@@ -4,6 +4,7 @@
 
   "net": {
     "role": "off",
+    "transport": "tcp",
     "addr": "127.0.0.1",
     "port": 27600,
     "control": "auto"

@@ -429,7 +429,7 @@ void ensure_cs() {
 
 // ---------------------------------------------------------------------------
 
-bool net_host(uint16_t port) {
+bool net_host(uint16_t port, bool loopback_only) {
     if (g.role != NetRole::None) return false;
     ensure_cs();
     if (!wsa_init()) return false;
@@ -444,7 +444,7 @@ bool net_host(uint16_t port) {
 
     sockaddr_in a{};
     a.sin_family      = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
+    a.sin_addr.s_addr = htonl(loopback_only ? INADDR_LOOPBACK : INADDR_ANY);
     a.sin_port        = htons(port);
     if (bind(g.listener, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
         fail("bind", WSAGetLastError()); closesocket(g.listener);

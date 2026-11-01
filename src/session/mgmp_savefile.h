@@ -86,6 +86,11 @@ void savefile_set_base(uintptr_t base);
 // the host has not published yet, or on a client.
 void savefile_catchup(uint8_t peer);
 
+// HOST, from follow_on_enter_node: the run's first node after the House. The
+// client is still standing in the House and has no map to follow onto, so the
+// run goes out as a fresh save ahead of the node. No-op otherwise.
+void savefile_on_leaving_house();
+
 // From h_SaveSlotClick. Returns false if the caller must NOT run the original,
 // which is how a client's local pick is swallowed.
 bool savefile_on_slot_click(void* save_selection, int slot);

@@ -23,6 +23,9 @@ namespace {
 // the same struct through a different serializer, and one copy of an offset
 // table is the only number of copies worth having.
 
+constexpr uintptr_t kCat_NextFightStatuses   = 0x7B8;
+constexpr uint32_t  kCat_NextFightStatusSize = 0xB8;
+
 typedef void  (__fastcall* fn_serialize_cat)(void* cat, void* stream, bool flag);
 typedef void  (__fastcall* fn_bs_dtor)(void* stream);
 typedef void* (__fastcall* fn_ofstream_ctor)(void* self);
@@ -327,6 +330,30 @@ void catsync_publish(const char* why) {
 
 // --- applying, and holding until it is safe to apply ------------------------
 
+// CatData+0x7B8 is the std::vector of statuses waiting for the next fight
+// (self_status_next_fight). Everything else SerializeCatData reads overwrites;
+// this one is read by push_back with no clear (0x14022F2C0..0x14022F339), so
+// applying a cat ADDS the host's list to ours. The client has already run the
+// same event and holds the same entries, hence every status doubled. Measured
+// 2026-10-31: poison 7 on the host, 14 on the client, rng identical.
+//
+// Rewinding `end` rather than destroying the 0xB8-byte elements leaks their
+// strings: a few dozen bytes per applied cat, and it needs no addresses for the
+// four element destructors.
+static void reset_next_fight_statuses(void* cat) {
+    uint8_t* list = (uint8_t*)cat + kCat_NextFightStatuses;
+    uint8_t* begin = nullptr;
+    uint8_t* end   = nullptr;
+    if (!mem_read(list,     &begin, sizeof(begin))) return;
+    if (!mem_read(list + 8, &end,   sizeof(end)))   return;
+    if (!begin || end <= begin) return;
+
+    mem_write(list + 8, &begin, sizeof(begin));
+    log_line("CATSYNC", "cleared %u next-fight status(es) so the host's list "
+                        "replaces this peer's instead of adding to it",
+             (unsigned)((end - begin) / kCat_NextFightStatusSize));
+}
+
 static void apply_now(const CatDataMsg& m, const char* when) {
     if (fnv1a(m.data, m.size) != m.hash) {
         log_line("CATSYNC", "!! cat %016llx failed its hash -- not applied",
@@ -358,6 +385,7 @@ static void apply_now(const CatDataMsg& m, const char* when) {
     *(uint32_t*)(bs + kBS_ReadLen) = m.size;
     *(uint32_t*)(bs + kBS_ReadPos) = 0;
 
+    reset_next_fight_statuses(cat);
     bool ok = safe_serialize(cat, bs);
     safe_bs_dtor(bs);
 

@@ -4,6 +4,7 @@
 #include "mgmp_overlay.h"
 #include "mgmp_session.h"
 #include "mgmp_net.h"
+#include "mgmp_steamlink.h"
 #include "mgmp_catsync.h"
 #include "mgmp_invsync.h"
 #include "mgmp_aim.h"
@@ -369,8 +370,30 @@ bool begin(bool host, const char* addr, uint16_t port) {
                  (unsigned long long)g.gpak_hash, (unsigned long long)g.build_hash);
     }
 
-    if (!(host ? net_host(port) : net_join(addr, port))) {
-        set_status("failed: %s", net_error());
+    // With the relay, mgmp_net still speaks TCP, just to a tunnel on 127.0.0.1.
+    // The client's tunnel has to exist before there is anything to dial; the
+    // host's needs the port it forwards to already listening.
+    const bool steam = config_steam();
+    uint16_t   dial  = port;
+    bool       up    = true;
+    const char* why  = "";
+
+    if (steam && !host) {
+        up = steamlink_join(addr, &dial);
+        if (!up) why = steamlink_error();
+    }
+    if (up) {
+        up = host ? net_host(port, steam) : net_join(steam ? "127.0.0.1" : addr, dial);
+        if (!up) why = net_error();
+    }
+    if (up && steam && host) {
+        up = steamlink_host(port);
+        if (!up) { why = steamlink_error(); net_shutdown(); }
+    }
+
+    if (!up) {
+        set_status("failed: %s", why);
+        if (steam) steamlink_stop();
         g.phase = Phase::Off;
         // Left started = false so another attempt is possible. A failed dial is
         // the single most likely thing to want to retry, and the reconnect
@@ -380,8 +403,9 @@ bool begin(bool host, const char* addr, uint16_t port) {
     }
 
     g.phase = Phase::Waiting;
-    if (host) set_status("hosting on port %u", (unsigned)port);
-    else      set_status("joining %s:%u", addr, (unsigned)port);
+    if (host) set_status(steam ? "hosting through Steam" : "hosting on port %u", (unsigned)port);
+    else if (steam) set_status("joining %s through Steam", addr);
+    else            set_status("joining %s:%u", addr, (unsigned)port);
     return true;
 }
 
@@ -467,6 +491,7 @@ void session_shutdown() {
     choice_shutdown();
     lockstep_shutdown();
     net_shutdown();
+    steamlink_stop();
     g.phase = Phase::Off;
     g.started = false;
 }

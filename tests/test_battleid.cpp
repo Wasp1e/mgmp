@@ -119,6 +119,29 @@ int main() {
               "no evidence the battle is finished");
     }
 
+    printf("-- THE RELOAD: the same node is not the same fight --\n");
+    {
+        const uint64_t kNode = 0x2f09d3c847255e5cULL;   // the node from the 2026-10-31 log
+        check(battle_id_for(kNode, 0) == kNode, "run 0 leaves the seed alone");
+
+        const uint64_t first  = battle_id_for(kNode, 0x6A000001);
+        const uint64_t second = battle_id_for(kNode, 0x6A000002);
+        check(first != second, "two loads of a run are two battles");
+        check(first != kNoBattle && second != kNoBattle, "neither reads as no battle");
+
+        BattleTracker<> t;
+        t.enter(first);
+        t.enter(second);
+        check(t.rel(first) == BattleRel::Retired, "the first attempt's messages are dropped");
+        check(t.rel(second) == BattleRel::Ours,   "the second attempt's are ours");
+
+        // A client that restarted mid-battle must land on the same id, which is
+        // why the id is computed and not counted.
+        BattleTracker<> rejoined;
+        rejoined.enter(battle_id_for(kNode, 0x6A000002));
+        check(rejoined.rel(second) == BattleRel::Ours, "a rejoining client gets the same id");
+    }
+
     printf(g_fail ? "\nFAILED (%d)\n" : "\nall passed\n", g_fail);
     return g_fail ? 1 : 0;
 }

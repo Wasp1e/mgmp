@@ -46,6 +46,12 @@ target_compile_definitions(test_config PRIVATE
     WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS NOMINMAX)
 add_test(NAME test_config COMMAND test_config)
 
-foreach(t test_proto test_hashring test_timedelay test_barrier test_split test_battleid test_config)
+# The relay tunnel, with a fake relay and real loopback sockets.
+add_executable(test_tunnel test_tunnel.cpp ${CMAKE_SOURCE_DIR}/src/net/mgmp_tunnel.cpp)
+target_include_directories(test_tunnel PRIVATE ${CMAKE_SOURCE_DIR}/src/net)
+target_compile_definitions(test_tunnel PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS NOMINMAX)
+add_test(NAME test_tunnel COMMAND test_tunnel)
+
+foreach(t test_proto test_hashring test_timedelay test_barrier test_split test_battleid test_config test_tunnel)
     target_compile_options(${t} PRIVATE /W3)
 endforeach()

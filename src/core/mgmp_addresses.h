@@ -76,6 +76,8 @@ enum Target : int {
     T_HighlightRefresh,  // sub_140151CE0 -- the status half of the ability
                          // highlight. Swallowed, and ONLY while this peer is
                          // drawing another player's aim. See mgmp_aim.h.
+    T_ShopBuy,           // the shop's purchase, after a click and before the
+                         // coin check -- swallowed on the client mid-adventure.
     T_COUNT
 };
 
@@ -468,6 +470,18 @@ static const TargetDesc kTargets[T_COUNT] = {
     // draw of ANOTHER player's aim, on the peer that does not own that cat.
     // Outside that window it is one predictable branch on a global.
     { 0x00152700, "HILITE",    "ability highlight status refresh (sub_140151CE0)" },
+
+    // sub_14079A600(Shop*, ShopItem*) -- compares the coins against the price at
+    // item+8, then grants through sub_14079ACB0, which holds the "bought blank
+    // collar" assert. Shop+0x7B picks the house's purse over the run's, so it is
+    // also how a purchase is told to be an adventure one. Sole code reference is
+    // its own click lambda, so swallowing it costs nothing else.
+    //
+    // Why it has to exist: nothing else stands between a client's click and a
+    // grant the host never hears of. Measured 2026-10-31: the client levelled a
+    // cat in its own shop, and that cat then took a move the host's copy could
+    // not, halting the boss on turn 6.
+    { 0x0079A600, "SHOPBUY",   "shop purchase (sub_14079A600)" },
 };
 
 // Coarse module guard, checked before the per-target signatures.

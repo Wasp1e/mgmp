@@ -5,6 +5,7 @@
 #include "mgmp_invsync.h"
 #include "mgmp_nodehash.h"
 #include "mgmp_runhist.h"
+#include "mgmp_savefile.h"
 #include "mgmp_follow.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_net.h"
@@ -16,6 +17,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 
 namespace mgmp {
 namespace {
@@ -79,6 +81,7 @@ struct State {
         uint32_t type  = 0;
         uint32_t count = 0;
         uint64_t seed  = 0;
+        uint32_t run_id = 0;
         uint64_t at    = 0;         // tick the host's choice arrived
         bool     held  = false;     // ...and whether we have said we are holding
     };
@@ -93,6 +96,9 @@ struct State {
     // that had already been sent. Measured 2026-08-26.
     bool     have_here      = false;
     uint32_t here_index     = 0;
+
+    // HOST: names the current load of the run -- see battle_id_for.
+    uint32_t run_id         = 0;
 
     // Last tick MapScreen::update ran. See follow_on_map: this is what tells
     // the save flush whether the run is between nodes or inside one.
@@ -291,11 +297,14 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     uint32_t count = 0; void* data = nullptr;
     read_nodes(map_screen, count, data);
 
+    // Ahead of everything below: save, then cats and inventory, then the node.
+    savefile_on_leaving_house();
+
     // Battle identity first of all, and before the publish: from here on this
     // peer's ACTION/HASH/CONTROL name this node, and the client establishes the
     // same id from the same field of the same node in follow_map_update.
     const uint64_t seed = node_seed0(node);
-    lockstep_enter_battle(seed);
+    lockstep_enter_battle(seed, g.run_id);
     remember_node(index, count, type, seed);
 
     // Cats FIRST, node second. TCP is ordered and the client applies a CATDATA
@@ -303,6 +312,15 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // MapScreen::update -- so sending in this order is what guarantees the
     // battle is built from the host's cats rather than from the client's stale
     // ones. Reversing these two lines reintroduces the bug this closes.
+    //
+    // Everything, not just what changed HERE. The dedupe compares against what
+    // this peer last sent, so it cannot see a client that changed its own copy,
+    // and the client's shop is live: on 2026-10-31 it bought a level-up the host
+    // never saw, kept the cat, and could walk further than the host allowed.
+    // The inventory buckets drift the same way. A node is rare, so a few KB here
+    // is cheap, and the client ends every node holding exactly the host's run.
+    catsync_forget();
+    invsync_forget();
     catsync_publish("entering a node");
     // ...and the other half of the same equip. Order between these two does not
     // matter the way it does against ENTERNODE -- an equip has already moved
@@ -320,6 +338,8 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     m.node_count = count;
     m.type       = type;
     m.seed0      = seed;
+    m.run_id     = g.run_id;
+    lockstep_owners_write(m);
     if (net_send_enter_node(m)) {
         ++g.published;
         if (sent) *sent = true;
@@ -419,6 +439,16 @@ void follow_request_jump(uint32_t index) {
     g.jump_index   = index;
 }
 
+// The clock rather than a counter: a host whose process restarted would count
+// from one again and reuse an id a connected client has already played.
+void follow_on_run_restart() {
+    Guard guard;
+    g.run_id    = (uint32_t)time(nullptr);
+    g.have_here = false;      // the node we were in belongs to the run just left
+    lockstep_on_run_restart();
+    log_line("FOLLOW", "new load of the run: %08x", g.run_id);
+}
+
 void follow_catchup(uint8_t peer) {
     if (!g.on || g.is_client || !net_active()) return;
 
@@ -435,6 +465,8 @@ void follow_catchup(uint8_t peer) {
     m.node_count = g.here_count;
     m.type       = g.here_type;
     m.seed0      = g.here_seed;
+    m.run_id     = g.run_id;
+    lockstep_owners_write(m);
     if (!net_send_enter_node_to(peer, m)) return;
 
     log_line("FOLLOW", "-> re-sent the CURRENT node %u/%u (%s) seed0=%016llx to"
@@ -453,6 +485,7 @@ void follow_on_message(const EnterNodeMsg& m) {
                            " believe they own the run");
         return;
     }
+    lockstep_owners_read(m);
     // A full queue means this peer is eight nodes behind, which no amount of
     // waiting is going to fix. Refuse the newest and SAY SO: the run is already
     // wrong, and the one thing that must not happen is what used to -- losing a
@@ -476,6 +509,7 @@ void follow_on_message(const EnterNodeMsg& m) {
     p.type  = m.type;
     p.count = m.node_count;
     p.seed  = m.seed0;
+    p.run_id = m.run_id;
     // Timed from ARRIVAL, not from the first map update that sees it: the point
     // of the delay is to put a known gap between the host entering a node and
     // this peer entering it, and the map screen may not be ready for a while
@@ -612,6 +646,7 @@ void* follow_map_update(void* map_screen) {
                  p.index, node_type_name(type), node_type_name(p.type));
 
     const uint32_t entering = p.index;
+    const uint32_t run_id   = p.run_id;
     pending_pop();
     ++g.entered;
     log_line("FOLLOW", "following host into node %u (%s)%s",
@@ -623,7 +658,7 @@ void* follow_map_update(void* map_screen) {
     // host does the matching call in follow_on_enter_node. Note this is the
     // CLIENT's only chance to make it -- the follow path calls o_EnterNode, the
     // MinHook trampoline, which bypasses the h_EnterNode detour entirely.
-    lockstep_enter_battle(seed);
+    lockstep_enter_battle(seed, run_id);
 
     // Everything the host published for this node lands HERE, and it must land
     // BEFORE remember_node, which is where the meta hash is taken.

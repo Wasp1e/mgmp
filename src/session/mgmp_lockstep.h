@@ -88,8 +88,17 @@ uint64_t lockstep_battle_id();
 
 // From the map layer, on BOTH peers, as a node is entered. Establishes battle
 // identity without any negotiation -- both peers pass the same seed because
-// they entered the same node.
-void lockstep_enter_battle(uint64_t seed0);
+// they entered the same node, and the same run_id because the host sent it.
+void lockstep_enter_battle(uint64_t seed0, uint32_t run_id);
+
+// HOST: a save was picked, so the battle in the decision log is over even
+// though nothing has entered the next one yet.
+void lockstep_on_run_restart();
+
+// HOST: put the run's cat owners on an outgoing ENTERNODE. CLIENT: take them
+// off one. See mgmp_split.h.
+void lockstep_owners_write(EnterNodeMsg& m);
+void lockstep_owners_read(const EnterNodeMsg& m);
 
 // A peer joined or reconnected: replay this battle's decisions to it so it can
 // fast-forward into a fight already under way. To that peer only.

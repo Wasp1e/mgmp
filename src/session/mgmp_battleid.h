@@ -29,6 +29,20 @@ namespace mgmp {
 // out-of-battle peer look like it shared one.
 constexpr uint64_t kNoBattle = 0;
 
+// The node seed alone does not name a fight once a run can be reloaded: the
+// host quits to the menu mid-battle, picks the save again and walks into the
+// same node with the same seed. With one id for both attempts, the first
+// attempt's actions and hashes were accepted as the second's. Measured
+// 2026-10-31: stale decisions replayed into a rejoining client, then a turn 1
+// halt comparing the two attempts.
+//
+// `run_id` is chosen by the host at each save pick and travels in ENTERNODE, so
+// the two peers still agree without negotiating and a client that restarts
+// mid-battle still lands on the same id. Zero leaves the seed as it is.
+constexpr uint64_t battle_id_for(uint64_t seed0, uint32_t run_id) {
+    return seed0 ^ (run_id * 0x9E3779B97F4A7C15ULL);
+}
+
 enum class BattleRel {
     Ours,      // the battle this peer is in right now
     Retired,   // one this peer has finished and left -- DROP
@@ -59,7 +73,7 @@ struct BattleTracker {
         if (id == current) return;
         if (current != kNoBattle) push_retired(current);
         // Entering a battle we had retired is not something the game does --
-        // a run never returns to a node -- but if it ever happened, treating
+        // a reload gets a new id from battle_id_for -- but if it ever happened, treating
         // the id as current has to win over treating it as retired, or every
         // message about it would be dropped. rel() checks `current` first.
         current = id;

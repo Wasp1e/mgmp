@@ -100,6 +100,10 @@ Open `mgmp.json` and set `game` to wherever Mewgenics actually is:
 
 (Windows paths in JSON need doubled backslashes.)
 
+If that path does not exist, the loader looks through your Steam libraries for
+the game. It also creates `steam_appid.txt` next to `Mewgenics.exe` if it is
+missing.
+
 ### 3. Choose who hosts
 
 The **host** owns the run. Their save file is the one you both play.
@@ -152,6 +156,21 @@ running:
 ---
 
 ## Connecting to each other
+
+### Through Steam
+
+No port forwarding, no VPN. Both players must be Steam friends.
+
+The host sets `"transport": "steam"` and `"role": "host"`, or ticks **through
+Steam** on the panel and presses **host**, then copies **your ID** to the friend.
+The friend sets `"transport": "steam"`, `"role": "client"` and puts that SteamID64
+in `addr`, or ticks the same box, pastes it into **host's ID** and presses **join**.
+
+Traffic goes through Steam's relays. The mod still speaks TCP, to a tunnel on
+`127.0.0.1` (`src/net/mgmp_tunnel.cpp`), which carries it over
+`ISteamNetworkingMessages`. Only the host's Steam friends are let in.
+
+### Over TCP
 
 The mod talks over a plain TCP connection on port **27600** by default. There
 is no matchmaking server, no relay, and no Steam lobby — the joining player

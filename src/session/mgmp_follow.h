@@ -72,6 +72,10 @@ void follow_on_message(const EnterNodeMsg& m);
 // afterwards would sit on the map forever.
 void follow_catchup(uint8_t peer);
 
+// HOST: a save was picked, so this is a new load of the run even if it walks
+// back into the same node. See battle_id_for.
+void follow_on_run_restart();
+
 // --- "are we standing ON the map, or inside a node?" -------------------------
 //
 // True only while MapScreen::update is actually ticking, i.e. the map is on

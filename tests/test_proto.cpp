@@ -31,6 +31,7 @@ int main() {
         a.slot_kind = 4; a.slot_index = 1;
         a.b30 = 1; a.b31 = 0;
         a.tx = 5; a.ty = -3; a.dx = -1; a.dy = 0;
+        a.fx = 0; a.fy = -1;
         strcpy_s(a.gon, "wp_BearTraps");
 
         uint32_t n = enc_action(buf, sizeof(buf), a);
@@ -48,6 +49,7 @@ int main() {
         check(b.b30 == 1 && b.b31 == 0, "the two tail bytes");
         check(b.tx == 5 && b.ty == -3, "target survives a negative");
         check(b.dx == -1 && b.dy == 0, "direction survives a negative");
+        check(b.fx == 0 && b.fy == -1, "the owner's facing survives a negative");
         check(strcmp(b.gon, "wp_BearTraps") == 0, "GON name, the second identity");
     }
 
@@ -282,6 +284,10 @@ int main() {
         EnterNodeMsg m{};
         m.index = 12; m.node_count = 40; m.type = 5;
         m.seed0 = 0xF7E6D5C4B3A29180ULL;
+        m.run_id = 0x6A1B2C3D;
+        m.owner_count = 2;
+        m.owner_id[0] = 0xF000000000000001ULL; m.owner_pos[0] = 0;
+        m.owner_id[1] = 22;                    m.owner_pos[1] = 1;
         uint32_t n = enc_enter_node(buf, sizeof(buf), m);
         check(n > 0, "encodes");
         Reader r(buf, n);
@@ -291,6 +297,10 @@ int main() {
         check(o.index == 12 && o.node_count == 40, "index and map size");
         check(o.type == 5, "node type (5 = battle)");
         check(o.seed0 == 0xF7E6D5C4B3A29180ULL, "seed survives the high bit");
+        check(o.run_id == 0x6A1B2C3D, "run id survives");
+        check(o.owner_count == 2 && o.owner_id[0] == 0xF000000000000001ULL &&
+              o.owner_pos[0] == 0 && o.owner_id[1] == 22 && o.owner_pos[1] == 1,
+              "cat owners survive");
         check(r.pos == r.len, "consumed exactly the frame");
     }
     {
@@ -305,6 +315,23 @@ int main() {
         Reader r(buf, n - 1); r.u8v();
         EnterNodeMsg o{};
         check(!dec_enter_node(r, o), "one byte short is rejected");
+    }
+    {
+        EnterNodeMsg m{}; m.owner_count = kMaxNodeOwners;
+        uint32_t n = enc_enter_node(buf, sizeof(buf), m);
+        check(n > 0, "a full owner table encodes");
+        Reader r(buf, n); r.u8v();
+        EnterNodeMsg o{};
+        check(dec_enter_node(r, o) && o.owner_count == kMaxNodeOwners,
+              "a full owner table decodes");
+
+        // With no owners the count is the frame's last byte.
+        EnterNodeMsg z{};
+        uint32_t k = enc_enter_node(buf, sizeof(buf), z);
+        buf[k - 1] = kMaxNodeOwners + 1;
+        Reader q(buf, k); q.u8v();
+        EnterNodeMsg p{};
+        check(!dec_enter_node(q, p), "an oversized owner count is rejected");
     }
 
     printf("\n-- ChoiceMsg: the message that replaces RUNSTATE --\n");
@@ -502,6 +529,7 @@ int main() {
         w.u64v(9);                      // battle_id, ahead of turn on the wire
         w.u32v(1); w.u8v(0); w.u8v(2); w.u8v(0); w.u8v(0); w.u8v(0); w.u8v(0);
         w.i32v(0); w.i32v(0); w.i32v(0); w.i32v(0);
+        w.i32v(0); w.i32v(0);           // facing
         char big[200]; memset(big, 'x', sizeof(big)); big[199] = 0;
         w.str(big);                     // Writer clamps to 255
         w.u32v(0xFEEDFACE);             // a sentinel after the string

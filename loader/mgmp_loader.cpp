@@ -4,9 +4,9 @@
 // (rather than attaching to a running process) is what lets the harness hook
 // ApplicationBase::initSystems, which runs once during startup.
 //
-// The game is left untouched on disk: nothing is copied into its directory and
-// no DLL next to the exe is proxied. That also sidesteps the fact that this
-// install's steam_api64.dll slot is already occupied.
+// The game's own files are left untouched on disk: no DLL next to the exe is
+// proxied, which also sidesteps the fact that this install's steam_api64.dll
+// slot is already occupied. The one thing added there is steam_appid.txt.
 //
 //   mgmp_loader.exe                       -- game path from mgmp.json
 //   mgmp_loader.exe <path\to\Mewgenics.exe> [args...]
@@ -25,6 +25,10 @@
 #include <windows.h>
 #include <tlhelp32.h>
 
+#include <conio.h>
+#include <fcntl.h>
+#include <io.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +40,18 @@
 
 namespace {
 
+const char kSteamAppId[] = "686060";
+
+// A double-clicked loader owns its console, which closes the moment it exits,
+// taking the error message with it. From a shell the console is shared and the
+// message stays, so there is nothing to wait for.
+void pause_if_own_console() {
+    DWORD ids[2];
+    if (GetConsoleProcessList(ids, 2) != 1) return;
+    wprintf(L"\nPress any key to close this window...\n");
+    _getwch();
+}
+
 void die(const wchar_t* what) {
     DWORD e = GetLastError();
     fflush(stdout);   // ExitProcess does not flush the CRT, and losing the
@@ -44,7 +60,17 @@ void die(const wchar_t* what) {
     FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                    nullptr, e, 0, msg, 512, nullptr);
     fwprintf(stderr, L"[!] %s failed (%lu): %s\n", what, e, msg);
+    pause_if_own_console();
     ExitProcess(1);
+}
+
+// JSON and Steam's VDF files are both UTF-8, whatever the system code page is.
+std::wstring utf8_to_wide(const std::string& s) {
+    if (s.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+    return w;
 }
 
 void loader_dir(wchar_t* out) {
@@ -74,11 +100,63 @@ bool game_from_config(const wchar_t* dir, wchar_t* out, size_t out_len) {
     auto it = j.find("game");
     if (it == j.end() || !it->is_string()) return false;
 
-    const std::string s = it->get<std::string>();
+    const std::wstring s = utf8_to_wide(it->get<std::string>());
     if (s.empty()) return false;
-    size_t conv = 0;
-    mbstowcs_s(&conv, out, out_len, s.c_str(), _TRUNCATE);
+    wcsncpy_s(out, out_len, s.c_str(), _TRUNCATE);
     return out[0] != 0;
+}
+
+// Looks through every Steam library for the game, so that a game installed
+// anywhere but the default folder works without editing mgmp.json.
+bool find_game_in_steam(wchar_t* out, size_t out_len) {
+    wchar_t steam[MAX_PATH] = {};
+    DWORD   cb = sizeof(steam);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath",
+                     RRF_RT_REG_SZ, nullptr, steam, &cb) != ERROR_SUCCESS)
+        return false;
+
+    auto try_library = [&](std::wstring lib) {
+        for (wchar_t& c : lib) if (c == L'/') c = L'\\';   // SteamPath uses forward slashes
+        lib += L"\\steamapps\\common\\Mewgenics\\Mewgenics.exe";
+        if (GetFileAttributesW(lib.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+        wcsncpy_s(out, out_len, lib.c_str(), _TRUNCATE);
+        return true;
+    };
+
+    if (try_library(steam)) return true;
+
+    // Each library is a  "path"  "D:\\SteamLibrary"  line, backslashes escaped.
+    std::ifstream in(std::wstring(steam) + L"\\steamapps\\libraryfolders.vdf");
+    std::string   line;
+    while (std::getline(in, line)) {
+        size_t key = line.find("\"path\"");
+        if (key == std::string::npos) continue;
+        size_t open  = line.find('"', key + 6);
+        size_t close = line.rfind('"');
+        if (open == std::string::npos || close <= open) continue;
+
+        std::string path;
+        for (size_t i = open + 1; i < close; ++i) {
+            if (line[i] == '\\' && line[i + 1] == '\\') ++i;
+            path += line[i];
+        }
+        if (try_library(utf8_to_wide(path))) return true;
+    }
+    return false;
+}
+
+// Without this file a genuine Steam copy restarts itself through Steam, and the
+// loader ends up following a process it did not start (see the relaunch notes
+// below). Failing to write it is survivable: that path still mostly works.
+void ensure_steam_appid(const wchar_t* game_dir) {
+    std::wstring path = std::wstring(game_dir) + L"\\steam_appid.txt";
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+
+    std::ofstream f(path, std::ios::binary);
+    f << kSteamAppId;
+    f.close();
+    if (f) wprintf(L"[*] created %s\n", path.c_str());
+    else   fwprintf(stderr, L"[!] could not create %s\n", path.c_str());
 }
 
 // --- pre-main injection -----------------------------------------------------
@@ -466,9 +544,7 @@ bool inject(HANDLE proc, const wchar_t* dll_path) {
 
 } // namespace
 
-int wmain(int argc, wchar_t** argv) {
-    setvbuf(stdout, nullptr, _IONBF, 0);   // progress must survive a hard exit
-
+static int run(int argc, wchar_t** argv) {
     wchar_t dir[MAX_PATH];
     loader_dir(dir);
 
@@ -479,7 +555,9 @@ int wmain(int argc, wchar_t** argv) {
     if (GetEnvironmentVariableW(L"MGMP_DLL", dll, MAX_PATH) == 0)
         swprintf_s(dll, L"%s\\mgmp.dll", dir);
     if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) {
-        fwprintf(stderr, L"[!] mgmp.dll not found next to the loader: %s\n", dll);
+        fwprintf(stderr, L"[!] mgmp.dll not found next to the loader: %s\n"
+                         L"    Extract the whole archive first, do not run it from inside the zip.\n",
+                 dll);
         return 1;
     }
 
@@ -502,7 +580,13 @@ int wmain(int argc, wchar_t** argv) {
     int     first_game_arg = 2;
     if (argc >= 2) {
         wcsncpy_s(game, argv[1], _TRUNCATE);
-    } else if (!game_from_config(dir, game, MAX_PATH)) {
+    } else {
+        game_from_config(dir, game, MAX_PATH);
+        if (GetFileAttributesW(game) == INVALID_FILE_ATTRIBUTES &&
+            find_game_in_steam(game, MAX_PATH))
+            wprintf(L"[*] found the game through Steam: %s\n", game);
+    }
+    if (!game[0]) {
         fwprintf(stderr,
                  L"usage: mgmp_loader.exe <path\\to\\Mewgenics.exe> [args...]\n"
                  L"       mgmp_loader.exe --attach <pid>\n"
@@ -519,6 +603,8 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t workdir[MAX_PATH];
     wcsncpy_s(workdir, game, _TRUNCATE);
     if (wchar_t* slash = wcsrchr(workdir, L'\\')) *slash = 0;
+
+    ensure_steam_appid(workdir);
 
     wchar_t cmdline[4096];
     swprintf_s(cmdline, L"\"%s\"", game);
@@ -767,5 +853,17 @@ int wmain(int argc, wchar_t** argv) {
 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    return rc;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);   // progress must survive a hard exit
+
+    // Without this a console prints every non-ASCII character of a path as "?".
+    if (_isatty(_fileno(stdout))) _setmode(_fileno(stdout), _O_U16TEXT);
+    if (_isatty(_fileno(stderr))) _setmode(_fileno(stderr), _O_U16TEXT);
+
+    int rc = run(argc, argv);
+    if (rc != 0) pause_if_own_console();
     return rc;
 }

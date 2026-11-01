@@ -88,6 +88,9 @@ constexpr uintptr_t kList_Data     = 16;
 // decision queue's element count.
 constexpr uintptr_t kBrain_Owner   = 0x38;
 constexpr uintptr_t kChar_Brain    = 0x68;
+// The CatData behind a cat, null on anything else. 0x14011746D reads it here,
+// null-checks it and copies the cat's HP across at the end of a battle.
+constexpr uintptr_t kChar_CatData  = 0x88;
 constexpr uintptr_t kTC_QueueCount = 0x60;
 
 // --- Character fields, for the state hash (recovered 2026-08-24) ------------
@@ -123,6 +126,12 @@ constexpr uintptr_t kTC_QueueCount = 0x60;
 // argument to the splash walk.
 constexpr uintptr_t kChar_TObj     = 0x60;
 constexpr uintptr_t kChar_Facing   = 0x388;
+// Where the cat is meant to be facing. Character's update compares this with
+// kChar_Facing (0x140108E05) and calls Character::Face to bring the current one
+// back to it, so a write to +0x388 alone lasts until that tick. Measured
+// 2026-10-31: every facing the client took from the owner was undone within
+// frames, and the next enemy read a different board.
+constexpr uintptr_t kChar_FaceTarget = 0x390;
 constexpr uintptr_t kChar_HP       = 0x4B0;
 constexpr uintptr_t kChar_Shield   = 0x4B4;
 constexpr uintptr_t kChar_MaxHP    = 0x4BC;
@@ -172,6 +181,7 @@ struct State {
     const void* cats[kMaxCats] = {};
     uint32_t    cat_count      = 0;
     bool        local_cat[kMaxCats] = {};   // this peer's input decides for it
+    OwnerTable  owners;                     // which player has which cat this run
     bool        human_cat[kMaxCats] = {};   // a human brain drives it at all
     bool        snapped        = false;
     const void* snapped_list   = nullptr;   // the vector object we snapshotted
@@ -196,6 +206,24 @@ struct State {
     uint32_t  pend_head = 0, pend_count = 0;
 
     bool     outstanding = false;   // a local decision is sent but not applied
+
+    // The facing carried by the decision about to be applied, on BOTH peers.
+    // PlayerBrain's own update calls Character::Face on the owning machine only
+    // (the hover, the manual turn), so what the owner read at send time is the
+    // value both sides commit to -- see lockstep_on_applied.
+    struct {
+        bool    have = false;
+        uint8_t cat  = 0;
+        int32_t fx = 0, fy = 0;
+    } pend_face;
+
+    // The facing an end of turn committed to, held for the turn boundary -- see
+    // pin_end_of_turn_facing.
+    struct {
+        bool    have = false;
+        uint8_t cat  = 0;
+        int32_t fx = 0, fy = 0;
+    } end_face;
     uint32_t turn        = 0;
 
     // Which battle. Turn numbering restarts at 0 in each one, so the turn index
@@ -371,7 +399,11 @@ bool read_affecting_elements(const void* chr, uint32_t out[2]) {
 // 0x00000400 and the client faulted, then on the rerun the two swapped. Which
 // peer "wins" is a coin flip, which is exactly what a state hash must never
 // contain.
-bool read_cat_state(const void* chr, CatState& out, bool in_battle = true) {
+//
+// No default on purpose: the state fence once took one and called into cats the
+// battle had already freed. Measured 2026-10-31 -- 1175 caught faults in one
+// fight and then a crash through a null pointer.
+bool read_cat_state(const void* chr, CatState& out, bool in_battle) {
     out = CatState{};
     out.in_battle = in_battle ? 1 : 0;
     if (!chr) return false;
@@ -573,7 +605,7 @@ void dump_cat_states(const char* why) {
             rtti_class_name(brain, cls, sizeof(cls));
 
         CatState st{};
-        if (!read_cat_state(ch, st)) {
+        if (!read_cat_state(ch, st, true)) {     // `ch` came from the live list
             log_line("LOCKSTEP", "  +%2u  <unreadable>  brain=%s", i, cls);
             continue;
         }
@@ -700,6 +732,17 @@ uint8_t cat_index_of(const void* character) {
     return kNoCat;
 }
 
+// CatData+0x00, the id the save and every catsync message use. 0 when there is
+// no CatData to read it from.
+static uint64_t cat_persistent_id(const void* character) {
+    const void* cat = nullptr;
+    uint64_t    id  = 0;
+    if (!mem_read((const uint8_t*)character + kChar_CatData, &cat, sizeof(cat)) || !cat)
+        return 0;
+    if (!mem_read((const uint8_t*)cat, &id, sizeof(id))) return 0;
+    return id;
+}
+
 // Snapshot the battle's character list. Called once per battle, at the first
 // turn boundary -- by then Level::init has run and every starting cat exists.
 // Resolve TurnControl -> the battle's character list. Split out from the
@@ -787,23 +830,13 @@ void snapshot_cats(void* turn_control) {
 
     if (cfg.net_control_auto) {
         // Derived identically on both peers rather than negotiated, which is
-        // why it needs no message and no waiting: the roster is byte-identical
-        // (measured -- 29 cats, same brain class per index, two processes with
-        // completely different heap addresses), the human filter is the same
-        // string compare, and the rule below is pure arithmetic. Both peers
-        // still exchange CONTROL afterwards, but as a check on the result --
-        // not as the source of it.
+        // why it needs no waiting: the human cats and their ids are the same on
+        // both, the owner table came from the host in ENTERNODE, and the rule
+        // for a cat the table has not seen is pure arithmetic. Both peers still
+        // exchange CONTROL afterwards, but as a check on the result -- not as
+        // the source of it. See mgmp_split.h for the rule.
         //
-        // Spread the human cats over however many players are in the session,
-        // in roster order, host first, with the remainder going to the earliest
-        // positions. Four cats over three players is 2/1/1; three over two is
-        // 2/1, which is what the two-player rule always did -- the old
-        // `(humans+1)/2` is exactly this formula at P=2, so nothing changes for
-        // a two-player session.
-        //
-        // Position, not peer id: see net_peer_pos. And contiguous rather than
-        // interleaved, so each player's cats are adjacent in the roster and the
-        // log is readable by eye.
+        // Position, not peer id: see net_peer_pos.
         uint32_t P   = net_peer_count();
         uint32_t pos = net_peer_pos();
         if (P == 0) {
@@ -814,13 +847,24 @@ void snapshot_cats(void* turn_control) {
             log_line("LOCKSTEP", "!! no peer list yet -- deferring the split; if "
                                  "this repeats, PEERS never arrived");
         }
-        const SplitRange range = split_for(g.humans, P, pos);
-        const uint32_t   mine  = range.count;
-
+        uint64_t human_id[kMaxCats];
+        uint8_t  player[kMaxCats];
         uint32_t seen = 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i)
+            if (g.human_cat[i]) human_id[seen++] = cat_persistent_id(g.cats[i]);
+
+        // A session of one is not a split worth remembering: the first cats it
+        // would record are all its own, and the friend arrives to an empty hand.
+        split_assign(g.owners, human_id, seen, P, P >= 2, player);
+
+        uint32_t mine = 0;
+        seen = 0;
         for (uint32_t i = 0; i < g.cat_count; ++i) {
             if (!g.human_cat[i]) continue;
-            g.local_cat[i] = split_owns(range, seen);
+            g.local_cat[i] = (player[seen] == pos);
+            if (g.local_cat[i]) ++mine;
+            log_line("LOCKSTEP", "  cat %u id=%016llx -> player %u", i,
+                     (unsigned long long)human_id[seen], (unsigned)player[seen]);
             ++seen;
         }
 
@@ -1786,6 +1830,8 @@ void lockstep_init() {
 
     g.active  = true;
     g.halted  = false;
+    g.pend_face.have = false;
+    g.end_face.have  = false;
     if (!rejoin_in_battle) {
         g.snapped = false;
         // Turn numbering is per battle and the HASH messages are keyed on it.
@@ -1925,6 +1971,7 @@ bool lockstep_aim_subject(const void* character, uint8_t& cat, bool& peer_owns) 
 struct PreviewFacing {
     uint8_t* ch = nullptr;
     int32_t  fx = 0, fy = 0;
+    int32_t  tx = 0, ty = 0;   // kChar_FaceTarget, which the preview moves too
     bool     have = false;
     uint32_t restored = 0;
     bool     said = false;
@@ -1942,6 +1989,8 @@ void lockstep_preview_facing_begin(void* brain) {
         return;
     if (!mem_read(ch + kChar_Facing,     &g_pf.fx, sizeof(g_pf.fx))) return;
     if (!mem_read(ch + kChar_Facing + 4, &g_pf.fy, sizeof(g_pf.fy))) return;
+    if (!mem_read(ch + kChar_FaceTarget,     &g_pf.tx, sizeof(g_pf.tx))) return;
+    if (!mem_read(ch + kChar_FaceTarget + 4, &g_pf.ty, sizeof(g_pf.ty))) return;
     g_pf.ch   = ch;
     g_pf.have = true;
 }
@@ -1950,13 +1999,17 @@ void lockstep_preview_facing_end() {
     if (!g_pf.have) return;
     g_pf.have = false;
 
-    int32_t fx = 0, fy = 0;
+    int32_t fx = 0, fy = 0, tx = 0, ty = 0;
     if (!mem_read(g_pf.ch + kChar_Facing,     &fx, sizeof(fx))) return;
     if (!mem_read(g_pf.ch + kChar_Facing + 4, &fy, sizeof(fy))) return;
-    if (fx == g_pf.fx && fy == g_pf.fy) return;
+    if (!mem_read(g_pf.ch + kChar_FaceTarget,     &tx, sizeof(tx))) return;
+    if (!mem_read(g_pf.ch + kChar_FaceTarget + 4, &ty, sizeof(ty))) return;
+    if (fx == g_pf.fx && fy == g_pf.fy && tx == g_pf.tx && ty == g_pf.ty) return;
 
     if (!mem_write(g_pf.ch + kChar_Facing,     &g_pf.fx, sizeof(g_pf.fx))) return;
     if (!mem_write(g_pf.ch + kChar_Facing + 4, &g_pf.fy, sizeof(g_pf.fy))) return;
+    if (!mem_write(g_pf.ch + kChar_FaceTarget,     &g_pf.tx, sizeof(g_pf.tx))) return;
+    if (!mem_write(g_pf.ch + kChar_FaceTarget + 4, &g_pf.ty, sizeof(g_pf.ty))) return;
     ++g_pf.restored;
 
     // Once per session. The count is what matters, not each event -- this fires
@@ -1982,6 +2035,7 @@ uint32_t lockstep_preview_facing_count() { return g_pf.restored; }
 
 struct StateFence {
     CatState snap[kMaxCats]{};
+    int32_t  target[kMaxCats][2]{};   // kChar_FaceTarget, not part of CatState
     bool     got[kMaxCats]{};
     uint32_t count = 0;
     bool     armed = false;
@@ -1994,9 +2048,21 @@ StateFence g_sf;
 void lockstep_state_fence_begin() {
     g_sf.armed = false;
     if (!g.active || !g.snapped || g.halted) return;
+
+    // Only cats the battle still holds. A departed cat's Character can be freed
+    // with its pointer still in the snapshot, and the read below is a call into
+    // the game that writes to it. This runs every frame on the peer watching an
+    // aim, so an unknown roster means no fence, not a guess.
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    if (!snapshot_membership(g.snapped_list, live, still_in, appeared)) return;
+
     g_sf.count = g.cat_count > kMaxCats ? kMaxCats : g.cat_count;
-    for (uint32_t i = 0; i < g_sf.count; ++i)
-        g_sf.got[i] = read_cat_state(g.cats[i], g_sf.snap[i]);
+    for (uint32_t i = 0; i < g_sf.count; ++i) {
+        g_sf.got[i] = still_in[i] && read_cat_state(g.cats[i], g_sf.snap[i], true) &&
+                      mem_read((const uint8_t*)g.cats[i] + kChar_FaceTarget,
+                               g_sf.target[i], sizeof(g_sf.target[i]));
+    }
     g_sf.armed = true;
 }
 
@@ -2008,10 +2074,14 @@ uint32_t lockstep_state_fence_end(const char* what) {
     for (uint32_t i = 0; i < g_sf.count; ++i) {
         if (!g_sf.got[i]) continue;
         CatState now{};
-        if (!read_cat_state(g.cats[i], now)) continue;
+        if (!read_cat_state(g.cats[i], now, true)) continue;
 
         const CatState& was = g_sf.snap[i];
-        const bool face_moved = (now.fx != was.fx || now.fy != was.fy);
+        int32_t target[2] = {};
+        mem_read((const uint8_t*)g.cats[i] + kChar_FaceTarget, target, sizeof(target));
+        const bool face_moved = (now.fx != was.fx || now.fy != was.fy ||
+                                 target[0] != g_sf.target[i][0] ||
+                                 target[1] != g_sf.target[i][1]);
         // memcmp would fold facing in with the rest; compare the fields that
         // cannot be put back separately, so the log can say which kind it was.
         const bool rest_moved =
@@ -2029,6 +2099,8 @@ uint32_t lockstep_state_fence_end(const char* what) {
             // is the one an action wrote.
             mem_write((uint8_t*)g.cats[i] + kChar_Facing,     &was.fx, sizeof(was.fx));
             mem_write((uint8_t*)g.cats[i] + kChar_Facing + 4, &was.fy, sizeof(was.fy));
+            mem_write((uint8_t*)g.cats[i] + kChar_FaceTarget, g_sf.target[i],
+                      sizeof(g_sf.target[i]));
         }
 
         if (!g_sf.said) {
@@ -2343,6 +2415,10 @@ bool lockstep_fill_choice(void* brain, void* out) {
         msg.type  = (uint8_t)a.type;
         msg.tx = a.target_x; msg.ty = a.target_y;
         msg.dx = a.dir_x;    msg.dy = a.dir_y;
+        // The target, not the current value: the current one can be mid-turn,
+        // and the target is what it settles on.
+        mem_read((const uint8_t*)actor + kChar_FaceTarget,     &msg.fx, sizeof(msg.fx));
+        mem_read((const uint8_t*)actor + kChar_FaceTarget + 4, &msg.fy, sizeof(msg.fy));
         msg.b30 = a.tail[0x30 - 0x28];
         msg.b31 = a.tail[0x31 - 0x28];
 
@@ -2371,6 +2447,10 @@ bool lockstep_fill_choice(void* brain, void* out) {
 
         if (net_send_action(msg)) {
             g.outstanding = true;
+            g.pend_face.have = true;
+            g.pend_face.cat  = cat;
+            g.pend_face.fx   = msg.fx;
+            g.pend_face.fy   = msg.fy;
             ++g.stats.sent;
             log_line("LOCKSTEP", "-> cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
                      (unsigned)cat, a.type == TA_EndTurn ? "endturn" : "ability",
@@ -2446,11 +2526,37 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     }
 
     mem_write(out, &a, sizeof(a));
+    g.pend_face.have = true;
+    g.pend_face.cat  = cat;
+    g.pend_face.fx   = msg.fx;
+    g.pend_face.fy   = msg.fy;
     ++g.stats.applied;
     log_line("LOCKSTEP", "<- cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
              (unsigned)cat, msg.type == TA_EndTurn ? "endturn" : "ability",
              msg.slot_kind, msg.slot_index, msg.tx, msg.ty,
              msg.gon[0] ? msg.gon : "-");
+}
+
+static void write_owner_facing(uint8_t* ch, uint8_t cat, int32_t fx, int32_t fy) {
+    int32_t was_x = 0, was_y = 0, tgt_x = 0, tgt_y = 0;
+    if (!mem_read(ch + kChar_Facing,     &was_x, sizeof(was_x)) ||
+        !mem_read(ch + kChar_Facing + 4, &was_y, sizeof(was_y)) ||
+        !mem_read(ch + kChar_FaceTarget,     &tgt_x, sizeof(tgt_x)) ||
+        !mem_read(ch + kChar_FaceTarget + 4, &tgt_y, sizeof(tgt_y)) ||
+        (was_x == fx && was_y == fy && tgt_x == fx && tgt_y == fy))
+        return;
+    mem_write(ch + kChar_Facing,     &fx, sizeof(fx));
+    mem_write(ch + kChar_Facing + 4, &fy, sizeof(fy));
+    mem_write(ch + kChar_FaceTarget,     &fx, sizeof(fx));
+    mem_write(ch + kChar_FaceTarget + 4, &fy, sizeof(fy));
+    // The aim-preview freeze would otherwise put the old value back if this
+    // runs inside its bracket.
+    if (g_pf.have && g_pf.ch == ch) {
+        g_pf.fx = fx; g_pf.fy = fy;
+        g_pf.tx = fx; g_pf.ty = fy;
+    }
+    log_line("LOCKSTEP", "facing of cat %u set to the owner's: (%d,%d) target (%d,%d) -> (%d,%d)",
+             (unsigned)cat, was_x, was_y, tgt_x, tgt_y, fx, fy);
 }
 
 void lockstep_on_applied(const void* action, const void* actor) {
@@ -2477,6 +2583,48 @@ void lockstep_on_applied(const void* action, const void* actor) {
     // cross-check would go once the state hash covers Character fields.
     uint8_t cat = cat_index_of(who);
     if (cat != kNoCat && g.local_cat[cat]) ++g.stats.applied;
+
+    // Both peers write the facing the decision carried, before the action runs,
+    // so whatever it does to facing itself lands on the same value everywhere.
+    // Not via Character::Face: that is 89 call sites of animation and passives,
+    // and the value is already final -- this only has to agree. (0,0) is a read
+    // that failed on the owner, never a real direction.
+    if (cat != kNoCat && g.pend_face.have && g.pend_face.cat == cat) {
+        g.pend_face.have = false;
+        const int32_t fx = g.pend_face.fx, fy = g.pend_face.fy;
+        if (fx || fy) {
+            write_owner_facing((uint8_t*)who, cat, fx, fy);
+            if (a.type == TA_EndTurn) {
+                g.end_face.have = true;
+                g.end_face.cat  = cat;
+                g.end_face.fx   = fx;
+                g.end_face.fy   = fy;
+            }
+        }
+    }
+}
+
+// The write in lockstep_on_applied is not the last word on an end of turn.
+// PlayerBrain::update (0x140778DA0) still runs for that cat for a few frames and
+// calls Character::Face from PlayerBrain+0x360, which holds this peer's own
+// state on a cat it does not own. Measured 2026-10-31: the client set cat 1 to
+// (0,1), it was back at (-1,0) by the boundary, and the next enemy read the two
+// boards differently. The boundary is before the next cat acts and past the
+// point that brain is driving anything.
+static void pin_end_of_turn_facing() {
+    Guard guard;
+    if (!g.end_face.have) return;
+    g.end_face.have = false;
+    if (!g.snapped || g.end_face.cat >= g.cat_count) return;
+
+    // A cat can die on its own end of turn, so its Character may be gone.
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    if (!snapshot_membership(g.snapped_list, live, still_in, appeared)) return;
+    if (!still_in[g.end_face.cat]) return;
+
+    write_owner_facing((uint8_t*)g.cats[g.end_face.cat], g.end_face.cat,
+                       g.end_face.fx, g.end_face.fy);
 }
 
 void lockstep_turn_boundary(void* turn_control) {
@@ -2503,6 +2651,8 @@ void lockstep_turn_boundary(void* turn_control) {
 
             g.snapped           = false;
             g.snapped_list      = nullptr;
+            g.pend_face.have    = false;
+            g.end_face.have     = false;
             g.turn              = 0;
             g.outstanding       = false;
             g.control_checked   = false;
@@ -2562,6 +2712,8 @@ void lockstep_turn_boundary(void* turn_control) {
                     g.have_peer_control[p] = false;
         }
     }
+
+    pin_end_of_turn_facing();
 
     snapshot_cats(turn_control);
     if (!g.snapped || g.halted) return;
@@ -2660,21 +2812,53 @@ bool lockstep_peer_owns_character(const void* character) {
 // battle-less "battle" as far as identity goes, and giving it an id is what
 // makes a CURSOR or a stray ACTION from the previous fight droppable while
 // standing in a shop.
-void lockstep_enter_battle(uint64_t seed0) {
+void lockstep_enter_battle(uint64_t seed0, uint32_t run_id) {
     Guard guard;
     if (seed0 == kNoBattle) return;
-    if (seed0 == g.battles.current) return;      // same node; not a transition
+    const uint64_t id = battle_id_for(seed0, run_id);
+    if (id == g.battles.current) return;         // same node; not a transition
 
     const uint64_t left = g.battles.current;
-    g.battles.enter(seed0);
+    g.battles.enter(id);
 
     // The log describes the battle we just left, and nothing in it can be
     // replayed into the new one.
     g.sent_log_n    = 0;
     g.sent_log_full = false;
 
-    log_line("LOCKSTEP", "battle id now %016llx%s", (unsigned long long)seed0,
+    log_line("LOCKSTEP", "battle id now %016llx (node seed %016llx, run %08x)%s",
+             (unsigned long long)id, (unsigned long long)seed0, run_id,
              left == kNoBattle ? " (first this session)" : "");
+}
+
+// The gap this closes is the host sitting on the menu or loading: a peer that
+// joins there would be replayed a battle that no longer exists, because nothing
+// has entered the next node to clear the log.
+void lockstep_on_run_restart() {
+    Guard guard;
+    g.sent_log_n    = 0;
+    g.sent_log_full = false;
+    g.owners        = OwnerTable{};
+}
+
+void lockstep_owners_write(EnterNodeMsg& m) {
+    static_assert(kMaxOwners == kMaxNodeOwners, "ENTERNODE carries the whole table");
+    Guard guard;
+    m.owner_count = (uint8_t)g.owners.count;
+    for (uint32_t i = 0; i < g.owners.count; ++i) {
+        m.owner_id[i]  = g.owners.id[i];
+        m.owner_pos[i] = g.owners.pos[i];
+    }
+}
+
+void lockstep_owners_read(const EnterNodeMsg& m) {
+    Guard guard;
+    g.owners = OwnerTable{};
+    g.owners.count = m.owner_count;
+    for (uint32_t i = 0; i < g.owners.count; ++i) {
+        g.owners.id[i]  = m.owner_id[i];
+        g.owners.pos[i] = m.owner_pos[i];
+    }
 }
 
 // A peer connected or reconnected. Hand it everything this peer has already

@@ -77,8 +77,10 @@ void net_msg_release(NetMsg& m);
 
 // --- lifecycle (game thread) ------------------------------------------------
 
-// port is the TCP port; host binds it, client dials <addr>:<port>.
-bool net_host(uint16_t port);
+// port is the TCP port; host binds it, client dials <addr>:<port>. loopback_only
+// is for the relay, which reaches the host through 127.0.0.1 and has no reason to
+// open a port to the network or wake the firewall.
+bool net_host(uint16_t port, bool loopback_only = false);
 bool net_join(const char* addr, uint16_t port);
 void net_shutdown();
 

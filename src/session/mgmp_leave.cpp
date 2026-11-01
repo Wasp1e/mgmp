@@ -9,6 +9,9 @@
 #include "mgmp_log.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
+#include "mgmp_ui.h"         // ui_window -- where a synthetic Escape is posted
+
+#include <windows.h>
 
 #include <cstring>
 #include <cstdio>
@@ -36,6 +39,12 @@ constexpr uint32_t kConfirmPolls = 2;
 // transition did not start.
 constexpr uint32_t kRetryFrames = 120;   // ~2 s at 60 Hz
 constexpr uint32_t kMaxPresses  = 5;
+
+// Polls between synthetic Escapes (2 s), and how many before leaving it to the
+// player. An Escape on a pause menu that is already open would close it, so the
+// wait has to outlast Quit To Menu being found and pressed.
+constexpr uint32_t kEscapePolls = 4;
+constexpr uint32_t kMaxEscapes  = 5;
 
 // WHERE THIS PEER IS, from two independent readings, because either can drift.
 //
@@ -72,6 +81,9 @@ struct State {
 
     // --- client ---
     bool     pending      = false;  // told to leave, still in a run
+    bool     reload       = false;  // ...and the House does not count as out
+    uint32_t escape_polls = 0;
+    uint32_t escapes      = 0;
     uint32_t presses      = 0;
     uint32_t cooldown     = 0;
     bool     said_gave_up = false;
@@ -259,6 +271,27 @@ Where refresh_where(const char** out_name) {
     return g.where;
 }
 
+// Opening the pause menu has no entry point (see kBtnName_PauseQuitToMenu), but
+// the game opens it on Escape, so Escape is what it gets. Button::update then
+// finds Quit To Menu the way it does when the player presses the key.
+void post_escape() {
+    HWND hwnd = (HWND)ui_window();
+    if (!hwnd) return;
+    const LPARAM down = 1 | ((LPARAM)MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC) << 16);
+    PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, down);
+    PostMessageW(hwnd, WM_KEYUP,   VK_ESCAPE, down | 0xC0000000);
+}
+
+void arm_departure() {
+    g.pending       = true;
+    g.presses       = 0;
+    g.cooldown      = 0;
+    g.said_gave_up  = false;
+    g.said_sidebar  = false;
+    g.escapes       = 0;
+    g.escape_polls  = kEscapePolls - 1;   // the first one goes out on the next poll
+}
+
 void report_broken() {
     if (g.said_broken) return;
     g.said_broken = true;
@@ -335,6 +368,18 @@ void leave_set_base(uintptr_t /*base*/) {
 // which is finer than the thing it describes changes.
 bool leave_in_run() { return g.where == Where::InRun; }
 
+bool leave_on_house() {
+    return g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) == 0;
+}
+
+void leave_request_reload() {
+    ensure_state();
+    if (!g.is_client) return;
+    arm_departure();
+    g.reload = true;
+    log_line("LEAVE", "the host's run changed -- going back to the menu to load it");
+}
+
 void leave_pump() {
     ensure_state();
 
@@ -378,8 +423,10 @@ void leave_pump() {
     //
     // Before the role split, because leave_request_local can arm a host and a
     // departure that completes has to be reported whoever asked for it.
-    if (g.pending && here == Where::OutOfRun) {
+    const bool only_at_house = g.reload && out && strcmp(out, kScene_House) == 0;
+    if (g.pending && here == Where::OutOfRun && !only_at_house) {
         g.pending = false;
+        g.reload  = false;
         ++g.left;
         log_line("LEAVE", "out of the run and on '%s' -- if the host picks a save "
                           "again this peer will follow it back in on its own",
@@ -392,6 +439,17 @@ void leave_pump() {
     if (here == Where::InRun && (g.presses || g.said_gave_up)) {
         g.presses      = 0;
         g.said_gave_up = false;
+    }
+
+    // Only for a client the host sent away: a panel test keeps its hands off the
+    // keyboard. The cooldown means a press is in flight, so wait that out.
+    if (g.pending && g.is_client && !g.cooldown && g.escapes < kMaxEscapes &&
+        ++g.escape_polls >= kEscapePolls) {
+        g.escape_polls = 0;
+        ++g.escapes;
+        post_escape();
+        log_line("LEAVE", "opening the pause menu for you (%u of %u)",
+                 g.escapes, kMaxEscapes);
     }
 
     // Everything below is the ANNOUNCING half, and only that half needs a live
@@ -472,20 +530,14 @@ void leave_on_message(const HostLeftMsg& m) {
         return;
     }
 
-    g.pending      = true;
-    g.presses      = 0;
-    g.cooldown     = 0;
-    g.said_gave_up = false;
+    arm_departure();
 
-    g.said_sidebar = false;
-
-    // THE LINE A PLAYER MUST NOT MISS, and the reason it names a key. There is
-    // no persistent PauseMenu to reach into -- see the header -- so the one
-    // thing this peer cannot do for itself is open the menu.
+    // Still names the key: the Escape posted from leave_pump is a request, and
+    // a window without focus or a dialog in the way can swallow it.
     log_line_lvl(LogLevel::Warn, "LEAVE",
-             "the host has LEFT THE RUN (it is on '%s')%s. Press Escape: the mod "
-             "will press Quit To Menu for you, and if the host starts a run again "
-             "you will be taken back in automatically.",
+             "the host has LEFT THE RUN (it is on '%s')%s. The mod is opening the "
+             "pause menu and pressing Quit To Menu; if nothing happens, press Escape "
+             "yourself. You will be taken back in automatically.",
              m.scene,
              here == Where::InRun
                  ? " and this peer is still in it"

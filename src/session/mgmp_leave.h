@@ -112,4 +112,12 @@ void leave_status(char* out, size_t out_size);
 // because the debug panel should be able to show it.
 bool leave_in_run();
 
+// Whether the House scene is what THIS peer is standing in. Cached like the above.
+bool leave_on_house();
+
+// CLIENT: a fresh save is waiting, so get to the main menu. Unlike a departure
+// from a run, the House does not count as having arrived: it is a place the
+// client can be standing in, and the save can only be applied from the menu.
+void leave_request_reload();
+
 } // namespace mgmp

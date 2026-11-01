@@ -192,6 +192,9 @@ void hook_defaults() {
     // cat turn toward the aim has nobody to diverge from.
     g_cfg.hook[T_UpdateDecision] = false;
 
+    // The shop's purchase. Solo, there is no host for a purchase to diverge from.
+    g_cfg.hook[T_ShopBuy] = false;
+
     // The highlight suppressor. Solo, there is nobody to draw another player's
     // aim for, so the guard it reads can never be raised and the hook would be
     // a detour on a function the game calls constantly for no reason at all.
@@ -249,6 +252,9 @@ void hooks_implied_by(bool net_configured) {
         // peers at different frame rates compute different damage. Implied by a
         // session for the same reason the lockstep hooks are.
         g_cfg.hook[T_UpdateDecision] = true;
+
+        // Only the host's run is real, and a purchase is a run write.
+        g_cfg.hook[T_ShopBuy] = true;
 
         // Implied by the aim preview, and NOT independently switchable: without
         // it mgmp_aim would call the ability highlight with its apply_status
@@ -319,7 +325,14 @@ void config_load(const wchar_t* dll_dir) {
         uint32_t port = g_cfg.net_port;
         read_uint(*net, "port", port, 1, 65535);
         g_cfg.net_port = (uint16_t)port;
+        read_str (*net, "transport", g_cfg.net_transport, sizeof(g_cfg.net_transport));
         read_control(*net);
+
+        if (_stricmp(g_cfg.net_transport, "tcp")   != 0 &&
+            _stricmp(g_cfg.net_transport, "steam") != 0) {
+            warn("net.transport = '%s' is not tcp/steam -- using tcp", g_cfg.net_transport);
+            strncpy_s(g_cfg.net_transport, "tcp", _TRUNCATE);
+        }
 
         if (_stricmp(g_cfg.net_role, "off")    != 0 &&
             _stricmp(g_cfg.net_role, "host")   != 0 &&
@@ -368,6 +381,12 @@ const Config& config() { return g_cfg; }
 // not the whole damage -- T_SFStoreBlob, T_SFLoadBlob, T_UpdateDecision,
 // T_HighlightRefresh, T_CombatMenuUpdate and T_ButtonUpdate were never created.
 // Flipping the flags here is what lets hooks_install_late() put them in.
+bool config_steam() { return _stricmp(g_cfg.net_transport, "steam") == 0; }
+
+void config_set_steam(bool steam) {
+    strncpy_s(g_cfg.net_transport, steam ? "steam" : "tcp", _TRUNCATE);
+}
+
 bool config_set_role(bool host) {
     const char* want = host ? "host" : "client";
     if (_stricmp(g_cfg.net_role, want) == 0) return false;

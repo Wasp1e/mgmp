@@ -51,7 +51,7 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 27;  // 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number
+constexpr uint32_t kProtoVersion = 35;  // 2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 28 ACTION carries the owner's facing -- PlayerBrain's own update calls Character::Face on the owning machine only, so a hover or a manual turn moved facing on one peer and the AI and backstab test then read two different boards, 29 ENTERNODE carries run_id -- a battle id is now the node seed mixed with which load of the run this is, because a host that reloaded mid-battle re-entered the same seed and the first attempt's actions and hashes were accepted as the second's, 30 both peers re-apply the end-of-turn facing at the turn boundary -- not one byte moved, version 12's rule again, because a peer without it reads a different board on the very next enemy turn, 31 the client clears a cat's next-fight statuses before applying a CATDATA -- again no byte moved, but a peer without it doubles every status an event grants, 32 ACTION's facing is now Character+0x390, the target the game settles on, and both it and +0x388 are written -- same bytes, different meaning, which is exactly what version 12 said must bump, 33 the client's adventure shop refuses purchases -- no byte moved, but a peer without it can still level a cat the host never hears about, 34 a `fresh` SAVEFILE can now arrive while the client stands in the House, and it is expected to leave for the menu and reload rather than wait to be told, 35 ENTERNODE carries the run's cat owners
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
 // that will ever approach it; everything in phase 4 is under 128 bytes.
@@ -400,6 +400,7 @@ struct ActionMsg {
     uint8_t  b31        = 0;   // TurnAction+0x31
     int32_t  tx = 0, ty = 0;   // target tile
     int32_t  dx = 0, dy = 0;   // direction
+    int32_t  fx = 0, fy = 0;   // Character+0x388 on the owner; (0,0) = unreadable
     char     gon[64]    = {};  // authored ability name -- the second identity
 };
 
@@ -554,11 +555,16 @@ struct CursorMsg {
 //
 // It also means the protocol never has to SEND a seed: entering the same node
 // is what makes the streams equal.
+constexpr uint32_t kMaxNodeOwners = 16;
 struct EnterNodeMsg {
     uint32_t index      = 0;   // index into MapScreen's node vector (+0x7C/+0x80)
     uint32_t node_count = 0;   // the sender's map size, so a bad index is caught
     uint32_t type       = 0;   // MapNodeType: 5 battle, 6 hard, 8 boss, 12 shop...
     uint64_t seed0      = 0;   // first word of MapNode+0x118
+    uint32_t run_id     = 0;   // which load of the run this is -- see battle_id_for
+    uint8_t  owner_count = 0;  // the run's cat owners -- see mgmp_split.h
+    uint64_t owner_id[kMaxNodeOwners]  = {};
+    uint8_t  owner_pos[kMaxNodeOwners] = {};
 };
 
 // Host -> client: the option the host picked on a decision screen.
@@ -907,6 +913,7 @@ inline uint32_t enc_action(uint8_t* p, uint32_t cap, const ActionMsg& a) {
     w.u8v(a.actor); w.u8v(a.type); w.u8v(a.slot_kind); w.u8v(a.slot_index);
     w.u8v(a.b30);   w.u8v(a.b31);
     w.i32v(a.tx); w.i32v(a.ty); w.i32v(a.dx); w.i32v(a.dy);
+    w.i32v(a.fx); w.i32v(a.fy);
     w.str(a.gon);
     return w.ok ? w.len : 0;
 }
@@ -1068,6 +1075,11 @@ inline uint32_t enc_enter_node(uint8_t* p, uint32_t cap, const EnterNodeMsg& m) 
     Writer w(p, cap);
     w.u8v(MSG_ENTERNODE);
     w.u32v(m.index); w.u32v(m.node_count); w.u32v(m.type); w.u64v(m.seed0);
+    w.u32v(m.run_id);
+    w.u8v(m.owner_count);
+    for (uint32_t i = 0; i < m.owner_count && i < kMaxNodeOwners; ++i) {
+        w.u64v(m.owner_id[i]); w.u8v(m.owner_pos[i]);
+    }
     return w.ok ? w.len : 0;
 }
 
@@ -1145,6 +1157,7 @@ inline bool dec_action(Reader& r, ActionMsg& a) {
     a.actor = r.u8v(); a.type = r.u8v(); a.slot_kind = r.u8v(); a.slot_index = r.u8v();
     a.b30 = r.u8v();   a.b31 = r.u8v();
     a.tx = r.i32v(); a.ty = r.i32v(); a.dx = r.i32v(); a.dy = r.i32v();
+    a.fx = r.i32v(); a.fy = r.i32v();
     r.str(a.gon, sizeof(a.gon));
     // Reject anything that is not a real decision at the edge. Types 6 and 7
     // are locally generated; if one ever arrives, the sender is broken and
@@ -1276,6 +1289,12 @@ inline bool dec_cursor(Reader& r, CursorMsg& c) {
 
 inline bool dec_enter_node(Reader& r, EnterNodeMsg& m) {
     m.index = r.u32v(); m.node_count = r.u32v(); m.type = r.u32v(); m.seed0 = r.u64v();
+    m.run_id = r.u32v();
+    m.owner_count = r.u8v();
+    if (m.owner_count > kMaxNodeOwners) return false;
+    for (uint32_t i = 0; i < m.owner_count; ++i) {
+        m.owner_id[i] = r.u64v(); m.owner_pos[i] = r.u8v();
+    }
     return r.ok;
 }
 

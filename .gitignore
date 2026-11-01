@@ -65,3 +65,9 @@ desktop.ini
 .DS_Store
 
 !third_party/**
+
+/dist/*
+!/dist/mgmp-coop/
+/dist/mgmp-coop/*
+!/dist/mgmp-coop/*.txt
+/dist/mgmp-coop/steam_appid.txt

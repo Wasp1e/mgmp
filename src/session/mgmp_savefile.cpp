@@ -9,6 +9,7 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"   // follow_on_map
+#include "mgmp_leave.h"    // leave_on_house, leave_request_reload
 // A slot click starts a run, which makes the three per-run dedupe caches stale.
 // See the block in savefile_on_slot_click.
 #include "mgmp_catsync.h"
@@ -270,6 +271,16 @@ struct State {
     bool     said_no_flush = false;
     bool     said_mid_node = false;
 
+    // The House has no node pushes, so its sync is the save itself: the file's
+    // mtime is watched while the host stands there. See house_tick.
+    uint32_t house_ticks = 0;
+    bool     in_house    = false;
+    bool     in_run      = false;
+    bool     house_owed  = false;     // back from a run; send even if unchanged
+    uint64_t sent_mtime  = 0;
+    uint64_t seen_mtime  = 0;
+    uint64_t sent_at     = 0;         // GetTickCount64 of the last House push
+
     // --- client ---
     uint8_t* blob      = nullptr;
     uint32_t blob_size = 0;
@@ -485,6 +496,7 @@ bool publish(uint8_t to, bool fresh) {
     uint64_t mtime = 0;
     uint8_t* data = read_whole_file(path, size, mtime);
     if (!data) return false;
+    g.sent_mtime = mtime;
 
     SaveFileMsg m{};
     m.slot  = g.slot;
@@ -533,9 +545,70 @@ bool publish(uint8_t to, bool fresh) {
     return true;
 }
 
+uint64_t save_mtime() {
+    wchar_t wname[128];
+    wide(g.name, wname, 128);
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return 0;
+    return ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) |
+           fad.ftLastWriteTime.dwLowDateTime;
+}
+
+// Nothing in the House can be replicated turn by turn: it has no re-seed, so
+// two peers drift on the first roll. What it does have is a save, so the client
+// is simply handed the file whenever it changes and reloads. A mid-write file
+// is the hazard, hence two readings a second apart before anything goes out,
+// and a floor between pushes because each one costs the client a trip through
+// the menu.
+void house_tick() {
+    constexpr uint32_t kTickFrames  = 60;       // about once a second
+    constexpr uint64_t kMinGapMs    = 30000;
+
+    if (!g.published || !g.have_slot || !net_active()) return;
+    if (++g.house_ticks % kTickFrames) return;
+
+    const bool house = leave_on_house();
+    const bool run   = leave_in_run();
+
+    if (house && !g.in_house && g.in_run) {
+        // Back from a run. The next adventure gets fresh battle ids, and the
+        // node the host stood in means nothing to a peer joining now.
+        follow_on_run_restart();
+        g.house_owed = true;
+    }
+    if (house) g.in_house = true;
+    g.in_run = run;
+    if (!house) return;
+
+    const uint64_t now   = GetTickCount64();
+    const uint64_t mtime = save_mtime();
+    const bool settled   = mtime && mtime == g.seen_mtime;
+    g.seen_mtime = mtime;
+    if (!settled) return;
+    if (mtime == g.sent_mtime && !g.house_owed) return;
+    if (!g.house_owed && now - g.sent_at < kMinGapMs) return;
+
+    if (publish(kNoPeer, /*fresh=*/true)) {
+        g.sent_at    = now;
+        g.house_owed = false;
+        log_line("SAVEFILE", "the house changed -- the client will reload it");
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
+
+void savefile_on_leaving_house() {
+    ensure_state();
+    if (!g.on || g.is_client || !g.in_house || !net_active()) return;
+    g.in_house = false;
+    g.in_run   = true;
+    log_line("SAVEFILE", "the run left the House -- sending it to the client first");
+    publish(kNoPeer, /*fresh=*/true);
+}
 
 // A SECOND, INDEPENDENT ANSWER TO "IS THIS PEER IN A RUN", exported because
 // mgmp_leave needs one that does not go through the loaded-scene list.
@@ -674,7 +747,7 @@ void savefile_pump() {
     if (g.play_cooldown) --g.play_cooldown;
 
     if (!g.on || g.is_client) return;
-    if (g.published) return;
+    if (g.published) { house_tick(); return; }
     if (!net_active()) return;
 
     // THE SILENT STALL. g.have_slot is set by savefile_on_slot_click and by
@@ -780,6 +853,7 @@ bool savefile_on_slot_click(void* ss, int slot) {
     catsync_forget();
     invsync_forget();
     runhist_forget();
+    follow_on_run_restart();
 
     log_line("SAVEFILE", "host chose slot %u '%s' -- publishing it and forgetting "
                          "the per-run cat/inventory/history caches, because this "
@@ -845,17 +919,9 @@ void savefile_on_message(const SaveFileMsg& m) {
                  "was in, so that run is being dropped and reloaded from the "
                  "host's new pick");
 
-        // The residual limit, stated rather than hidden. autoselect only runs
-        // from SaveSelection::update and the auto-Play only from the main menu's
-        // Button::update, so a client standing inside an adventure has no screen
-        // either of them can act on. The blob is kept and applies the moment the
-        // player gets back to the menu -- but nothing can drag them there, so
-        // this has to be said out loud.
-        if (adventure_is_loaded_impl())
-            log_line_lvl(LogLevel::Error, "SAVEFILE",
-                     "!! this peer is INSIDE a run and a save can only be applied "
-                     "from the save-selection screen -- quit to the main menu and "
-                     "the host's new run will load on its own");
+        // autoselect only runs from SaveSelection::update and the auto-Play only
+        // from the main menu's Button::update, so this peer has to get there.
+        leave_request_reload();
     }
 
     if (g.blob) free(g.blob);

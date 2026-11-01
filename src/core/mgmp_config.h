@@ -23,6 +23,10 @@ struct Config {
     char     net_addr[64]  = "127.0.0.1";   // client only
     uint16_t net_port      = 27600;
 
+    // net.transport = tcp | steam. With steam, net.addr is the host's SteamID64
+    // and nobody forwards a port; net.port is then only a loopback detail.
+    char     net_transport[16] = "tcp";
+
     // net.control = "auto", or an array of cat indices into the battle's own
     // character list. auto derives the split from the roster and is the only
     // usable setting for a whole run -- explicit indices cannot be known before
@@ -95,7 +99,7 @@ struct Config {
     // ever correct, and an ini that turned one off by hand produced failures
     // that looked like missing features (see the hook_sfstoreblob note in
     // mgmp_config.cpp).
-    bool     hook[32] = {};
+    bool     hook[40] = {};
 
     // Anything the parser could not make sense of, printed in the startup
     // banner: a misconfigured mod must announce itself, not fail silently.
@@ -124,5 +128,10 @@ const Config& config();
 // Called by session begin(). Returns true if the role actually changed, which
 // is the caller's cue to install the hooks that were skipped at load time.
 bool        config_set_role(bool host);
+
+// True when net.transport says steam. The panel's box writes the same field, so
+// the session never has to care which of the two chose it.
+bool        config_steam();
+void        config_set_steam(bool steam);
 
 } // namespace mgmp

@@ -15,6 +15,7 @@
 #include "mgmp_tuning.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
+#include "mgmp_steamlink.h"
 #include "mgmp_session.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_battleid.h"   // kNoBattle
@@ -402,24 +403,51 @@ void draw_connect() {
     const bool busy = session_request_pending();
     const bool live = net_active();
 
-    ImGui::SetNextItemWidth(150.0f);
-    ImGui::InputText("addr", g.addr, sizeof(g.addr));
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.0f);
-    ImGui::InputInt("port", &g.port, 0, 0);
+    bool steam = config_steam();
+    ImGui::BeginDisabled(busy || live);
+    if (ImGui::Checkbox("through Steam", &steam)) config_set_steam(steam);
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip("Connect through Steam's relays. Nobody forwards a port;"
+                          " both players must be Steam friends.");
+
+    if (steam) {
+        const uint64_t self = steamlink_self_id();
+        if (self) {
+            char id[32];
+            _snprintf_s(id, sizeof(id), _TRUNCATE, "%llu", (unsigned long long)self);
+            ImGui::Text("your ID: %s", id);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("copy")) ImGui::SetClipboardText(id);
+            ImGui::SetItemTooltip("The host sends this to the friend who is joining.");
+        } else {
+            ImGui::TextDisabled("Steam is not reachable");
+        }
+    }
+
+    ImGui::SetNextItemWidth(steam ? 240.0f : 150.0f);
+    ImGui::InputText(steam ? "host's ID" : "addr", g.addr, sizeof(g.addr));
+    if (!steam) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::InputInt("port", &g.port, 0, 0);
+    }
     if (g.port < 1)     g.port = 1;
     if (g.port > 65535) g.port = 65535;
 
     ImGui::BeginDisabled(busy);
 
     if (ImGui::Button("host")) session_request_host((uint16_t)g.port);
-    ImGui::SetItemTooltip("Listen on this port. If a session is already up it is"
-                          " torn down first -- 'host' means start over.");
+    ImGui::SetItemTooltip(steam ? "Wait for a Steam friend to join with your ID. If a"
+                                  " session is already up it is torn down first."
+                                : "Listen on this port. If a session is already up it is"
+                                  " torn down first -- 'host' means start over.");
     ImGui::SameLine();
 
     if (ImGui::Button("join")) session_request_join(g.addr, (uint16_t)g.port);
-    ImGui::SetItemTooltip("Dial addr:port. A client that only lost its socket"
-                          " keeps its run and declines the host's save.");
+    ImGui::SetItemTooltip(steam ? "Connect to the SteamID above. A client that only lost"
+                                  " its connection keeps its run."
+                                : "Dial addr:port. A client that only lost its socket"
+                                  " keeps its run and declines the host's save.");
     ImGui::SameLine();
 
     ImGui::BeginDisabled(!live);
@@ -723,6 +751,8 @@ void ui_shutdown() {
     // and shutdown can run from a thread with no current context.
     g.visible = false;
 }
+
+void* ui_window() { return g.hwnd; }
 
 bool ui_captures_input() {
     if (!g.ready || !g.visible) return false;

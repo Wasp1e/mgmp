@@ -113,6 +113,7 @@ fn_this       o_ButtonUpdate  = nullptr;
 // hold. Same ABI as GetChoice, and for the same reason.
 fn_two_ptr    o_UpdateDecision = nullptr;
 fn_this_c     o_HighlightRefresh = nullptr;
+fn_two_ptr    o_ShopBuy = nullptr;
 
 // MewSaveFile::Store / ::Load. Both are (this, std::string key BY VALUE,
 // ByteStream&); the return value is the key destructor's and no caller reads
@@ -584,6 +585,19 @@ void __fastcall h_ButtonUpdate(void* self) {
     leave_on_button_update(self);
 }
 
+// A client's shop draws the same stock but buys into a copy of the run the host
+// never hears about, so its purchases are refused before a coin moves. Shop+0x7B
+// is the house shop, which is outside the run and stays this peer's own.
+void* __fastcall h_ShopBuy(void* self, void* item) {
+    uint8_t house = 0;
+    mem_read((const uint8_t*)self + 0x7B, &house, sizeof(house));
+    if (!house && lockstep_active() && _stricmp(config().net_role, "client") == 0) {
+        log_line("SHOP", "refused a purchase -- only the host buys during a run");
+        return nullptr;
+    }
+    return o_ShopBuy(self, item);
+}
+
 // The aim preview turns the acting cat while a decision is held, writing the
 // same Character+0x388 the backstab test reads -- under a wall-clock gate, so
 // two peers at different frame rates disagree about damage. Snapshot the field,
@@ -723,6 +737,7 @@ const Binding kBindings[] = {
     { T_ButtonUpdate,     (void*)&h_ButtonUpdate, (void**)&o_ButtonUpdate },
     { T_HighlightRefresh, (void*)&h_HighlightRefresh, (void**)&o_HighlightRefresh },
     { T_UpdateDecision,   (void*)&h_UpdateDecision, (void**)&o_UpdateDecision },
+    { T_ShopBuy,          (void*)&h_ShopBuy,        (void**)&o_ShopBuy        },
 
     { T_SaveScumPenalty, (void*)&h_SaveScum, (void**)&o_SaveScum },
     { T_TimeDelayTick,   (void*)&h_TimeDelay, (void**)&o_TimeDelay },

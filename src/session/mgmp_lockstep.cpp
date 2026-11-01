@@ -201,6 +201,19 @@ struct State {
     // nothing new to learn and the peer is halted anyway.
     bool     dump_sent = false;
     bool     dump_seen = false;
+    // The peer's cat as it stands while it waits for a decision. Written only
+    // from the poll that is waiting on that decision: nothing is running then,
+    // and the next action or end of turn commits its own facing over this one.
+    struct {
+        bool     have = false;
+        uint8_t  cat  = 0;
+        int32_t  fx   = 0, fy = 0;
+        uint32_t turn = 0;
+    } live_face;
+    uint8_t  poll_cat = 0xFF;     // the cat the last GetChoice poll was for
+
+    bool     correcting = false;  // a state-only mismatch waits on the peer's dump
+    char     correcting_why[192] = {};
 
     ActionMsg pending[kMaxPending];
     uint32_t  pend_head = 0, pend_count = 0;
@@ -805,6 +818,7 @@ void snapshot_cats(void* turn_control) {
     g.hashed_count = 0;
     g.dump_sent    = false;
     g.dump_seen    = false;
+    g.correcting   = false;
 
     // --- who is human -------------------------------------------------
     //
@@ -1562,7 +1576,27 @@ void send_state_dump(uint32_t turn) {
 
 // Prints one line per cat whose row differs, and nothing at all for the rows
 // that agree -- which on a real desync is almost all of them.
-void compare_state_dump(const StateDumpMsg& m) {
+// Take the host's HP and shield for a cat that differs in nothing else. As a
+// difference rather than a value, because the cat may have been hit again since
+// the turn the host's table describes. Never kills: the number can be written
+// but a death cannot, so a cat the host still has alive stays alive here.
+static void correct_cat(uint32_t i, const CatState& mine, const CatState& host) {
+    uint8_t* ch = (uint8_t*)g.cats[i];
+    int32_t  hp = 0, shield = 0;
+    if (!mem_read(ch + kChar_HP, &hp, sizeof(hp)) ||
+        !mem_read(ch + kChar_Shield, &shield, sizeof(shield)))
+        return;
+    int32_t new_hp     = hp + (host.hp - mine.hp);
+    int32_t new_shield = shield + (host.shield - mine.shield);
+    if (new_hp < 1) new_hp = 1;
+    if (new_shield < 0) new_shield = 0;
+    mem_write(ch + kChar_HP, &new_hp, sizeof(new_hp));
+    mem_write(ch + kChar_Shield, &new_shield, sizeof(new_shield));
+    log_line("LOCKSTEP", "corrected cat %u to the host's: hp %d -> %d, shield %d -> %d",
+             i, hp, new_hp, shield, new_shield);
+}
+
+void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
     if (g.dump_seen) return;
 
     if (m.stride != sizeof(CatState)) {
@@ -1580,6 +1614,7 @@ void compare_state_dump(const StateDumpMsg& m) {
                              "table is from turn %u -- not diffing two different "
                              "instants)", m.turn, g.hashed_turn);
         g.dump_seen = true;
+        if (g.correcting) { g.correcting = false; halt(g.correcting_why); }
         return;
     }
     g.dump_seen = true;
@@ -1600,9 +1635,21 @@ void compare_state_dump(const StateDumpMsg& m) {
                          "compared:", m.turn, n);
 
     uint32_t differ = 0;
+    bool     only_health = (m.count == g.hashed_count);
+    bool     correct[kMaxCats] = {};
     for (uint32_t i = 0; i < n; ++i) {
         const CatState& a = g.hashed[i];
         const CatState& b = theirs[i];
+
+        if (a.hp != b.hp || a.shield != b.shield) {
+            correct[i] = true;
+            if (a.dead || b.dead || !a.in_battle || !b.in_battle) only_health = false;
+        }
+        if (a.maxhp != b.maxhp || a.dead != b.dead || a.e0 != b.e0 || a.e1 != b.e1 ||
+            a.in_battle != b.in_battle || a.readable != b.readable ||
+            a.linked != b.linked || a.elems != b.elems ||
+            a.tx != b.tx || a.ty != b.ty)
+            only_health = false;
 
         // Field by field, and facing is INCLUDED here even though the hash
         // excludes it. That exclusion is about what may halt a run; it is not a
@@ -1663,6 +1710,33 @@ void compare_state_dump(const StateDumpMsg& m) {
                              "APPLY/DOACTION/TRIGGER lines for the first one, "
                              "back from this turn.", differ, n);
     }
+
+    if (!g.correcting) return;
+    g.correcting = false;
+
+    if (differ == 0 || !only_health) {
+        halt(g.correcting_why);
+        return;
+    }
+    g.diverged = false;
+
+    // Only the host's table is the truth. On the host, and for another client's
+    // table, the diff above is all there is to do.
+    if (net_role() == NetRole::Host || from != 0) {
+        log_line("LOCKSTEP", "turn %u: only health differs -- the client takes the "
+                             "host's numbers and the battle goes on", m.turn);
+        return;
+    }
+
+    // A cat can have left the battle since the table was taken.
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    if (!snapshot_membership(g.snapped_list, live, still_in, appeared)) {
+        halt(g.correcting_why);
+        return;
+    }
+    for (uint32_t i = 0; i < n; ++i)
+        if (correct[i] && still_in[i]) correct_cat(i, g.hashed[i], theirs[i]);
 }
 
 void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
@@ -1691,6 +1765,23 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
                 (unsigned long long)mine.state_hash, (unsigned long long)theirs.state_hash);
     ++g.mismatches;
     if (!g.diverged) { g.diverged = true; g.first_mismatch = mine.turn; }
+
+    // THE STREAMS STILL AGREE, SO THE BATTLE CAN STILL BE SAVED. Both boards rolled
+    // the same dice and differ in a number that statuses left behind, which the
+    // hash cannot see until it lands on HP. Measured 2026-11-01: burn took 2 from
+    // an enemy on the host and 1 on the client, cause not found, and a halt threw
+    // away a battle that was one HP apart. The dumps decide: health alone is
+    // corrected to the host's, anything else halts as before.
+    if (config().net_desync_halt && rng_ok && queue_ok &&
+        g.hashed_valid && g.hashed_turn == mine.turn && !g.correcting) {
+        strcpy_s(g.correcting_why, why);
+        g.correcting = true;
+        g.dump_sent  = false;
+        g.dump_seen  = false;
+        log_line("LOCKSTEP", "!! %s -- comparing the cat tables before halting", why);
+        send_state_dump(mine.turn);
+        return;
+    }
 
     // Both peers publish the table their own hash was taken over, whichever
     // half disagreed. It used to go out only for a state-only mismatch, on the
@@ -2257,7 +2348,7 @@ void lockstep_pump() {
             // after one -- and the peer's HALT usually beats it here.
             case MSG_STATEDUMP:
                 if (stale_battle(m.statedump.battle_id, "a state dump")) break;
-                compare_state_dump(m.statedump);
+                compare_state_dump(m.statedump, m.from);
                 // Answer in kind, so the peer that halted first also gets a
                 // diff in its own log. send_state_dump is idempotent.
                 send_state_dump(m.statedump.turn);
@@ -2301,6 +2392,19 @@ void lockstep_pump() {
 // Defined just below, after its first caller.
 static void apply_remote(const ActionMsg& msg, const void* actor, void* out);
 
+static void write_owner_facing(uint8_t* ch, uint8_t cat, int32_t fx, int32_t fy);
+
+// PlayerBrain+0x360 goes in too: this peer's brain turns the cat back to it.
+constexpr uintptr_t kPBrain_Dir = 0x360;
+
+static void show_live_facing(void* brain, const void* actor, uint8_t cat) {
+    const auto& f = g.live_face;
+    if (!f.have || f.cat != cat || f.turn != g.turn || !g.human_cat[cat]) return;
+    write_owner_facing((uint8_t*)actor, cat, f.fx, f.fy);
+    mem_write((uint8_t*)brain + kPBrain_Dir,     &f.fx, sizeof(f.fx));
+    mem_write((uint8_t*)brain + kPBrain_Dir + 4, &f.fy, sizeof(f.fy));
+}
+
 bool lockstep_fill_choice(void* brain, void* out) {
     if (!g.active || !brain || !out) return false;
     if (g.halted) {
@@ -2323,6 +2427,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
     // turn rather than only the ones this function goes on to act upon. A
     // summon (kNoCat) is nobody's, same as an AI cat.
     g.local_actor = (cat != kNoCat) && g.local_cat[cat];
+    g.poll_cat    = cat;
     if (cat == kNoCat) return false;      // a summon: not in the snapshot, so
                                           // neither peer treats it as owned and
                                           // both let their own AI drive it.
@@ -2469,6 +2574,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
     if (!pend_take(cat, msg)) {
         uint32_t none = TA_None;
         mem_write(out, &none, sizeof(none));
+        show_live_facing(brain, actor, cat);
         return true;                       // nothing yet -- keep waiting, free
     }
     apply_remote(msg, actor, out);
@@ -2793,6 +2899,35 @@ void lockstep_turn_boundary(void* turn_control) {
 }
 
 uint64_t lockstep_battle_id()  { return g.active ? g.battles.current : kNoBattle; }
+void lockstep_live_facing(CursorMsg& out) {
+    Guard guard;
+    if (!g.active || !g.snapped || g.halted || !g.local_actor || g.outstanding) return;
+    if (g.poll_cat >= g.cat_count || !g.human_cat[g.poll_cat]) return;
+
+    int32_t fx = 0, fy = 0;
+    const uint8_t* ch = (const uint8_t*)g.cats[g.poll_cat];
+    if (!mem_read(ch + kChar_FaceTarget,     &fx, sizeof(fx)) ||
+        !mem_read(ch + kChar_FaceTarget + 4, &fy, sizeof(fy)))
+        return;
+    if ((!fx && !fy) || fx < -1 || fx > 1 || fy < -1 || fy > 1) return;
+
+    out.face_cat  = g.poll_cat;
+    out.face_x    = (int8_t)fx;
+    out.face_y    = (int8_t)fy;
+    out.face_turn = g.turn;
+}
+
+void lockstep_on_live_facing(const CursorMsg& c) {
+    Guard guard;
+    g.live_face.have = false;
+    if (c.face_cat == 0xFF || c.battle_id != g.battles.current) return;
+    g.live_face.have = true;
+    g.live_face.cat  = c.face_cat;
+    g.live_face.fx   = c.face_x;
+    g.live_face.fy   = c.face_y;
+    g.live_face.turn = c.face_turn;
+}
+
 bool     lockstep_local_actor(){ return g.active && g.snapped && g.local_actor; }
 
 bool lockstep_peer_owns_character(const void* character) {

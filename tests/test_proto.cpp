@@ -276,6 +276,33 @@ int main() {
         check(!dec_cursor(r, o), "one byte short is rejected");
     }
 
+    printf("\n-- EnterNodeMsg carries the weather --\n");
+    {
+        EnterNodeMsg m{}; m.weather_count = 2;
+        strcpy_s(m.weather[0], "Fog");
+        strcpy_s(m.weather[1], "HeavyRain");
+        uint32_t n = enc_enter_node(buf, sizeof(buf), m);
+        Reader r(buf, n); r.u8v();
+        EnterNodeMsg o{};
+        check(dec_enter_node(r, o), "decodes");
+        check(o.weather_count == 2 && !strcmp(o.weather[0], "Fog") &&
+              !strcmp(o.weather[1], "HeavyRain"), "weather names survive");
+        check(r.pos == r.len, "consumed exactly the frame");
+    }
+
+    printf("\n-- CursorMsg carries the live facing --\n");
+    {
+        CursorMsg c{}; c.face_cat = 7; c.face_x = -1; c.face_y = 1; c.face_turn = 12;
+        uint32_t n = enc_cursor(buf, sizeof(buf), c);
+        Reader r(buf, n); r.u8v();
+        CursorMsg o{};
+        check(dec_cursor(r, o), "decodes");
+        check(o.face_cat == 7 && o.face_x == -1 && o.face_y == 1 && o.face_turn == 12,
+              "a negative direction survives");
+        CursorMsg d{};
+        check(d.face_cat == 0xFF, "no facing by default");
+    }
+
     printf("\n-- EnterNodeMsg carries the node seed --\n");
     {
         // seed0 is the field that matters: EnterNode copies MapNode+0x118

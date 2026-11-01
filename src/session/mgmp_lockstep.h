@@ -114,6 +114,11 @@ void lockstep_catchup(uint8_t peer);
 // answer comes from the roster index of whoever is actually being polled.
 bool lockstep_local_actor();
 
+// The facing of the cat this peer is deciding for, on an outgoing cursor message,
+// and the peer's on an incoming one.
+void lockstep_live_facing(CursorMsg& out);
+void lockstep_on_live_facing(const CursorMsg& c);
+
 // Does a peer -- specifically NOT this one -- own the input for this exact
 // Character? Asked by the combat-menu lock, which has a Character* in hand
 // (CombatMenu+280) and must not depend on who happens to be being polled.

@@ -346,6 +346,7 @@ void cursor_on_message(uint8_t from, const CursorMsg& c) {
     g.peers[from].msg  = c;
     g.peers[from].at   = GetTickCount64();
     g.peers[from].have = true;
+    lockstep_on_live_facing(c);
 }
 
 void cursor_on_status_menu(void* sm) {
@@ -381,6 +382,7 @@ void cursor_on_status_menu(void* sm) {
     // is the only place that has a window to divide by; absent before the first
     // frame, in which case the peer simply keeps the last position it had.
     overlay_local_pointer(out.nx, out.ny, out.mode);
+    lockstep_live_facing(out);
 
     int32_t hx = 0, hy = 0;
     if (read_hover_tile(sm, hx, hy) &&
@@ -403,6 +405,9 @@ void cursor_on_status_menu(void* sm) {
                        out.owns_turn != g.last_sent.owns_turn ||
                        out.nx != g.last_sent.nx || out.ny != g.last_sent.ny ||
                        out.mode != g.last_sent.mode ||
+                       out.face_cat != g.last_sent.face_cat ||
+                       out.face_x != g.last_sent.face_x ||
+                       out.face_y != g.last_sent.face_y ||
                        out.battle_id != g.last_sent.battle_id;
     const uint64_t since = now - g.last_send_at;
     if ((moved && since >= kMinSendGapMs) || since >= kHeartbeatMs) {

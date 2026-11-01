@@ -470,7 +470,7 @@ bool flush_live_run() {
     return true;
 }
 
-bool publish(uint8_t to, bool fresh) {
+bool publish(uint8_t to, uint8_t fresh) {
     ensure_dir();
     if (!g.have_dir) return false;
 
@@ -502,7 +502,7 @@ bool publish(uint8_t to, bool fresh) {
     m.slot  = g.slot;
     m.size  = size;
     m.hash  = savefile_hash(data, size);
-    m.fresh = fresh ? 1 : 0;
+    m.fresh = fresh;
     strncpy_s(m.name, g.name, _TRUNCATE);
     m.data = data;
 
@@ -512,6 +512,11 @@ bool publish(uint8_t to, bool fresh) {
         log_line("SAVEFILE", "!! failed to send %s (%u bytes)", g.name, size);
         return false;
     }
+
+    // Every broadcast sends the client through the menu, so the floor in
+    // house_tick counts from all of them. Measured 2026-11-01: the first publish
+    // did not count, and the client was told to reload twice in a few seconds.
+    if (to == kNoPeer) g.sent_at = GetTickCount64();
 
     if (to == kNoPeer)
         log_line("SAVEFILE", "-> sent slot %u '%s', %u bytes, hash %016llx (%s)",
@@ -580,6 +585,11 @@ void house_tick() {
     }
     if (house) g.in_house = true;
     g.in_run = run;
+
+    // The host started an adventure. Waiting for the first node left the client
+    // in the House for as long as the host looked at the map. On the map because
+    // that is the one place save_adventure may be called from.
+    if (g.in_house && !house && run && follow_on_map()) savefile_on_leaving_house();
     if (!house) return;
 
     const uint64_t now   = GetTickCount64();
@@ -728,10 +738,11 @@ void savefile_catchup(uint8_t peer) {
     if (!g.on || g.is_client) return;
     if (!g.published || !g.have_slot) return;
     if (!net_active()) return;
-    // fresh = false: this peer is being caught up, not told to restart. A
-    // client already in the run must keep it and resync from the per-node
-    // pushes; only a slot click means "drop what you have".
-    publish(peer, /*fresh=*/false);
+    // Not fresh: this peer is being caught up, not told to restart. A client
+    // already in the run must keep it and resync from the per-node pushes; only
+    // a slot click means "drop what you have". Saying the host is in a run lets
+    // a client that is NOT in one follow it there.
+    publish(peer, leave_in_run() ? kSaveCatchupInRun : kSaveCatchup);
 }
 
 void savefile_pump() {
@@ -892,7 +903,13 @@ void savefile_on_message(const SaveFileMsg& m) {
     //
     // The run is kept and the host's per-node CATDATA/INVENTORY/ENTERNODE
     // pushes resynchronise it, which is what a reconnect actually needs.
-    if (g.applied && !m.fresh) {
+    //
+    // Unless the host is in a run and this peer is standing in the House or on
+    // the menu: then there is no run here to keep, and nothing is coming that
+    // would bring it one.
+    const bool drop_ours = m.fresh == kSaveFresh ||
+                           (m.fresh == kSaveCatchupInRun && !leave_in_run());
+    if (g.applied && !drop_ours) {
         ++g.refused;
         if (g.refused == 1)
             log_line("SAVEFILE", "<- host's save (slot %u '%s', hash %016llx) "
@@ -909,7 +926,7 @@ void savefile_on_message(const SaveFileMsg& m) {
     // g.applied, which is set once per process, was the whole reason the second
     // save was declined. Clear it and re-arm the auto-Play so the client can
     // follow the host back through the save screen.
-    if (g.applied && m.fresh) {
+    if (g.applied && drop_ours) {
         g.applied      = false;
         g.play_presses = 0;
         g.play_cooldown = 0;

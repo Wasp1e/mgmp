@@ -625,9 +625,13 @@ void session_update() {
                 break;
 
             case MSG_REFUSE:
+                log_line("SESSION", "!! peer refused us: %s", m.refuse);
+                // A client on the wrong build refuses the host right back. That
+                // loses the host that one peer, not the session: stopping here
+                // left it deaf to the same friend coming back on the right build.
+                if (net_role() == NetRole::Host) break;
                 g.phase = Phase::Refused;
                 set_status("peer refused: %s", m.refuse);
-                log_line("SESSION", "!! peer refused us: %s", m.refuse);
                 return;
 
             // NOT silent, deliberately.

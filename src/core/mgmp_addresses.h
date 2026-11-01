@@ -561,6 +561,9 @@ enum Call : int {
 
     // --- pressing Play for a client that is stuck on the menu ------------
     C_ButtonClick,           // void(Button*, bool force) -- sub_1409764B0
+
+    // --- the weather list (mgmp_follow.cpp) ------------------------------
+    C_StringVecEmplace,      // void(vector<std::string>*, std::string&&)
     C_COUNT
 };
 
@@ -791,6 +794,9 @@ static const CallDesc kCalls[C_COUNT] = {
     // The button is identified by the std::string at Button+504 (kBtn_Name),
     // never by pointer or by position in a panel.
     { 0x0097E8E0, "glaiel::Button::Click" },
+
+    // What add_weather (0x1409283E0) appends to the list with.
+    { 0x0004B0C0, "vector<string>::emplace_back" },
 };
 
 // sub_140138A10 IS NOT A DRAW ROUTINE, and it is in the table above only
@@ -891,6 +897,11 @@ constexpr uintptr_t kDir_CatIdData   = 1472;   // u64*, the run's cat ids
 
 // The other two fields sub_1403B9CE0 ("save the adventure") reads before it
 // calls the inventory writer:  sub_1402E10D0(*(Inventory**)(dir+1416), dir+56).
+// std::vector<std::string> begin / end, read by add_weather and the map's
+// weather display.
+constexpr uintptr_t kDir_WeatherBegin = 0x668;
+constexpr uintptr_t kDir_WeatherEnd   = 0x670;
+
 constexpr uintptr_t kDir_SaveFile  = 56;      // an EMBEDDED MewSaveFile, not a ptr
 constexpr uintptr_t kDir_Inventory = 1416;    // Inventory*
 

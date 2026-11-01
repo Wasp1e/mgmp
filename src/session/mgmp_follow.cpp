@@ -12,6 +12,8 @@
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
+#include "mgmp_addresses.h"
+#include "mgmp_resolve.h"
 #include "mgmp_log.h"
 
 #include <windows.h>
@@ -82,6 +84,8 @@ struct State {
         uint32_t count = 0;
         uint64_t seed  = 0;
         uint32_t run_id = 0;
+        uint8_t  weather_count = 0;
+        char     weather[kMaxNodeWeather][kNodeWeatherLen] = {};
         uint64_t at    = 0;         // tick the host's choice arrived
         bool     held  = false;     // ...and whether we have said we are holding
     };
@@ -258,6 +262,92 @@ void remember_node(uint32_t index, uint32_t count, uint32_t type, uint64_t seed)
     if (moved) nodehash_on_node(seed, index);
 }
 
+// --- the weather waiting for the next fight ---------------------------------
+//
+// Measured 2026-11-01: `Happening` rolled weather on the host, and the next
+// battle opened with the rng apart and every cat equal. The list is not in any
+// push, and neither peer has to agree on how it got there, only on what it holds
+// when the battle reads it.
+
+struct GameString {            // MSVC std::string, short form
+    char     buf[16] = {};
+    uint64_t size    = 0;
+    uint64_t cap     = 15;
+};
+static_assert(sizeof(GameString) == 32, "the list's element size");
+
+static const uint8_t* weather_director() {
+    const void** slot = (const void**)addr_of_data(D_MewDirectorPtr);
+    const void* dir = nullptr;
+    if (!slot || !mem_read(slot, &dir, sizeof(dir))) return nullptr;
+    return (const uint8_t*)dir;
+}
+
+static uint32_t weather_read(char out[kMaxNodeWeather][kNodeWeatherLen]) {
+    const uint8_t* dir = weather_director();
+    if (!dir) return 0;
+    const uint8_t* begin = nullptr;
+    const uint8_t* end   = nullptr;
+    if (!mem_read(dir + kDir_WeatherBegin, &begin, sizeof(begin)) ||
+        !mem_read(dir + kDir_WeatherEnd,   &end,   sizeof(end)) || !begin || end <= begin)
+        return 0;
+
+    const uint32_t n = (uint32_t)((end - begin) / sizeof(GameString));
+    if (n > kMaxNodeWeather)
+        log_line("FOLLOW", "!! %u weathers queued, only %u can be sent", n, kMaxNodeWeather);
+
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n && kept < kMaxNodeWeather; ++i) {
+        GameString s;
+        if (!mem_read(begin + i * sizeof(GameString), &s, sizeof(s))) return kept;
+        if (s.cap > 15 || s.size > 15) {
+            log_line("FOLLOW", "!! a weather name is too long to send");
+            continue;
+        }
+        memcpy(out[kept], s.buf, 16);
+        out[kept][15] = 0;
+        ++kept;
+    }
+    return kept;
+}
+
+static void weather_write(EnterNodeMsg& m) {
+    m.weather_count = (uint8_t)weather_read(m.weather);
+}
+
+// CLIENT, on the map, just before the node.
+static void weather_apply(uint32_t count, const char want[kMaxNodeWeather][kNodeWeatherLen]) {
+    char have[kMaxNodeWeather][kNodeWeatherLen] = {};
+    const uint32_t n = weather_read(have);
+    if (n == count && !memcmp(have, want, count * kNodeWeatherLen)) return;
+
+    log_line("FOLLOW", "weather: the host has %u (first '%s'), this peer %u (first '%s')"
+                       " -- taking the host's", count, count ? want[0] : "-",
+             n, n ? have[0] : "-");
+
+    typedef void (__fastcall *fn_emplace)(void*, void*);
+    fn_emplace emplace = (fn_emplace)addr_of_call(C_StringVecEmplace);
+    const uint8_t* dir = weather_director();
+    if (!emplace || !dir) {
+        log_line("FOLLOW", "!! cannot reach the weather list");
+        return;
+    }
+
+    // Rewound rather than destructed: the names are all in the short form, so
+    // there is nothing behind them to free.
+    uint8_t* vec = (uint8_t*)dir + kDir_WeatherBegin;
+    const uint8_t* begin = nullptr;
+    if (!mem_read(vec, &begin, sizeof(begin))) return;
+    mem_write(vec + (kDir_WeatherEnd - kDir_WeatherBegin), &begin, sizeof(begin));
+
+    for (uint32_t i = 0; i < count; ++i) {
+        GameString s;
+        memcpy(s.buf, want[i], kNodeWeatherLen);
+        s.size = strlen(s.buf);
+        emplace(vec, &s);
+    }
+}
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !net_active() || !map_screen || !node) return true;
@@ -340,6 +430,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     m.seed0      = seed;
     m.run_id     = g.run_id;
     lockstep_owners_write(m);
+    weather_write(m);
     if (net_send_enter_node(m)) {
         ++g.published;
         if (sent) *sent = true;
@@ -467,6 +558,7 @@ void follow_catchup(uint8_t peer) {
     m.seed0      = g.here_seed;
     m.run_id     = g.run_id;
     lockstep_owners_write(m);
+    weather_write(m);
     if (!net_send_enter_node_to(peer, m)) return;
 
     log_line("FOLLOW", "-> re-sent the CURRENT node %u/%u (%s) seed0=%016llx to"
@@ -510,6 +602,8 @@ void follow_on_message(const EnterNodeMsg& m) {
     p.count = m.node_count;
     p.seed  = m.seed0;
     p.run_id = m.run_id;
+    p.weather_count = m.weather_count;
+    memcpy(p.weather, m.weather, sizeof(p.weather));
     // Timed from ARRIVAL, not from the first map update that sees it: the point
     // of the delay is to put a known gap between the host entering a node and
     // this peer entering it, and the map screen may not be ready for a while
@@ -647,6 +741,7 @@ void* follow_map_update(void* map_screen) {
 
     const uint32_t entering = p.index;
     const uint32_t run_id   = p.run_id;
+    weather_apply(p.weather_count, p.weather);
     pending_pop();
     ++g.entered;
     log_line("FOLLOW", "following host into node %u (%s)%s",

@@ -214,11 +214,19 @@ struct State {
 
     bool     correcting = false;  // a state-only mismatch waits on the peer's dump
     char     correcting_why[192] = {};
+    uint64_t hashed_rng[4] = {};  // the stream the hash at hashed_turn was taken over
+    uint64_t host_hash_battle = 0;  // the last hash of the host's that was compared
+    uint32_t host_hash_turn   = 0;
 
     ActionMsg pending[kMaxPending];
     uint32_t  pend_head = 0, pend_count = 0;
 
     bool     outstanding = false;   // a local decision is sent but not applied
+    struct {                        // ...and which one it was
+        uint32_t    type = 0;
+        const void* ability = nullptr;
+        int32_t     tx = 0, ty = 0, dx = 0, dy = 0;
+    } last_sent;
 
     // The facing carried by the decision about to be applied, on BOTH peers.
     // PlayerBrain's own update calls Character::Face on the owning machine only
@@ -337,6 +345,50 @@ struct Guard {
     Guard()  { if (g.cs_ready) EnterCriticalSection(&g.cs); }
     ~Guard() { if (g.cs_ready) LeaveCriticalSection(&g.cs); }
 };
+
+// mgmp_owners.txt beside the log. See the note in mgmp_split.h. Only the host
+// touches it: the client's table always comes from the host.
+void owners_path(wchar_t* out, size_t cap) {
+    wcsncpy_s(out, cap, config().log_path, _TRUNCATE);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    wcsncpy_s(slash ? slash + 1 : out, cap - (slash ? slash + 1 - out : 0),
+              L"mgmp_owners.txt", _TRUNCATE);
+}
+
+void owners_save() {
+    wchar_t path[MAX_PATH];
+    owners_path(path, MAX_PATH);
+    char text[kMaxOwners * 32];
+    const uint32_t n = split_format(g.owners, text, sizeof(text));
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") || !f) {
+        log_line("LOCKSTEP", "!! could not write the cat owners -- a reload will deal"
+                             " the cats afresh");
+        return;
+    }
+    fwrite(text, 1, n, f);
+    fclose(f);
+}
+
+void owners_load() {
+    if (net_role() != NetRole::Host) return;
+    wchar_t path[MAX_PATH];
+    owners_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") || !f) return;
+    char text[kMaxOwners * 32];
+    const size_t n = fread(text, 1, sizeof(text) - 1, f);
+    fclose(f);
+    text[n] = 0;
+
+    uint64_t run[kMaxOwners];
+    const uint32_t cats = catsync_run_uids(run, kMaxOwners);
+    const OwnerTable saved = split_parse(text);
+    if (!split_covers(saved, run, cats)) return;   // these cats are another run's
+    g.owners = saved;
+    log_line("LOCKSTEP", "cat owners restored from the last session: %u cat(s)",
+             saved.count);
+}
 
 // Defined below, next to the desync compare; declared here because the control
 // check runs earlier in the file and halting is the right answer to a split
@@ -870,6 +922,7 @@ void snapshot_cats(void* turn_control) {
         // A session of one is not a split worth remembering: the first cats it
         // would record are all its own, and the friend arrives to an empty hand.
         split_assign(g.owners, human_id, seen, P, P >= 2, player);
+        if (P >= 2 && net_role() == NetRole::Host) owners_save();
 
         uint32_t mine = 0;
         seen = 0;
@@ -1391,8 +1444,10 @@ HashMsg build_hash(void* turn_control) {
     // agree on -- TLS+0x198 is presentation and is *meant* to differ (measured:
     // 10x variation between runs C and D while all 44 sim draws stayed
     // byte-identical).
-    if (uint64_t* s = rng_global_stream())
+    if (uint64_t* s = rng_global_stream()) {
         h.rng_hash = fnv1a(s, 32);
+        memcpy(g.hashed_rng, s, sizeof(g.hashed_rng));
+    }
 
     // The decision queue. Cheapest and earliest divergence signal there is:
     // types 6 and 7 exist *because* a passive fired, so a differing proc roll
@@ -1570,6 +1625,7 @@ void send_state_dump(uint32_t turn) {
     m.count     = g.hashed_count;
     m.stride    = (uint32_t)sizeof(CatState);
     m.size      = m.count * m.stride;
+    memcpy(m.rng, g.hashed_rng, sizeof(m.rng));
     m.data      = (uint8_t*)g.hashed;
     g.dump_sent = net_send_statedump(m);
 }
@@ -1714,7 +1770,8 @@ void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
     if (!g.correcting) return;
     g.correcting = false;
 
-    if (differ == 0 || !only_health) {
+    const bool rng_differs = memcmp(m.rng, g.hashed_rng, sizeof(m.rng)) != 0;
+    if ((differ == 0 && !rng_differs) || !only_health) {
         halt(g.correcting_why);
         return;
     }
@@ -1737,6 +1794,18 @@ void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
     }
     for (uint32_t i = 0; i < n; ++i)
         if (correct[i] && still_in[i]) correct_cat(i, g.hashed[i], theirs[i]);
+
+    // The stream can only be swapped if nothing has been drawn from it since the
+    // table: a draw already made cannot be made again from the host's numbers.
+    if (rng_differs) {
+        uint64_t* s = rng_global_stream();
+        if (!s || memcmp(s, g.hashed_rng, sizeof(g.hashed_rng)) != 0) {
+            halt(g.correcting_why);
+            return;
+        }
+        memcpy(s, m.rng, sizeof(m.rng));
+        log_line("LOCKSTEP", "corrected the stream to the host's at turn %u", m.turn);
+    }
 }
 
 void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
@@ -1766,13 +1835,12 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
     ++g.mismatches;
     if (!g.diverged) { g.diverged = true; g.first_mismatch = mine.turn; }
 
-    // THE STREAMS STILL AGREE, SO THE BATTLE CAN STILL BE SAVED. Both boards rolled
-    // the same dice and differ in a number that statuses left behind, which the
-    // hash cannot see until it lands on HP. Measured 2026-11-01: burn took 2 from
-    // an enemy on the host and 1 on the client, cause not found, and a halt threw
-    // away a battle that was one HP apart. The dumps decide: health alone is
-    // corrected to the host's, anything else halts as before.
-    if (config().net_desync_halt && rng_ok && queue_ok &&
+    // THE BATTLE CAN STILL BE SAVED WHILE THE QUEUES AGREE. Two measured cases from
+    // 2026-11-01, causes not found: burn took 2 from an enemy on the host and 1 on
+    // the client, and a turn left every cat equal with the streams apart. A halt
+    // threw away both. The dumps decide: health and the stream are corrected to
+    // the host's, anything else halts as before.
+    if (config().net_desync_halt && queue_ok &&
         g.hashed_valid && g.hashed_turn == mine.turn && !g.correcting) {
         strcpy_s(g.correcting_why, why);
         g.correcting = true;
@@ -1822,6 +1890,10 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
 // log that speaks only on mismatch cannot be told apart from a log whose check
 // never ran, and telling those two apart is the entire point of this fix.
 void report_pair(const HashMsg& mine, const HashMsg& theirs, uint8_t peer) {
+    if (peer == 0) {
+        g.host_hash_battle = mine.battle_id;
+        g.host_hash_turn   = mine.turn;
+    }
     if (mine.rng_hash == theirs.rng_hash &&
         mine.queue_depth == theirs.queue_depth &&
         mine.state_hash == theirs.state_hash) {
@@ -2400,7 +2472,21 @@ constexpr uintptr_t kPBrain_Dir = 0x360;
 static void show_live_facing(void* brain, const void* actor, uint8_t cat) {
     const auto& f = g.live_face;
     if (!f.have || f.cat != cat || f.turn != g.turn || !g.human_cat[cat]) return;
-    write_owner_facing((uint8_t*)actor, cat, f.fx, f.fy);
+
+    // The target alone. The sprite turns inside Character::Face, and Character's
+    // update only calls that while current and target differ, so writing both
+    // fields, as a committed action does, moves the numbers and nothing on screen.
+    uint8_t* ch = (uint8_t*)actor;
+    int32_t  tx = 0, ty = 0;
+    if (!mem_read(ch + kChar_FaceTarget,     &tx, sizeof(tx)) ||
+        !mem_read(ch + kChar_FaceTarget + 4, &ty, sizeof(ty)))
+        return;
+    if (tx != f.fx || ty != f.fy) {
+        mem_write(ch + kChar_FaceTarget,     &f.fx, sizeof(f.fx));
+        mem_write(ch + kChar_FaceTarget + 4, &f.fy, sizeof(f.fy));
+        if (g_pf.have && g_pf.ch == ch) { g_pf.tx = f.fx; g_pf.ty = f.fy; }
+        log_line("LOCKSTEP", "cat %u turns to the owner's (%d,%d)", (unsigned)cat, f.fx, f.fy);
+    }
     mem_write((uint8_t*)brain + kPBrain_Dir,     &f.fx, sizeof(f.fx));
     mem_write((uint8_t*)brain + kPBrain_Dir + 4, &f.fy, sizeof(f.fy));
 }
@@ -2507,11 +2593,24 @@ bool lockstep_fill_choice(void* brain, void* out) {
             return true;
         }
 
-        if (g.outstanding) return false;
-
         TurnAction a{};
         if (!mem_read(out, &a, sizeof(a))) return false;
         if (a.type != TA_Ability && a.type != TA_EndTurn) return false;
+
+        // "Sent and not applied yet" covers the same decision polled twice, not
+        // a different one. The game can drop a decision without applying it:
+        // measured 2026-11-01 it dropped a Bolt on both peers, and the attack
+        // the player made next went unsent because the Bolt still counted as
+        // outstanding, so that attack ran on one board only.
+        if (g.outstanding) {
+            if (g.last_sent.type == a.type && g.last_sent.ability == a.ability &&
+                g.last_sent.tx == a.target_x && g.last_sent.ty == a.target_y &&
+                g.last_sent.dx == a.dir_x && g.last_sent.dy == a.dir_y)
+                return false;
+            log_line("LOCKSTEP", "cat %u's last decision was never applied and the "
+                                 "player has made a new one -- sending that",
+                     (unsigned)cat);
+        }
 
         ActionMsg msg{};
         msg.battle_id = g.battles.current;
@@ -2552,6 +2651,10 @@ bool lockstep_fill_choice(void* brain, void* out) {
 
         if (net_send_action(msg)) {
             g.outstanding = true;
+            g.last_sent.type    = a.type;
+            g.last_sent.ability = a.ability;
+            g.last_sent.tx = a.target_x; g.last_sent.ty = a.target_y;
+            g.last_sent.dx = a.dir_x;    g.last_sent.dy = a.dir_y;
             g.pend_face.have = true;
             g.pend_face.cat  = cat;
             g.pend_face.fx   = msg.fx;
@@ -2733,6 +2836,33 @@ static void pin_end_of_turn_facing() {
                        g.end_face.fx, g.end_face.fy);
 }
 
+// A stream that left setup apart from the host's can be swapped for the host's
+// only until the first draw of the battle, and that draw is the NextTurn this
+// runs ahead of. So the client stands still here until the host's turn-0 hash is
+// in and any correction it starts is done. Measured 2026-11-02, battle after
+// KnifeInTheWall: every cat equal, streams apart, the host's dump one frame late,
+// halted. What setup drew differently is unknown. Turn 0 only: at any later turn
+// the host can be a whole human turn away.
+void hold_for_host(const HashMsg& mine) {
+    constexpr uint64_t kHoldMs = 5000;
+    if (net_role() == NetRole::Host || !config().net_desync_halt) return;
+
+    const uint64_t until = GetTickCount64() + kHoldMs;
+    while (!g.halted) {
+        const bool answered = g.host_hash_battle == mine.battle_id &&
+                              g.host_hash_turn == mine.turn;
+        if (answered && !g.correcting) return;
+        if (GetTickCount64() >= until) {
+            log_line("LOCKSTEP", "turn %u: no answer from the host in %llu ms -- "
+                                 "going on without it", mine.turn,
+                     (unsigned long long)kHoldMs);
+            return;
+        }
+        lockstep_pump();
+        Sleep(1);
+    }
+}
+
 void lockstep_turn_boundary(void* turn_control) {
     if (!g.active) return;
 
@@ -2895,6 +3025,8 @@ void lockstep_turn_boundary(void* turn_control) {
             report_pair(mine, theirs, (uint8_t)p);
     }
 
+    if (mine.turn == 0) hold_for_host(mine);
+
     ++g.turn;
 }
 
@@ -2976,9 +3108,20 @@ void lockstep_on_run_restart() {
     g.owners        = OwnerTable{};
 }
 
+bool lockstep_cat_mine(uint64_t id) {
+    Guard guard;
+    const uint32_t players = net_peer_count();
+    const int row = id ? g.owners.find(id) : -1;
+    const uint32_t owner = (row >= 0 && g.owners.pos[row] < players) ? g.owners.pos[row] : 0;
+    return owner == net_peer_pos();
+}
+
 void lockstep_owners_write(EnterNodeMsg& m) {
     static_assert(kMaxOwners == kMaxNodeOwners, "ENTERNODE carries the whole table");
     Guard guard;
+    // Here and not at the split: the client takes its table from this message,
+    // so the host's has to be back before the first node goes out.
+    if (!g.owners.count) owners_load();
     m.owner_count = (uint8_t)g.owners.count;
     for (uint32_t i = 0; i < g.owners.count; ++i) {
         m.owner_id[i]  = g.owners.id[i];

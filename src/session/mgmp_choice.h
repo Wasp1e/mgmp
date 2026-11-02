@@ -129,6 +129,12 @@ bool choice_on_level_select(void* screen, void* opt);
 void choice_on_event_update(void* world_event);
 void choice_on_level_update(void* level_screen);
 
+// HOST: a level-up is being bought in the shop, so the screen that opens next is
+// sent to the client. CLIENT: choice_pump opens that screen, once a frame until
+// this peer is in that shop and between scenes.
+void choice_on_shop_level();
+void choice_pump();
+
 void choice_on_message(const ChoiceMsg& m);
 
 // This peer has ENTERED the node with this seed. Called by mgmp_follow from

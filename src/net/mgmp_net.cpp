@@ -215,6 +215,9 @@ bool relayed(uint8_t type) {
         // everyone else to look at.
         case MSG_AIM:
         case MSG_HALT:
+        // Only a client's pick for its own cat gets here: the host's
+        // reach everyone directly and are never received back.
+        case MSG_CHOICE:
         // NODEHASH is symmetric -- every peer authors its own -- so with more
         // than two players a client's has to reach the other clients, exactly
         // like the per-turn HASH above it.
@@ -321,6 +324,7 @@ void recv_loop(Link& link) {
         }
         m.from = from;
         g.stats.bytes_received += len + 4;
+        if (m.type == MSG_PING) continue;   // its job ended when it crossed the relay
         queue_push(m);
     }
 
@@ -648,6 +652,11 @@ bool net_send_hostleft(const HostLeftMsg& m) { MGMP_SEND_WITH(enc_hostleft, m); 
 bool net_send_refuse (const char* reason) { MGMP_SEND_WITH(enc_refuse,  reason); }
 
 #undef MGMP_SEND_WITH
+
+bool net_send_ping() {
+    const uint8_t p = MSG_PING;
+    return net_send(&p, 1);
+}
 
 bool net_send_hello_to(uint8_t peer, const Hello& h) {
     uint8_t p[512];

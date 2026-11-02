@@ -50,6 +50,11 @@ struct State {
     char     req_addr[64] = {};
     uint16_t req_port = 0;
     char     last_action[128] = {};
+
+    // Where this client dialled, and when it noticed the link had gone.
+    char     dial_addr[64] = {};
+    uint16_t dial_port = 0;
+    uint64_t closed_at = 0;
 };
 
 State g;
@@ -378,6 +383,11 @@ bool begin(bool host, const char* addr, uint16_t port) {
     bool       up    = true;
     const char* why  = "";
 
+    if (!host) {
+        _snprintf_s(g.dial_addr, sizeof(g.dial_addr), _TRUNCATE, "%s", addr ? addr : "");
+        g.dial_port = port;
+    }
+
     if (steam && !host) {
         up = steamlink_join(addr, &dial);
         if (!up) why = steamlink_error();
@@ -496,6 +506,37 @@ void session_shutdown() {
     g.started = false;
 }
 
+// Steam times out a relay session that goes unused for a few minutes, and away
+// from a battle board nothing here sends anything: measured 2026-11-01, 6 frames
+// received in a 20-minute session in the House that lost the peer twice, so the
+// run the host started had nobody to go to.
+static void keepalive() {
+    constexpr uint64_t kPingEveryMs = 20000;
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - last < kPingEveryMs) return;
+    last = now;
+    net_send_ping();
+}
+
+// A client that lost the link dials again by itself, so the host's catch-up can
+// bring it into whatever the run is doing now. The wait matters: on 2026-11-02 a
+// join pressed the instant the old session closed was killed by the host still
+// closing that session, and nobody dialled after that.
+static void redial() {
+    constexpr uint64_t kRedialAfterMs = 5000;
+    if (net_role() != NetRole::Client || net_state() != NetState::Closed) {
+        g.closed_at = 0;
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    if (!g.closed_at) g.closed_at = now;
+    if (now - g.closed_at < kRedialAfterMs) return;
+    g.closed_at = 0;
+    log_line("SESSION", "the link to the host dropped -- dialling again");
+    session_request_join(g.dial_addr, g.dial_port);
+}
+
 void session_update() {
     // BEFORE the early return below, deliberately: a Host or Join pressed with
     // no session at all arrives with phase == Off, which is precisely the state
@@ -504,13 +545,19 @@ void session_update() {
 
     if (g.phase == Phase::Off || g.phase == Phase::Refused) return;
 
+    redial();
+
     // Send our HELLO as soon as the socket is up. Both sides do this
     // unconditionally, so neither has to know who speaks first.
     if (g.phase == Phase::Waiting && net_state() == NetState::Connected)
         send_our_hello();
 
     if (g.phase == Phase::Ready) {
+        keepalive();
         lockstep_pump();
+        choice_pump();
+        follow_edit_pump();
+        cursor_off_board();
         // The host's save is published from here rather than at the click,
         // because the click routinely happens before a peer has connected --
         // and, on a new game, before the file it names exists on disk.

@@ -142,7 +142,27 @@ void invsync_on_message(const InventoryMsg& m);
 // dangle is not the screen being ticked. And it is still before EnterNode, so
 // nothing that consumes the inventory -- a battle, a shop -- can have run
 // between the host's push and this peer applying it.
-void invsync_apply_pending(const char* why);
+//
+// True if a push was taken, whether or not it changed anything here.
+bool invsync_apply_pending(const char* why);
+
+// THE CLIENT'S EQUIPMENT EDITS. It sends its whole inventory, naming the host
+// inventory it worked from, and the host holds that while its own inventory
+// screen is up: host logs of 2026-11-02 show the bag changing as an item was
+// picked up and put down, once a second, so the map ticks under an open screen and
+// an apply there would free items that screen is showing.
+//
+// invsync_screen_open is true while such a screen is up on this peer, and always
+// true if that cannot be told, since a wrong true only makes an apply later.
+bool invsync_screen_open();
+
+// 0 if the inventory cannot be read.
+uint64_t invsync_local_hash();
+void     invsync_send_edit();
+
+// HOST: 0 nothing held, 1 applied, -1 refused because the host's own inventory
+// moved since the edit's base. Coins and food stay the host's either way.
+int invsync_take_edit();
 
 // --- the two hook bodies ----------------------------------------------------
 //

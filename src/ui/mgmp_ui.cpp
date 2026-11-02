@@ -43,6 +43,7 @@ struct UI {
 
     HWND     hwnd      = nullptr;
     WNDPROC  prev_wndproc = nullptr;
+    uint32_t synthetic_keys = 0;   // posted Escape messages still on their way
 
     // The pane's own copy of the log. Fed from log_ring_fetch by cursor, so a
     // quiet frame copies nothing.
@@ -604,6 +605,14 @@ void draw_session() {
 // --- input ------------------------------------------------------------------
 
 LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Keys the mod posted for the game itself. A friend who has just used the
+    // panel to rejoin still has it open, and it must not eat the Escape that
+    // takes him out to load the host's run.
+    if (g.synthetic_keys && (msg == WM_KEYDOWN || msg == WM_KEYUP) && wp == VK_ESCAPE) {
+        --g.synthetic_keys;
+        return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
+    }
+
     // The toggle is read before ImGui sees anything, so the panel can always be
     // dismissed even if it has somehow captured the keyboard.
     if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && wp == (WPARAM)g.toggle_vk) {
@@ -753,6 +762,14 @@ void ui_shutdown() {
 }
 
 void* ui_window() { return g.hwnd; }
+
+void ui_post_escape() {
+    if (!g.hwnd) return;
+    const LPARAM down = 1 | ((LPARAM)MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC) << 16);
+    g.synthetic_keys += 2;
+    PostMessageW(g.hwnd, WM_KEYDOWN, VK_ESCAPE, down);
+    PostMessageW(g.hwnd, WM_KEYUP,   VK_ESCAPE, down | 0xC0000000);
+}
 
 bool ui_captures_input() {
     if (!g.ready || !g.visible) return false;

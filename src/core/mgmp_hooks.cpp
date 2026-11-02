@@ -595,6 +595,10 @@ void* __fastcall h_ShopBuy(void* self, void* item) {
         log_line("SHOP", "refused a purchase -- only the host buys during a run");
         return nullptr;
     }
+    constexpr uint32_t kItem_LevelUp = 12;
+    uint32_t type = 0;
+    mem_read(item, &type, sizeof(type));
+    if (!house && type == kItem_LevelUp) choice_on_shop_level();
     return o_ShopBuy(self, item);
 }
 

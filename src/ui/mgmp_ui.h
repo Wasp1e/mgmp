@@ -72,4 +72,7 @@ bool ui_captures_input();
 // The game's HWND, or null before the first swap.
 void* ui_window();
 
+// Press Escape for the game. It goes past the panel, open or not.
+void ui_post_escape();
+
 } // namespace mgmp

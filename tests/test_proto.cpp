@@ -370,6 +370,7 @@ int main() {
         ChoiceMsg m{};
         m.kind = kChoiceLevelUp; m.index = 2; m.count = 4; m.aux = 7;
         m.node_seed = 0x99AF76329BA60F33ull;
+        m.cat = 0x0D;
         strcpy_s(m.name, "FurySwipes");
         uint32_t n = enc_choice(buf, sizeof(buf), m);
         check(n > 0, "encodes");
@@ -385,6 +386,7 @@ int main() {
         // and a held one surfaces on a later node's screen -- measured live on
         // 2026-08-25, where node 6's pick landed on node 3 and corrupted a run.
         check(o.node_seed == 0x99AF76329BA60F33ull, "the node seed survives");
+        check(o.cat == 0x0D, "the cat id survives");
         check(r.pos == r.len, "consumed exactly the frame");
     }
     {
@@ -718,6 +720,7 @@ int main() {
         InventoryMsg out{};
         out.coins = -3; out.food = 41; out.boxes = 0;   // negative: it is an int
         out.hash  = 0x0123456789ABCDEFull;
+        out.base  = 0xFEDCBA9876543210ull;
         out.size[0] = sizeof(back);  out.data[0] = back;
         out.size[1] = sizeof(store); out.data[1] = store;
         out.size[2] = 0;             out.data[2] = nullptr;   // empty trash
@@ -733,6 +736,7 @@ int main() {
         check(dec_inventory(r, in), "decodes");
         check(in.coins == -3 && in.food == 41 && in.boxes == 0, "scalars survive");
         check(in.hash == out.hash, "hash survives");
+        check(in.base == out.base, "base survives");
         check(in.size[0] == sizeof(back) && in.size[1] == sizeof(store), "sizes");
         check(in.size[2] == 0 && in.data[2] == nullptr, "an empty bucket stays empty");
         check(in.data[0] && memcmp(in.data[0], back, sizeof(back)) == 0, "backpack bytes");

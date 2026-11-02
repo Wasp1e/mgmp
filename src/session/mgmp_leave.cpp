@@ -271,17 +271,6 @@ Where refresh_where(const char** out_name) {
     return g.where;
 }
 
-// Opening the pause menu has no entry point (see kBtnName_PauseQuitToMenu), but
-// the game opens it on Escape, so Escape is what it gets. Button::update then
-// finds Quit To Menu the way it does when the player presses the key.
-void post_escape() {
-    HWND hwnd = (HWND)ui_window();
-    if (!hwnd) return;
-    const LPARAM down = 1 | ((LPARAM)MapVirtualKeyW(VK_ESCAPE, MAPVK_VK_TO_VSC) << 16);
-    PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, down);
-    PostMessageW(hwnd, WM_KEYUP,   VK_ESCAPE, down | 0xC0000000);
-}
-
 void arm_departure() {
     g.pending       = true;
     g.presses       = 0;
@@ -314,6 +303,7 @@ void leave_init() {
     g.out_polls  = 0;
     g.announced  = false;
     g.pending    = false;
+    g.reload     = false;
     g.presses    = 0;
     g.cooldown   = 0;
     g.said_gave_up = false;
@@ -443,13 +433,23 @@ void leave_pump() {
 
     // Only for a client the host sent away: a panel test keeps its hands off the
     // keyboard. The cooldown means a press is in flight, so wait that out.
-    if (g.pending && g.is_client && !g.cooldown && g.escapes < kMaxEscapes &&
+    //
+    // Opening the pause menu has no entry point (see kBtnName_PauseQuitToMenu),
+    // but the game opens it on Escape, and Button::update then finds Quit To Menu
+    // the way it does when the player presses the key. The limit only holds once
+    // the menu has been seen: on 2026-11-02 five Escapes in the House opened
+    // nothing, and the friend stayed there with the host's run in hand.
+    if (g.pending && g.is_client && !g.cooldown &&
+        (g.escapes < kMaxEscapes || !g.said_sidebar) &&
         ++g.escape_polls >= kEscapePolls) {
         g.escape_polls = 0;
         ++g.escapes;
-        post_escape();
-        log_line("LEAVE", "opening the pause menu for you (%u of %u)",
-                 g.escapes, kMaxEscapes);
+        ui_post_escape();
+        if (g.escapes <= kMaxEscapes || g.escapes % 15 == 0)
+            log_line("LEAVE", "opening the pause menu for you (try %u) -- window %s, "
+                              "panel %s", g.escapes,
+                     GetForegroundWindow() == (HWND)ui_window() ? "focused" : "NOT focused",
+                     ui_captures_input() ? "holding input" : "not holding input");
     }
 
     // Everything below is the ANNOUNCING half, and only that half needs a live

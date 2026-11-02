@@ -92,6 +92,10 @@ void cursor_shutdown();
 // it touches either, and does nothing at all when the session is not Ready.
 void cursor_on_status_menu(void* status_menu);
 
+// Every frame in a session: sends this peer's pointer on any screen without a
+// battle board, where there is no status menu to send it.
+void cursor_off_board();
+
 // From the lockstep pump. Records where one peer is pointing; the drawing
 // happens on the next StatusMenu::update, not here.
 void cursor_on_message(uint8_t from, const CursorMsg& c);

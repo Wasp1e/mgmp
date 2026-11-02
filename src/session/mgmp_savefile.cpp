@@ -278,6 +278,7 @@ struct State {
     bool     in_run      = false;
     bool     house_owed  = false;     // back from a run; send even if unchanged
     uint64_t sent_mtime  = 0;
+    uint64_t sent_day    = 0;
     uint64_t seen_mtime  = 0;
     uint64_t sent_at     = 0;         // GetTickCount64 of the last House push
 
@@ -470,6 +471,37 @@ bool flush_live_run() {
     return true;
 }
 
+// Which day the save is on, read out of the raw file: the House rewrites the save
+// every few seconds, so a changed file says nothing, and every push sends the
+// client through the menu. Measured 2026-11-01: four reloads in two minutes of
+// standing still. `current_day` is a row in the save's sqlite `properties` table,
+// so its bytes are the value's serial type, the key and then the value. The name
+// also sits in the table's index, which holds a rowid there, hence the page type
+// test. A replaced row can linger as a dead cell on the same page, and the day
+// only goes up, so the largest value found is the live one.
+uint64_t day_signature(const uint8_t* d, uint32_t n) {
+    static const char kKey[] = "current_day";
+    constexpr uint8_t kTableLeaf = 0x0D;
+    const uint32_t len = sizeof(kKey) - 1;
+    if (n < 100) return 0;
+    uint32_t page = ((uint32_t)d[16] << 8) | d[17];
+    if (page == 1) page = 65536;
+    if (page == 0) return 0;
+
+    uint64_t day = 0;
+    for (uint32_t i = 1; i + len + 4 < n; ++i) {
+        if (d[i] != 'c' || memcmp(d + i, kKey, len) != 0) continue;
+        const uint32_t start = i - i % page;
+        if (d[start ? start : 100] != kTableLeaf) continue;
+        const uint8_t serial = d[i - 1];
+        uint64_t value = (serial == 9) ? 1 : 0;
+        if (serial >= 1 && serial <= 4)
+            for (uint32_t b = 0; b < serial; ++b) value = (value << 8) | d[i + len + b];
+        if (value > day) day = value;
+    }
+    return day;
+}
+
 bool publish(uint8_t to, uint8_t fresh) {
     ensure_dir();
     if (!g.have_dir) return false;
@@ -497,6 +529,7 @@ bool publish(uint8_t to, uint8_t fresh) {
     uint8_t* data = read_whole_file(path, size, mtime);
     if (!data) return false;
     g.sent_mtime = mtime;
+    g.sent_day   = day_signature(data, size);
 
     SaveFileMsg m{};
     m.slot  = g.slot;
@@ -599,6 +632,24 @@ void house_tick() {
     if (!settled) return;
     if (mtime == g.sent_mtime && !g.house_owed) return;
     if (!g.house_owed && now - g.sent_at < kMinGapMs) return;
+
+    if (!g.house_owed) {
+        wchar_t wname[128];
+        wide(g.name, wname, 128);
+        wchar_t path[MAX_PATH];
+        _snwprintf_s(path, _TRUNCATE, L"%s\\%s", g.dir, wname);
+
+        uint32_t size = 0;
+        uint64_t read_at = 0;
+        uint8_t* data = read_whole_file(path, size, read_at);
+        if (!data) return;
+        const uint64_t day = day_signature(data, size);
+        free(data);
+        if (day == g.sent_day) {
+            g.sent_mtime = mtime;
+            return;
+        }
+    }
 
     if (publish(kNoPeer, /*fresh=*/true)) {
         g.sent_at    = now;

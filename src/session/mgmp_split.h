@@ -15,7 +15,10 @@
 // THE RULE. A cat is identified by its persistent id, CatData+0x00, and keeps
 // the player it was first given to until the run ends. A cat not seen yet goes
 // to whoever has the fewest cats in this battle, earliest position on a tie, and
-// unseen cats are taken in id order so that speed has no say in it.
+// unseen cats are taken in roster order: the roster is by speed, so the players
+// alternate through the first battle. Taken in id order they did not, measured
+// 2026-11-02: host, friend, friend, host. Speed gained later can still put two
+// of one player's cats side by side, because no cat changes hands to fix it.
 //
 //   4 cats, 2 players  ->  2 / 2
 //   3 cats, 2 players  ->  2 / 1        (the host takes the odd cat, as ever)
@@ -39,10 +42,12 @@
 // one player.
 
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 
 namespace mgmp {
 
-constexpr uint32_t kMaxOwners = 16;       // ENTERNODE's limit; a party is 4
+constexpr uint32_t kMaxOwners = 16;      // ENTERNODE's limit; a party is 4
 constexpr uint32_t kMaxSplitPeers = 32;
 
 struct OwnerTable {
@@ -79,27 +84,64 @@ inline void split_assign(OwnerTable& t, const uint64_t* ids, uint32_t humans,
         }
     }
 
-    for (;;) {
-        // Lowest id first; equal ids can only be 0, and those stay in roster
-        // order, which every peer shares.
-        uint32_t next = humans;
-        for (uint32_t i = 0; i < humans; ++i)
-            if (out[i] == kUnplaced && (next == humans || ids[i] < ids[next])) next = i;
-        if (next == humans) return;
+    for (uint32_t i = 0; i < humans; ++i) {
+        if (out[i] != kUnplaced) continue;
 
         uint32_t best = 0;
         for (uint32_t p = 1; p < peers; ++p)
             if (load[p] < load[best]) best = p;
 
-        out[next] = (uint8_t)best;
+        out[i] = (uint8_t)best;
         ++load[best];
 
-        if (remember && ids[next] && t.find(ids[next]) < 0 && t.count < kMaxOwners) {
-            t.id[t.count]  = ids[next];
+        if (remember && ids[i] && t.find(ids[i]) < 0 && t.count < kMaxOwners) {
+            t.id[t.count]  = ids[i];
             t.pos[t.count] = (uint8_t)best;
             ++t.count;
         }
     }
+}
+
+// THE TABLE ON DISK. Reloading a run starts the table over, and the roster it is
+// rebuilt from has moved with every speed gained, so the same run came back with
+// two cats swapped: measured 2026-11-03. The host keeps a file, one "id position"
+// line per cat. A cat's id outlives a run, so the file carries no run id: it
+// applies when it names every cat in the run.
+inline uint32_t split_format(const OwnerTable& t, char* out, uint32_t cap) {
+    uint32_t n = 0;
+    if (cap) out[0] = 0;
+    for (uint32_t i = 0; i < t.count; ++i) {
+        const int w = snprintf(out + n, cap - n, "%016llx %u\n",
+                               (unsigned long long)t.id[i], (unsigned)t.pos[i]);
+        if (w < 0 || (uint32_t)w >= cap - n) break;
+        n += (uint32_t)w;
+    }
+    return n;
+}
+
+inline OwnerTable split_parse(const char* text) {
+    OwnerTable t;
+    while (*text && t.count < kMaxOwners) {
+        unsigned long long id = 0;
+        unsigned pos = 0;
+        if (sscanf_s(text, "%llx %u", &id, &pos) == 2 && id && pos < 256 &&
+            t.find(id) < 0) {
+            t.id[t.count]  = id;
+            t.pos[t.count] = (uint8_t)pos;
+            ++t.count;
+        }
+        const char* eol = strchr(text, '\n');
+        if (!eol) break;
+        text = eol + 1;
+    }
+    return t;
+}
+
+inline bool split_covers(const OwnerTable& t, const uint64_t* ids, uint32_t n) {
+    if (!n) return false;
+    for (uint32_t i = 0; i < n; ++i)
+        if (t.find(ids[i]) < 0) return false;
+    return true;
 }
 
 } // namespace mgmp

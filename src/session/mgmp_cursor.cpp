@@ -178,6 +178,7 @@ struct State {
     // that can be wrong here can be wrong sixty times a second.
     bool said_no_ui       = false;
     bool said_epoch_skew  = false;
+    uint64_t board_at     = 0;     // the last frame a battle board sent the cursor
     uint32_t drawn_frames = 0;
 } g;
 
@@ -349,6 +350,33 @@ void cursor_on_message(uint8_t from, const CursorMsg& c) {
     lockstep_on_live_facing(c);
 }
 
+// Away from a battle board the pointer is all there is to share: the map, an
+// event, a level-up, a shop. No tile, and nobody's turn is being faded. The
+// overlay draws whatever arrives, on any screen.
+void cursor_off_board() {
+    constexpr uint64_t kBoardGoneMs = 250;
+    if (!g.on || !net_active()) return;
+    if (GetTickCount64() - g.board_at < kBoardGoneMs) return;
+
+    CursorMsg out;
+    out.battle_id = lockstep_battle_id();
+    out.owns_turn = 1;
+    if (!overlay_local_pointer(out.nx, out.ny, out.mode)) return;
+
+    const bool moved = !g.have_sent ||
+                       out.nx != g.last_sent.nx || out.ny != g.last_sent.ny ||
+                       out.mode != g.last_sent.mode ||
+                       out.on_board != g.last_sent.on_board;
+    const uint64_t now   = GetTickCount64();
+    const uint64_t since = now - g.last_send_at;
+    if (!(moved && since >= kMinSendGapMs) && since < kHeartbeatMs) return;
+    if (net_send_cursor(out)) {
+        g.last_sent    = out;
+        g.have_sent    = true;
+        g.last_send_at = now;
+    }
+}
+
 void cursor_on_status_menu(void* sm) {
     if (!sm) return;
 
@@ -364,6 +392,7 @@ void cursor_on_status_menu(void* sm) {
         if (g.touched_pips) { set_local_pip_alpha(sm, 1.0); g.touched_pips = false; }
         return;   // not on a battle board; nothing to point at
     }
+    g.board_at = GetTickCount64();
 
     const uint64_t battle = lockstep_battle_id();
     const bool     mine   = lockstep_local_actor();

@@ -317,6 +317,13 @@ What caught it was the **ability cross-check** (resolve by slot, validate by GON
 name) — the only thing in the battle layer that looks at what a cat *can do*
 rather than what has *happened to* it.
 
+**`SerializeCatData` does not clear an empty equipment slot on read.** The five
+slots are embedded at `CatData+0x9B0`, stride `0x60`; `sub_14022D2A0` writes a 0
+byte for an empty one (id -1 or empty name) and on reading that byte returns, so
+a live cat keeps the old item. `empty_equipment` in `mgmp_catsync.cpp` clears the
+slots first, and the client re-serializes each applied cat against the host's
+hash, log line `is not the host's after applying it`.
+
 #### Facing is simulation state that presentation writes
 
 **`sub_14011C6F0` is the backstab test**, called from

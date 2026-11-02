@@ -155,6 +155,10 @@ bool net_send_nodehash(const NodeHashMsg& m);
 // been back inside a run.
 bool net_send_hostleft(const HostLeftMsg& m);
 
+// Keeps an otherwise silent link open. The receiver drops it before the queue,
+// so nothing above the transport ever sees one.
+bool net_send_ping();
+
 // The desync dump. Sent at most once per divergence, so it has no throughput
 // budget to respect and no dedupe to do -- by the time it goes out the run is
 // already over.

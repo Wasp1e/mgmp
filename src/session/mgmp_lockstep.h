@@ -100,6 +100,10 @@ void lockstep_on_run_restart();
 void lockstep_owners_write(EnterNodeMsg& m);
 void lockstep_owners_read(const EnterNodeMsg& m);
 
+// Whether this player decides for the cat with this persistent id outside a
+// battle. A cat the table does not know, or whose player has left, is the host's.
+bool lockstep_cat_mine(uint64_t id);
+
 // A peer joined or reconnected: replay this battle's decisions to it so it can
 // fast-forward into a fight already under way. To that peer only.
 void lockstep_catchup(uint8_t peer);

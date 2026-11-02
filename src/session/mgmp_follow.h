@@ -65,6 +65,9 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent);
 // mgmp_hooks.cpp, where every other original lives.
 void* follow_map_update(void* map_screen);
 
+// Every frame in a session: the client's equipment edits. See follow_edit_pump.
+void follow_edit_pump();
+
 void follow_on_message(const EnterNodeMsg& m);
 
 // HOST: tell a peer that just joined which node the run is standing in. ENTERNODE

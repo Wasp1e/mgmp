@@ -1,7 +1,10 @@
 // mgmp_choice -- see mgmp_choice.h for why replicating the CHOICE replaces
 // replicating everything the choice does.
 #include "mgmp_choice.h"
+#include "mgmp_catsync.h"
 #include "mgmp_follow.h"
+#include "mgmp_invsync.h"
+#include "mgmp_lockstep.h"
 #include "mgmp_net.h"
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
@@ -25,10 +28,12 @@ namespace {
 // which resolves *(LevelUpScreen+864) + 240 * index.
 constexpr uintptr_t kEvt_OptBegin  = 224;
 constexpr uintptr_t kEvt_OptEnd    = 232;
+constexpr uintptr_t kEvt_Cat       = 296;   // the event's subject CatData
 
 constexpr uintptr_t kLvl_OptBegin  = 864;
 constexpr uintptr_t kLvl_OptEnd    = 872;
 constexpr uintptr_t kLvl_Committed = 792;   // select_option's "already chose" guard
+constexpr uintptr_t kLvl_Cat       = 0xA0;  // the CatData being levelled
 
 constexpr uintptr_t kOptStride     = 240;
 
@@ -47,6 +52,62 @@ constexpr uintptr_t kLvlOpt_Name = 200;
 constexpr uint32_t kMaxOptions = 64;
 
 using fn_cap = void (__fastcall*)(void*);
+
+// A level-up bought in a shop opens from inside the purchase, which only the host
+// makes. The tail of that branch (sub_14079ACB0, type 12) is all the client needs:
+// it hands sub_14079C5C0 the scene on top, the Shop and a list of cats, and the
+// transition takes the list over. Its callback reads Shop+0x20 and +0x28 when the
+// fade ends, so a null Shop crashes a second later: measured 2026-11-03. The options
+// then roll from the cat alone, so the two screens match. The cat comes from the
+// host because the pick in front of this call, sub_14079B2C0, is not worth repeating.
+constexpr uintptr_t kRva_SceneMgr   = 0x13C5BA8;  // data
+constexpr uintptr_t kRva_LevelOpen  = 0x79C5C0;
+constexpr uintptr_t kRva_SceneTop   = 0x96B3E0;
+constexpr uintptr_t kRva_CatVecCopy = 0x483A0;
+constexpr uintptr_t kMgr_Busy       = 0x38;
+constexpr uintptr_t kMgr_Scenes     = 0x18;
+constexpr uintptr_t kScene_Leaving  = 0x4B0;
+
+// This peer's Shop. Nothing the mod holds reaches it and it is not in its scene's
+// component list (measured 2026-11-03: the walk found none), so it is taken from
+// the one call Shop overrides past the base's bookkeeping, slot 10 of its table.
+// Whether that runs once or every frame does not matter here: only a live Shop
+// runs it, and choice_on_node_entered forgets it, so a dead shop is never used.
+constexpr uintptr_t kRva_ShopVtable = 0xF03A88;
+constexpr uintptr_t kRva_ShopStart  = 0x797EA0;
+constexpr uint32_t  kShopStartSlot  = 10;
+
+struct CatVec { uint32_t cap, count; void** data; };   // CustomVector<CatData*>
+struct LevelArgs { void* shop; CatVec cats; };
+
+using fn_vec_copy   = void  (__fastcall*)(CatVec*, const CatVec*);
+using fn_scene_top  = void* (__fastcall*)(void*);
+using fn_level_open = void* (__fastcall*)(void*, void*, void*, LevelArgs*);
+using fn_shop_start = void* (__fastcall*)(void*, void*, void*, void*);
+
+fn_shop_start o_shop_start = nullptr;
+void*         g_shop       = nullptr;
+
+void* __fastcall shop_start(void* self, void* b, void* c, void* d) {
+    g_shop = self;
+    return o_shop_start(self, b, c, d);
+}
+
+void watch_shop(uintptr_t base) {
+    if (o_shop_start) return;
+    void** slot = (void**)(base + kRva_ShopVtable) + kShopStartSlot;
+    void*  have = nullptr;
+    DWORD  prot = 0;
+    if (!mem_read(slot, &have, sizeof(have)) || (uintptr_t)have != base + kRva_ShopStart ||
+        !VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+        log_line("CHOICE", "!! the Shop table moved -- a shop level-up opens on the host"
+                           " only");
+        return;
+    }
+    o_shop_start = (fn_shop_start)have;
+    *slot = (void*)&shop_start;
+    VirtualProtect(slot, sizeof(void*), prot, &prot);
+}
 
 struct State {
     bool on        = false;
@@ -93,6 +154,44 @@ struct State {
     uint32_t pending_aux[2]      = {0, 0};
     char     pending_name[2][48] = {};
     bool     pending_warned[2]   = {false, false};
+    uint64_t pending_cat         = 0;   // the cat a held level-up choice is for
+
+    // HOST: what the client picked for its own cats. A queue, because the client
+    // can finish two screens while the host is still on an earlier one.
+    struct PeerPick {
+        uint8_t  kind = 0;
+        uint64_t cat = 0;
+        uint32_t index = 0, count = 0;
+        char     name[48] = {};
+    };
+    static constexpr uint32_t kMaxPicks = 8;
+    PeerPick picks[kMaxPicks];
+    uint32_t pick_count = 0;
+    uint64_t released_cat = 0;    // a pick that could not apply; the host decides
+    void*    said_screen  = nullptr;
+    void*    said_event   = nullptr;
+
+    // Not every level-up reaches the client: one bought in a shop opens on the
+    // host alone, since the client buys nothing. So the host only waits for a
+    // client that said it has the screen, and gives it kOpenWaitMs to say so.
+    static constexpr uint64_t kOpenWaitMs = 5000;
+    uint64_t client_open_cat = 0;
+    uint64_t screen_at       = 0;
+
+    // A shop level-up: the host notes the purchase, and the client holds the
+    // cat until it stands in the same shop.
+    fn_vec_copy   vec_copy   = nullptr;
+    fn_scene_top  scene_top  = nullptr;
+    fn_level_open level_open = nullptr;
+    bool     shop_bought = false;
+    uint64_t shop_cat    = 0;
+    uint64_t shop_seed   = 0;
+    uint64_t shop_at     = 0;
+
+    // A screen opened under the client's inventory is hidden by it, and the
+    // player does not know to look. Wait for the inventory to close, for this
+    // long: past it the screen is there to find when the inventory does close.
+    static constexpr uint64_t kShopHoldMs = 15000;
 
     // Set while we drive the game's own commit path, so the hook that exists to
     // SWALLOW a click does not swallow the click we just injected. Not
@@ -229,6 +328,73 @@ bool inject_level(uint32_t index) {
     return true;
 }
 
+uint64_t screen_cat(const void* screen, uintptr_t off) {
+    void*    cat = nullptr;
+    uint64_t id  = 0;
+    if (!mem_read((const uint8_t*)screen + off, &cat, sizeof(cat)) || !cat) return 0;
+    mem_read(cat, &id, sizeof(id));
+    return id;
+}
+
+// HOST: the screen is for a client's cat, so its owner's pick is what commits it.
+// A pick that cannot apply hands the screen to the host: waiting for a click that
+// has already happened would leave it stuck.
+void apply_peer_pick(uint8_t kind, void* screen, uint64_t cat) {
+    uint32_t at = g.pick_count;
+    for (uint32_t i = g.pick_count; i-- > 0;)
+        if (g.picks[i].kind == kind && g.picks[i].cat == cat) at = i;
+    if (at == g.pick_count) return;
+
+    const uintptr_t bo = (kind == kChoiceLevelUp) ? kLvl_OptBegin : kEvt_OptBegin;
+    const uintptr_t eo = (kind == kChoiceLevelUp) ? kLvl_OptEnd   : kEvt_OptEnd;
+    uint8_t* begin = nullptr; uint32_t count = 0;
+    if (!read_options(screen, bo, eo, begin, count)) return;
+
+    const State::PeerPick p = g.picks[at];
+    for (uint32_t i = at + 1; i < g.pick_count; ++i) g.picks[i - 1] = g.picks[i];
+    --g.pick_count;
+
+    if (p.index >= count || p.count != count) {
+        log_line("CHOICE", "!! the client chose %s option %u/%u and this screen has %u --"
+                           " the host decides this one", kind_name(kind), p.index, p.count,
+                 count);
+        g.released_cat = cat;
+        return;
+    }
+    char mine[48] = {};
+    option_name(kind, begin + (uintptr_t)p.index * kOptStride, mine, sizeof(mine));
+    if (strcmp(mine, p.name) != 0)
+        log_line("CHOICE", "!! %s option %u is '%s' here but '%s' on the client --"
+                           " taking it anyway", kind_name(kind), p.index, mine, p.name);
+    const bool ok = (kind == kChoiceLevelUp) ? inject_level(p.index) : inject_event(p.index);
+    if (ok) {
+        ++g.applied;
+        log_line("CHOICE", "applied the client's %s choice: option %u/%u ('%s')",
+                 kind_name(kind), p.index, count, mine);
+    } else {
+        log_line("CHOICE", "!! failed to apply the client's %s choice %u", kind_name(kind),
+                 p.index);
+        g.released_cat = cat;
+    }
+}
+
+bool safe_open_level(void* scene, void* cat, void* shop) {
+    __try {
+        void*  one = cat;
+        CatVec src{ 1, 1, &one };
+        LevelArgs args{};
+        args.shop = shop;
+        g.vec_copy(&args.cats, &src);       // the game's heap: the game frees it
+        return g.level_open(scene, g.scene_top(scene), nullptr, &args) != nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool prologue_is(uintptr_t addr, const char* bytes, size_t n) {
+    char have[8] = {};
+    return mem_read((const void*)addr, have, n) && memcmp(have, bytes, n) == 0;
+}
+
 // Shared by both apply ticks.
 void apply_pending(uint8_t kind, void* screen) {
     if (!g.pending[kind]) return;
@@ -362,6 +528,20 @@ void choice_set_base(uintptr_t base) {
     g.evt_commit = (fn_cap)evt;
     g.lvl_click  = (fn_cap)lvl;
     g.resolved = true;
+
+    // Optional: without these the host picks a shop level-up, as it always did.
+    watch_shop(base);
+    g.level_open = nullptr;
+    if (prologue_is(base + kRva_LevelOpen,  "\x48\x89\x5C\x24\x10\x4C\x89\x44", 8) &&
+        prologue_is(base + kRva_SceneTop,   "\x40\x57\x48\x83\xEC\x20\x80\xB9", 8) &&
+        prologue_is(base + kRva_CatVecCopy, "\x48\x89\x5C\x24\x08\x48\x89\x74", 8)) {
+        g.vec_copy   = (fn_vec_copy)(base + kRva_CatVecCopy);
+        g.scene_top  = (fn_scene_top)(base + kRva_SceneTop);
+        g.level_open = (fn_level_open)(base + kRva_LevelOpen);
+    } else {
+        log_line("CHOICE", "!! the level-up screen functions moved -- a shop level-up"
+                           " opens on the host only");
+    }
 }
 
 void choice_init() {
@@ -405,25 +585,28 @@ bool choice_on_event_commit(void* cap) {
     if (!g.on || !cap) return true;
     if (g.injecting) return true;           // this is our own injected click
 
-    Guard guard;
-
     void* we    = nullptr;
     void* entry = nullptr;
     if (!mem_read((const uint8_t*)cap + 8,  &we,    sizeof(we)))    return true;
     if (!mem_read((const uint8_t*)cap + 16, &entry, sizeof(entry))) return true;
+
+    const uint64_t cat  = screen_cat(we, kEvt_Cat);
+    const bool     mine = lockstep_cat_mine(cat);
+
+    Guard guard;
     g.world_event = we;
 
     uint8_t* begin = nullptr; uint32_t count = 0;
     const bool have = read_options(we, kEvt_OptBegin, kEvt_OptEnd, begin, count);
 
-    if (g.is_client) {
+    if (!mine && cat != g.released_cat) {
         ++g.swallowed;
-        log_line("CHOICE", "suppressed a local event click -- the host owns this run's"
-                           " choices (this peer had %u option(s))", have ? count : 0);
+        log_line("CHOICE", "suppressed a local event click -- cat %016llx belongs to the"
+                           " other player", (unsigned long long)cat);
         return false;                        // do NOT run the original
     }
 
-    // Host: name the index, publish it, then let the click through.
+    // The cat's owner: name the index, publish it, then let the click through.
     if (!have) {
         log_line("CHOICE", "!! could not read this event's option array -- the peer will"
                            " not be told which option was picked");
@@ -441,6 +624,7 @@ bool choice_on_event_commit(void* cap) {
     m.index = (uint32_t)(delta / kOptStride);
     m.count = count;
     m.node_seed = follow_here_seed();
+    m.cat   = cat;
     option_name(kChoiceEvent, (const uint8_t*)entry, m.name, sizeof(m.name));
     if (net_send_choice(m)) {
         ++g.sent;
@@ -451,9 +635,21 @@ bool choice_on_event_commit(void* cap) {
 
 void choice_on_event_update(void* world_event) {
     if (!g.on || !world_event) return;
+
+    const uint64_t cat  = screen_cat(world_event, kEvt_Cat);
+    const bool     mine = lockstep_cat_mine(cat);
+
     Guard guard;
     g.world_event = world_event;
+
+    if (g.said_event != world_event && cat) {
+        g.said_event = world_event;
+        log_line("CHOICE", "event screen for cat %016llx -- %s", (unsigned long long)cat,
+                 mine ? "this player picks" : "the other player picks");
+    }
+
     if (g.is_client) apply_pending(kChoiceEvent, world_event);
+    else if (!mine)  apply_peer_pick(kChoiceEvent, world_event, cat);
 }
 
 // --- the level-up screen ---------------------------------------------------
@@ -462,13 +658,22 @@ bool choice_on_level_select(void* screen, void* opt) {
     if (!g.on || !screen || !opt) return true;
     if (g.injecting) return true;
 
+    const uint64_t cat  = screen_cat(screen, kLvl_Cat);
+    const bool     mine = lockstep_cat_mine(cat);
+
     Guard guard;
     g.level_screen = screen;
 
-    if (g.is_client) {
+    const bool nobody_there = !g.is_client && cat != g.client_open_cat &&
+                              GetTickCount64() - g.screen_at >= State::kOpenWaitMs;
+    if (nobody_there && !mine)
+        log_line("CHOICE", "the client has no level-up screen for cat %016llx -- the"
+                           " host picks", (unsigned long long)cat);
+
+    if (!mine && !nobody_there && cat != g.released_cat) {
         ++g.swallowed;
-        log_line("CHOICE", "suppressed a local level-up click -- the host owns this"
-                           " run's choices");
+        log_line("CHOICE", "suppressed a local level-up click -- cat %016llx belongs to"
+                           " the other player", (unsigned long long)cat);
         return false;
     }
 
@@ -508,6 +713,7 @@ bool choice_on_level_select(void* screen, void* opt) {
     m.count = count;
     m.aux   = want_type;
     m.node_seed = follow_here_seed();
+    m.cat   = cat;
     memcpy(m.name, want_name, sizeof(m.name));
     if (net_send_choice(m)) {
         ++g.sent;
@@ -519,15 +725,54 @@ bool choice_on_level_select(void* screen, void* opt) {
 
 void choice_on_level_update(void* level_screen) {
     if (!g.on || !level_screen) return;
+
+    const uint64_t cat  = screen_cat(level_screen, kLvl_Cat);
+    const bool     mine = lockstep_cat_mine(cat);
+
     Guard guard;
     g.level_screen = level_screen;
-    if (!g.is_client) return;
+
+    uint8_t committed = 0;
+    mem_read((const uint8_t*)level_screen + kLvl_Committed, &committed, 1);
+
+    // Cleared on commit, not compared alone: the next cat's screen can be
+    // allocated at the same address.
+    if (committed) {
+        g.said_screen = nullptr;
+    } else if (g.said_screen != level_screen) {
+        g.said_screen = level_screen;
+        g.screen_at   = GetTickCount64();
+        log_line("CHOICE", "level-up screen for cat %016llx -- %s", (unsigned long long)cat,
+                 mine ? "this player picks" : "the other player picks");
+        if (!g.is_client && g.shop_bought) {
+            g.shop_bought = false;
+            ChoiceMsg m{};
+            m.kind = kChoiceShop;
+            m.cat  = cat;
+            m.node_seed = follow_here_seed();
+            net_send_choice(m);
+        }
+        if (g.is_client && mine) {
+            ChoiceMsg m{};
+            m.kind = kChoiceOpen;
+            m.cat  = cat;
+            net_send_choice(m);
+        }
+    }
+
+    if (!g.is_client) {
+        if (!mine && !committed) apply_peer_pick(kChoiceLevelUp, level_screen, cat);
+        return;
+    }
+
+    // A choice for the cat on the next screen is not due yet. This peer can get
+    // there behind the host now that some of the screens are its own to finish.
+    if (g.pending[kChoiceLevelUp] && g.pending_cat && g.pending_cat != cat) return;
 
     // select_option no-ops once LevelUpScreen+792 is set, so injecting into a
     // screen that already committed would be swallowed by the GAME rather than
     // by us -- silently. Drop the held choice instead, and say so.
-    uint8_t committed = 0;
-    if (mem_read((const uint8_t*)level_screen + kLvl_Committed, &committed, 1) && committed) {
+    if (committed) {
         if (g.pending[kChoiceLevelUp]) {
             log_line("CHOICE", "!! a level-up choice arrived for a screen that has already"
                                " committed -- dropping it");
@@ -538,20 +783,93 @@ void choice_on_level_update(void* level_screen) {
     apply_pending(kChoiceLevelUp, level_screen);
 }
 
+// --- a level-up bought in a shop -------------------------------------------
+
+void choice_on_shop_level() {
+    if (!g.on || g.is_client) return;
+    Guard guard;
+    g.shop_bought = true;
+}
+
+void choice_pump() {
+    if (!g.on || !g.is_client || !g.shop_cat || !g.level_open) return;
+    Guard guard;
+    if (g.shop_seed != g.here_seed) return;     // still on the way to that shop
+    if (invsync_screen_open() && GetTickCount64() - g.shop_at < State::kShopHoldMs) return;
+
+    void* mgr = nullptr;
+    if (!mem_read((const void*)(g.base + kRva_SceneMgr), &mgr, sizeof(mgr)) || !mgr) return;
+    uint8_t busy = 0;
+    if (!mem_read((const uint8_t*)mgr + kMgr_Busy, &busy, 1) || busy) return;
+    void* list  = nullptr;
+    void* scene = nullptr;
+    if (!mem_read((const uint8_t*)mgr + kMgr_Scenes, &list, sizeof(list)) || !list) return;
+    if (!mem_read((const uint8_t*)list + 8, &scene, sizeof(scene)) || !scene) return;
+    if (!mem_read((const uint8_t*)scene + kScene_Leaving, &busy, 1) || busy) return;
+
+    const uint64_t id = g.shop_cat;
+    g.shop_cat = 0;
+    void* cat  = catsync_cat_by_uid(id);
+    void* shop = g_shop;
+    if (cat && shop && safe_open_level(scene, cat, shop))
+        log_line("CHOICE", "opened the host's shop level-up for cat %016llx",
+                 (unsigned long long)id);
+    else {
+        log_line("CHOICE", "!! could not open the shop level-up for cat %016llx (cat %p,"
+                           " shop %p) -- the host will pick it",
+                 (unsigned long long)id, cat, shop);
+        ChoiceMsg none{};           // takes back the kChoiceOpen, so the host stops waiting
+        none.kind = kChoiceOpen;
+        net_send_choice(none);
+    }
+}
+
 // --- receiving -------------------------------------------------------------
 
 void choice_on_message(const ChoiceMsg& m) {
     if (!g.on) return;
     Guard guard;
 
-    if (!g.is_client) {
-        // Same asymmetry mgmp_follow reports: the message is host -> client, so
-        // a host receiving one is talking to a peer that also believes it hosts.
-        log_line("CHOICE", "!! received a %s choice while hosting -- both peers believe"
-                           " they own the run", kind_name(m.kind));
+    if (m.kind == kChoiceOpen) {
+        if (!g.is_client) g.client_open_cat = m.cat;
+        return;
+    }
+    if (m.kind == kChoiceShop) {
+        if (g.is_client) {
+            g.shop_cat  = m.cat;
+            g.shop_seed = m.node_seed;
+            g.shop_at   = GetTickCount64();
+            // Said now, not when the screen is up, so the host waits for the
+            // player however long the inventory stays open.
+            if (lockstep_cat_mine(m.cat)) {
+                ChoiceMsg open{};
+                open.kind = kChoiceOpen;
+                open.cat  = m.cat;
+                net_send_choice(open);
+            }
+        }
         return;
     }
     const uint8_t kind = (m.kind == kChoiceLevelUp) ? kChoiceLevelUp : kChoiceEvent;
+
+    if (!g.is_client) {
+        if (g.pick_count >= State::kMaxPicks) {
+            log_line("CHOICE", "!! %u picks already held -- dropping the %s choice for"
+                               " cat %016llx", g.pick_count, kind_name(kind),
+                     (unsigned long long)m.cat);
+            return;
+        }
+        State::PeerPick& p = g.picks[g.pick_count++];
+        p.kind  = kind;
+        p.cat   = m.cat;
+        p.index = m.index;
+        p.count = m.count;
+        memcpy(p.name, m.name, sizeof(p.name));
+        p.name[sizeof(p.name) - 1] = '\0';
+        log_line("CHOICE", "<- the client chose %s option %u/%u ('%s') for cat %016llx",
+                 kind_name(kind), m.index, m.count, p.name, (unsigned long long)m.cat);
+        return;
+    }
 
     // A choice for a node mgmp_follow already gave up on. Refusing it here is
     // the other half of choice_on_node_skipped: that one catches the choice
@@ -577,6 +895,7 @@ void choice_on_message(const ChoiceMsg& m) {
     g.pending_count[kind]  = m.count;
     g.pending_aux[kind]    = m.aux;
     g.pending_warned[kind] = false;
+    if (kind == kChoiceLevelUp) g.pending_cat = m.cat;
     memcpy(g.pending_name[kind], m.name, sizeof(g.pending_name[kind]));
     g.pending_name[kind][sizeof(g.pending_name[kind]) - 1] = '\0';
 
@@ -586,9 +905,9 @@ void choice_on_message(const ChoiceMsg& m) {
 
     // Apply immediately if the screen is already up; otherwise the update tick
     // takes it. Doing it here too is what makes the common case land in the
-    // same frame the message arrived.
-    void* screen = (kind == kChoiceLevelUp) ? g.level_screen : g.world_event;
-    if (screen) apply_pending(kind, screen);
+    // same frame the message arrived. A level-up waits for the tick, which knows
+    // which cat the screen is for.
+    if (kind == kChoiceEvent && g.world_event) apply_pending(kind, g.world_event);
 }
 
 void choice_on_node_entered(uint64_t node_seed) {
@@ -602,6 +921,12 @@ void choice_on_node_entered(uint64_t node_seed) {
     // The update ticks re-cache a live pointer on their very next frame.
     g.world_event  = nullptr;
     g.level_screen = nullptr;
+    g_shop         = nullptr;
+    g.pick_count   = 0;
+    g.released_cat = 0;
+    g.client_open_cat = 0;
+    g.shop_bought  = false;
+    if (g.shop_seed != node_seed) g.shop_cat = 0;
 
     // A choice already waiting for THIS node becomes due the moment we arrive.
     // Re-arm the "holding" line so the next one is reported afresh rather than

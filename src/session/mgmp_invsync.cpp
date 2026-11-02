@@ -99,6 +99,8 @@ struct State {
     bool     pend_have = false;
     int32_t  pend_coins = 0, pend_food = 0, pend_boxes = 0;
     uint64_t pend_hash = 0;
+    uint64_t pend_base = 0;
+    uint64_t host_hash = 0;           // client: the last inventory the host sent
     uint32_t pend_size[kInvBuckets] = {};
     uint8_t* pend_data[kInvBuckets] = {};
 
@@ -107,6 +109,40 @@ struct State {
 };
 
 State g;
+
+// IS AN INVENTORY SCREEN UP. Its item boxes exist only while it is, and each one
+// updates every frame, so the last frame a box ticked answers the question. Slot
+// 11 is Button::update's, overridden here; the screen's own only override is not
+// a per-frame one.
+constexpr uintptr_t kRva_ItemBoxVtable = 0xF11828;
+constexpr uintptr_t kRva_ItemBoxUpdate = 0x34E280;
+constexpr uint32_t  kItemBoxUpdateSlot = 11;
+constexpr uint64_t  kBoxGoneMs         = 300;
+
+using fn_box_update = void* (__fastcall*)(void*, void*, void*, void*);
+fn_box_update o_box_update = nullptr;
+uint64_t      g_box_at     = 0;
+
+void* __fastcall box_update(void* a, void* b, void* c, void* d) {
+    g_box_at = GetTickCount64();
+    return o_box_update(a, b, c, d);
+}
+
+void watch_item_boxes(uintptr_t base) {
+    if (o_box_update) return;
+    void** slot = (void**)(base + kRva_ItemBoxVtable) + kItemBoxUpdateSlot;
+    void*  have = nullptr;
+    DWORD  prot = 0;
+    if (!mem_read(slot, &have, sizeof(have)) || (uintptr_t)have != base + kRva_ItemBoxUpdate ||
+        !VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+        log_line("INVSYNC", "!! the inventory item box moved -- an equipment edit waits"
+                            " for the next node");
+        return;
+    }
+    o_box_update = (fn_box_update)have;
+    *slot = (void*)&box_update;
+    VirtualProtect(slot, sizeof(void*), prot, &prot);
+}
 
 uint64_t fnv1a(const void* p, uint32_t n, uint64_t h = 0xCBF29CE484222325ull) {
     const uint8_t* b = (const uint8_t*)p;
@@ -304,6 +340,11 @@ void invsync_set_base(uintptr_t base) {
         return;
     }
     g.resolved = true;
+    watch_item_boxes(base);
+}
+
+bool invsync_screen_open() {
+    return !o_box_update || GetTickCount64() - g_box_at < kBoxGoneMs;
 }
 
 void invsync_init() {
@@ -432,27 +473,24 @@ void invsync_forget() {
     g.last_hash = 0;
 }
 
-void invsync_publish(const char* why) {
-    ensure_state();
-    if (!g.on || g.is_client || !net_active()) return;
-
+// This peer's inventory as a message, hash included. On success the caller owns
+// m.data[*] and frees them with free_local.
+static bool read_local(InventoryMsg& m, const char* why) {
     RunInv ri{};
     if (!run_inv(ri)) {
         // No run yet. Not an error: the host publishes at its first map node,
         // which can be before there is anything to publish.
-        return;
+        return false;
     }
 
-    InventoryMsg m{};
     if (!mem_read((uint8_t*)ri.inventory + kInv_Coins, &m.coins, sizeof(m.coins)) ||
         !mem_read((uint8_t*)ri.inventory + kInv_Food,  &m.food,  sizeof(m.food))  ||
         !mem_read((uint8_t*)ri.inventory + kInv_Boxes, &m.boxes, sizeof(m.boxes))) {
         log_line("INVSYNC", "!! could not read the inventory scalars -- nothing "
                             "published (%s)", why);
-        return;
+        return false;
     }
 
-    bool failed = false;
     for (uint32_t i = 0; i < kInvBuckets; ++i) {
         void* bucket = (uint8_t*)ri.inventory + kBuckets[i].off;
         if (!serialize_bucket(ri.savefile, bucket, kBuckets[i].key,
@@ -464,36 +502,70 @@ void invsync_publish(const char* why) {
                                 "published (%s). If this repeats, the store hook "
                                 "is not firing and the blob went to the save "
                                 "file instead.", kBuckets[i].label, why);
-            failed = true;
-            break;
+            for (uint32_t j = 0; j < i; ++j) free(m.data[j]);
+            return false;
         }
     }
 
-    if (!failed) {
-        uint64_t h = fnv1a(&m.coins, sizeof(m.coins));
-        h = fnv1a(&m.food,  sizeof(m.food),  h);
-        h = fnv1a(&m.boxes, sizeof(m.boxes), h);
-        for (uint32_t i = 0; i < kInvBuckets; ++i) {
-            h = fnv1a(&m.size[i], sizeof(m.size[i]), h);
-            if (m.size[i]) h = fnv1a(m.data[i], m.size[i], h);
-        }
-        m.hash = h;
-
-        if (g.has_last && g.last_hash == h) {
-            ++g.skipped;
-        } else if (net_send_inventory(m)) {
-            g.last_hash = h;
-            g.has_last  = true;
-            ++g.pushed;
-            log_line("INVSYNC", "-> inventory %016llx: %u/%u/%u bytes "
-                                "(backpack/storage/trash), %d coins %d food "
-                                "%d boxes (%s)",
-                     (unsigned long long)h, m.size[0], m.size[1], m.size[2],
-                     m.coins, m.food, m.boxes, why);
-        }
+    uint64_t h = fnv1a(&m.coins, sizeof(m.coins));
+    h = fnv1a(&m.food,  sizeof(m.food),  h);
+    h = fnv1a(&m.boxes, sizeof(m.boxes), h);
+    for (uint32_t i = 0; i < kInvBuckets; ++i) {
+        h = fnv1a(&m.size[i], sizeof(m.size[i]), h);
+        if (m.size[i]) h = fnv1a(m.data[i], m.size[i], h);
     }
+    m.hash = h;
+    return true;
+}
 
+static void free_local(InventoryMsg& m) {
     for (uint32_t i = 0; i < kInvBuckets; ++i) free(m.data[i]);
+}
+
+void invsync_publish(const char* why) {
+    ensure_state();
+    if (!g.on || g.is_client || !net_active()) return;
+
+    InventoryMsg m{};
+    if (!read_local(m, why)) return;
+
+    if (g.has_last && g.last_hash == m.hash) {
+        ++g.skipped;
+    } else if (net_send_inventory(m)) {
+        g.last_hash = m.hash;
+        g.has_last  = true;
+        ++g.pushed;
+        log_line("INVSYNC", "-> inventory %016llx: %u/%u/%u bytes "
+                            "(backpack/storage/trash), %d coins %d food "
+                            "%d boxes (%s)",
+                 (unsigned long long)m.hash, m.size[0], m.size[1], m.size[2],
+                 m.coins, m.food, m.boxes, why);
+    }
+    free_local(m);
+}
+
+uint64_t invsync_local_hash() {
+    ensure_state();
+    if (!g.on) return 0;
+    InventoryMsg m{};
+    if (!read_local(m, "a look at this peer's inventory")) return 0;
+    free_local(m);
+    return m.hash;
+}
+
+void invsync_send_edit() {
+    ensure_state();
+    if (!g.on || !g.is_client || !net_active()) return;
+    InventoryMsg m{};
+    if (!read_local(m, "an equipment edit")) return;
+    m.base = g.host_hash;
+    if (net_send_inventory(m)) {
+        log_line("INVSYNC", "-> this peer's equipment edit: inventory %016llx on top of"
+                            " the host's %016llx",
+                 (unsigned long long)m.hash, (unsigned long long)m.base);
+        g.host_hash = m.hash;      // the next edit stands on this one
+    }
+    free_local(m);
 }
 
 // --- client -----------------------------------------------------------------
@@ -529,6 +601,8 @@ static void free_pending() {
 }
 
 static bool stash_pending(const InventoryMsg& m) {
+    // A second edit stands on the first, and only the first ever saw the host's.
+    const uint64_t base = g.pend_have ? g.pend_base : m.base;
     if (g.pend_have) ++g.coalesced;
     free_pending();
     for (uint32_t i = 0; i < kInvBuckets; ++i) {
@@ -543,6 +617,7 @@ static bool stash_pending(const InventoryMsg& m) {
     g.pend_food  = m.food;
     g.pend_boxes = m.boxes;
     g.pend_hash  = m.hash;
+    g.pend_base  = base;
     g.pend_have  = true;
     return true;
 }
@@ -568,10 +643,11 @@ static void apply_now(const InventoryMsg& m, const char* when) {
         }
     }
 
-    bool scalars =
-        mem_write((uint8_t*)ri.inventory + kInv_Coins, &m.coins, sizeof(m.coins)) &&
-        mem_write((uint8_t*)ri.inventory + kInv_Food,  &m.food,  sizeof(m.food))  &&
-        mem_write((uint8_t*)ri.inventory + kInv_Boxes, &m.boxes, sizeof(m.boxes));
+    // Coins and food are the host's own: an edit moves items and nothing else.
+    bool scalars = !g.is_client ||
+        (mem_write((uint8_t*)ri.inventory + kInv_Coins, &m.coins, sizeof(m.coins)) &&
+         mem_write((uint8_t*)ri.inventory + kInv_Food,  &m.food,  sizeof(m.food))  &&
+         mem_write((uint8_t*)ri.inventory + kInv_Boxes, &m.boxes, sizeof(m.boxes)));
     if (!scalars)
         log_line("INVSYNC", "!! could not write the inventory scalars");
 
@@ -593,10 +669,14 @@ void invsync_on_message(const InventoryMsg& m) {
     ensure_state();
     if (!g.on) return;
     if (!g.is_client) {
-        log_line("INVSYNC", "!! received an inventory from the peer while "
-                            "hosting -- ignored (both peers configured as host?)");
+        // The client's equipment edit. Held for invsync_take_edit: the map keeps
+        // ticking under an open inventory screen, so the tick is not safe here.
+        if (!stash_pending(m))
+            log_line("INVSYNC", "!! could not hold the client's equipment edit -- it is"
+                                " lost");
         return;
     }
+    g.host_hash = m.hash;
 
     if (!defer_applies()) { apply_now(m, "on arrival"); return; }
 
@@ -613,9 +693,42 @@ void invsync_on_message(const InventoryMsg& m) {
     ++g.deferred;
 }
 
-void invsync_apply_pending(const char* why) {
+int invsync_take_edit() {
     ensure_state();
-    if (!g.on || !g.pend_have) return;
+    if (!g.on || g.is_client || !g.pend_have) return 0;
+
+    if (invsync_local_hash() != g.pend_base) {
+        log_line("INVSYNC", "the host's inventory moved since the client's edit (base"
+                            " %016llx) -- the edit is refused",
+                 (unsigned long long)g.pend_base);
+        free_pending();
+        return -1;
+    }
+
+    InventoryMsg m{};
+    m.hash = g.pend_hash;
+    for (uint32_t i = 0; i < kInvBuckets; ++i) {
+        m.size[i] = g.pend_size[i];
+        m.data[i] = g.pend_data[i];
+    }
+    apply_now(m, "the client's equipment edit");
+    // The client holds this already. Sending it back would make it reload a bag
+    // it may be looking at, and any newer edit of its would be overwritten.
+    if (invsync_local_hash() == m.hash) { g.last_hash = m.hash; g.has_last = true; }
+    free_pending();
+    return 1;
+}
+
+bool invsync_apply_pending(const char* why) {
+    ensure_state();
+    if (!g.on || !g.is_client || !g.pend_have) return false;
+
+    // An echo of what this peer already holds. Clearing a bucket frees items a
+    // screen may be showing, so nothing is touched that does not have to be.
+    if (invsync_local_hash() == g.pend_hash) {
+        free_pending();
+        return true;
+    }
 
     InventoryMsg m{};
     m.coins = g.pend_coins;
@@ -628,6 +741,7 @@ void invsync_apply_pending(const char* why) {
     }
     apply_now(m, why);
     free_pending();   // frees the same buffers m borrowed; m is dead here
+    return true;
 }
 
 } // namespace mgmp

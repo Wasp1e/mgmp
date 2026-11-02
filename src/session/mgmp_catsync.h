@@ -97,4 +97,18 @@ void catsync_on_message(const CatDataMsg& m);
 // battle screen, and it is still in time for whatever the node opens.
 void catsync_apply_pending(const char* why);
 
+// The run's cat whose CatData+0 is `uid`, or null. That is the id the battle and
+// choice layers carry, which is not the registry's.
+void* catsync_cat_by_uid(uint64_t uid);
+
+// The CatData+0 of every cat in the run. 0 if any of them cannot be read.
+uint32_t catsync_run_uids(uint64_t* out, uint32_t max);
+
+// The client's equipment edits, the cats' half: see invsync_take_edit.
+// catsync_equipment_sig is a hash over all the run's cats' slots, 0 if unreadable.
+uint64_t catsync_equipment_sig();
+void     catsync_send_equipment();
+// HOST: apply what is held, or with keep false throw it away.
+void     catsync_take_equipment(bool keep);
+
 } // namespace mgmp

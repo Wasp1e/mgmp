@@ -26,8 +26,8 @@ int main() {
         OwnerTable t; uint8_t o[4];
         const uint64_t ids[4] = { 40, 10, 30, 20 };
         split_assign(t, ids, 4, 2, true, o);
-        check(o[1] == 0 && o[3] == 1 && o[2] == 0 && o[0] == 1,
-              "four new cats go out in id order, not roster order");
+        check(o[0] == 0 && o[1] == 1 && o[2] == 0 && o[3] == 1,
+              "four new cats alternate in roster order, whatever their ids");
     }
     {
         OwnerTable t; uint8_t o[3];
@@ -117,6 +117,40 @@ int main() {
         split_assign(t, ids, kMaxOwners + 2, 2, true, o);
         check(t.count == kMaxOwners, "a full table stops growing");
         check(o[kMaxOwners + 1] < 2, "and the overflow is still placed");
+    }
+
+    // --- the table on disk ---------------------------------------------------
+    {
+        OwnerTable t; uint8_t o[4];
+        const uint64_t ids[4] = { 0x8db411c683615c38ULL, 0x069228a12583872bULL,
+                                  0xbe594044d93e9a81ULL, 0xfb397ba372390ef9ULL };
+        split_assign(t, ids, 4, 2, true, o);
+        char text[256];
+        split_format(t, text, sizeof(text));
+        const OwnerTable back = split_parse(text);
+        check(back.count == 4, "every row survives the file");
+        for (uint32_t i = 0; i < 4; ++i)
+            check(back.pos[back.find(ids[i])] == o[i], "and keeps its player");
+        check(split_covers(back, ids, 4), "the same party is covered");
+        const uint64_t dead[3] = { ids[3], ids[0], ids[2] };
+        check(split_covers(back, dead, 3), "so is that party after a death");
+        const uint64_t other[4] = { ids[0], ids[1], ids[2], 77 };
+        check(!split_covers(back, other, 4), "one new cat means another run");
+        check(!split_covers(back, ids, 0), "an unread party means nothing");
+
+        // A reload: the fast cat moved up and the table came off the disk.
+        OwnerTable loaded = split_parse(text);
+        const uint64_t moved[4] = { ids[1], ids[0], ids[2], ids[3] };
+        uint8_t later[4];
+        split_assign(loaded, moved, 4, 2, true, later);
+        check(later[0] == o[1] && later[1] == o[0], "a reload swaps nobody");
+    }
+    {
+        check(split_parse("").count == 0, "an empty file is an empty table");
+        check(split_parse("nonsense\n\n12 1").count == 1, "a bad line costs only itself");
+        char tiny[8];
+        OwnerTable t; t.id[0] = 1; t.count = 1;
+        check(split_format(t, tiny, sizeof(tiny)) == 0, "a short buffer writes no half row");
     }
 
     // --- THE SHARES: balanced and earliest-first for every plausible battle ---

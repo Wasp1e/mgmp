@@ -107,6 +107,13 @@ struct State {
     // Last tick MapScreen::update ran. See follow_on_map: this is what tells
     // the save flush whether the run is between nodes or inside one.
     uint64_t map_tick       = 0;
+    uint64_t inv_tick       = 0;
+
+    // CLIENT: see watch_edits.
+    uint64_t edit_tick      = 0;
+    uint64_t edit_base      = 0;
+    uint64_t edit_seen      = 0;
+    bool     edit_rebase    = true;
 
     // A jump asked for by the debug panel, applied at the tail of the next
     // MapScreen::update -- the same site the follow path enters nodes from.
@@ -348,6 +355,8 @@ static void weather_apply(uint32_t count, const char want[kMaxNodeWeather][kNode
     }
 }
 
+static void take_client_edit();
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !net_active() || !map_screen || !node) return true;
@@ -403,6 +412,11 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // battle is built from the host's cats rather than from the client's stale
     // ones. Reversing these two lines reintroduces the bug this closes.
     //
+    // A click on the map means no inventory screen is open here, which makes this
+    // the one safe moment for what the client edited: applied before the publish,
+    // so a refused edit is rolled back by it and the client ends up with the host's.
+    take_client_edit();
+
     // Everything, not just what changed HERE. The dedupe compares against what
     // this peer last sent, so it cannot see a client that changed its own copy,
     // and the client's shop is live: on 2026-10-31 it bought a level-up the host
@@ -522,6 +536,39 @@ bool read_marker_node(uintptr_t slot, uint32_t& index) {
     return index_of_node(g.map, node, index);
 }
 
+// Where a node is drawn, and where the marker keeps its own position. The map's
+// load path places the marker from exactly these (0x140228AF7). The cats trailing
+// the marker read its position every frame, so they run after it on their own.
+constexpr uintptr_t kNode_Graphic    = 0x160;
+constexpr uintptr_t kGraphic_Pos     = 0x70;    // float x, y
+constexpr uintptr_t kMarker_Object   = 0x48;
+constexpr uintptr_t kObject_Pos      = 0x80;    // double x, y, z
+
+// The client enters a node straight from the host's word, so nothing walks its
+// marker there and the map stayed on the first node for the whole run. Every
+// check here fails to doing nothing: the marker is scenery to the battle, and
+// what a reload reads back is this same slot.
+void place_marker(void* map_screen, void* node) {
+    uint8_t* marker = nullptr;
+    if (!mem_read((const uint8_t*)map_screen + kMap_Marker, &marker, sizeof(marker)) || !marker)
+        return;
+
+    const uint8_t* graphic = nullptr;
+    uint8_t*       object  = nullptr;
+    float          pos[2]  = {};
+    if (!mem_read((const uint8_t*)node + kNode_Graphic, &graphic, sizeof(graphic)) || !graphic ||
+        !mem_read(graphic + kGraphic_Pos, pos, sizeof(pos)) ||
+        !mem_read(marker + kMarker_Object, &object, sizeof(object)) || !object) {
+        log_line("FOLLOW", "!! could not move the map marker to the host's node");
+        return;
+    }
+
+    mem_write(marker + kMarker_AtNode,   &node, sizeof(node));
+    mem_write(marker + kMarker_Selected, &node, sizeof(node));
+    const double xyz[3] = { pos[0], pos[1], 0.0 };
+    mem_write(object + kObject_Pos, xyz, sizeof(xyz));
+}
+
 bool follow_marker_node(uint32_t& index)   { return read_marker_node(kMarker_AtNode,   index); }
 bool follow_selected_node(uint32_t& index) { return read_marker_node(kMarker_Selected, index); }
 
@@ -616,6 +663,62 @@ void follow_on_message(const EnterNodeMsg& m) {
              g.pending_count > 1 ? " -- QUEUED, this peer is still behind" : "");
 }
 
+// CLIENT: did the player change equipment since the last thing that came from the
+// host? A battle and a host's push both change it too, so each moves the baseline
+// instead. An item being dragged is in neither the bag nor a slot, so a change has
+// to hold still for one more look before it goes out.
+static void take_client_edit() {
+    const int edit = invsync_take_edit();
+    if (!edit) return;
+    catsync_take_equipment(edit > 0);
+    if (edit > 0) {
+        log_line("FOLLOW", "took the client's equipment edit");
+        return;
+    }
+    log_line("FOLLOW", "!! refused the client's equipment edit -- the host changed the"
+                       " inventory first");
+    catsync_forget();
+    invsync_forget();
+    catsync_publish("a refused edit");
+    invsync_publish("a refused edit");
+}
+
+static void watch_edits() {
+    const uint64_t sig = catsync_equipment_sig() ^ invsync_local_hash();
+    if (g.edit_rebase) {
+        g.edit_rebase = false;
+        g.edit_base   = sig;
+        g.edit_seen   = sig;
+        return;
+    }
+    if (!sig || sig == g.edit_base) { g.edit_seen = sig; return; }
+    if (sig != g.edit_seen) { g.edit_seen = sig; return; }
+    g.edit_base = sig;
+    log_line("FOLLOW", "this player changed the equipment -- sending it to the host");
+    catsync_send_equipment();
+    invsync_send_edit();
+}
+
+// Once a second, on the map or in a shop: the two places equipment changes hands
+// with nothing else running. A battle would write cats its Characters derive from.
+void follow_edit_pump() {
+    constexpr uint64_t kEveryMs = 1000;
+    if (!g.on) return;
+    Guard guard;
+    const uint64_t now = GetTickCount64();
+    if (now - g.edit_tick < kEveryMs) return;
+    g.edit_tick = now;
+
+    const bool in_shop = g.have_here && strcmp(node_type_name(g.here_type), "shop") == 0;
+    if (!follow_on_map() && !in_shop) return;
+
+    if (g.is_client) {
+        if (!pending_any()) watch_edits();
+    } else if (!invsync_screen_open()) {
+        take_client_edit();
+    }
+}
+
 void* follow_map_update(void* map_screen) {
     if (!g.on || !map_screen) return nullptr;
 
@@ -625,6 +728,16 @@ void* follow_map_update(void* map_screen) {
     // The map is ticking, so the run is BETWEEN nodes. This is the stamp the
     // save flush reads -- see follow_on_map.
     g.map_tick = GetTickCount64();
+
+    // A chest changes the inventory between nodes, and the push at the next node
+    // left the client without the item until then. Once a second because the
+    // publish only sends when the inventory hash moved.
+    if (g.map_tick - g.inv_tick >= 1000) {
+        g.inv_tick = g.map_tick;
+        invsync_publish("changed on the map");
+    }
+    if (!invsync_screen_open() && invsync_apply_pending("on the map"))
+        g.edit_rebase = true;
 
     // --- a jump asked for by the debug panel --------------------------------
     //
@@ -747,6 +860,7 @@ void* follow_map_update(void* map_screen) {
     log_line("FOLLOW", "following host into node %u (%s)%s",
              entering, node_type_name(type),
              pending_any() ? " -- more nodes still queued" : "");
+    g.edit_rebase = true;
 
     // Battle identity, established without negotiating anything: this is the
     // same node the host entered, so `seed` is the same 64 bits it read. The
@@ -778,6 +892,7 @@ void* follow_map_update(void* map_screen) {
     runhist_apply_pending("about to follow the host into a node");
 
     remember_node(entering, count, type, seed);
+    place_marker(map_screen, node);
 
     // A shift-held EnterNode takes a completely different branch (the very
     // first thing it does is SDL_GetScancodeFromKey(SDLK_LSHIFT) and, if down,

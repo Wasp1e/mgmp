@@ -159,9 +159,12 @@ bool invsync_screen_open();
 // 0 if the inventory cannot be read.
 uint64_t invsync_local_hash();
 void     invsync_send_edit();
+bool     invsync_has_pending();
+void     invsync_drop_pending();
 
-// HOST: 0 nothing held, 1 applied, -1 refused because the host's own inventory
-// moved since the edit's base. Coins and food stay the host's either way.
+// HOST: 0 nothing held, 1 applied, 2 the host's bag already is that one, -1 refused
+// because the host's own inventory moved since the edit's base. Coins and food stay
+// the host's either way.
 int invsync_take_edit();
 
 // --- the two hook bodies ----------------------------------------------------

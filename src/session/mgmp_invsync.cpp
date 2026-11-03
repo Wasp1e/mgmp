@@ -100,7 +100,7 @@ struct State {
     int32_t  pend_coins = 0, pend_food = 0, pend_boxes = 0;
     uint64_t pend_hash = 0;
     uint64_t pend_base = 0;
-    uint64_t host_hash = 0;           // client: the last inventory the host sent
+    uint64_t host_hash = 0;           // client: the host's inventory this peer HOLDS
     uint32_t pend_size[kInvBuckets] = {};
     uint8_t* pend_data[kInvBuckets] = {};
 
@@ -651,6 +651,7 @@ static void apply_now(const InventoryMsg& m, const char* when) {
     if (!scalars)
         log_line("INVSYNC", "!! could not write the inventory scalars");
 
+    if (g.is_client) g.host_hash = m.hash;
     ++g.applied;
     log_line("INVSYNC", "<- inventory %016llx: %u/%u buckets applied, "
                         "%d coins %d food %d boxes (%s)%s",
@@ -676,7 +677,6 @@ void invsync_on_message(const InventoryMsg& m) {
                                 " lost");
         return;
     }
-    g.host_hash = m.hash;
 
     if (!defer_applies()) { apply_now(m, "on arrival"); return; }
 
@@ -693,11 +693,23 @@ void invsync_on_message(const InventoryMsg& m) {
     ++g.deferred;
 }
 
+bool invsync_has_pending() { return g.pend_have; }
+void invsync_drop_pending() { free_pending(); }
+
 int invsync_take_edit() {
     ensure_state();
     if (!g.on || g.is_client || !g.pend_have) return 0;
 
-    if (invsync_local_hash() != g.pend_base) {
+    // The game moves the bag on both peers after a fight, a level-up or an event,
+    // and the client reads that as an edit. Measured 2026-11-03: four of five such
+    // "edits" named the very inventory the host had just reached. Nothing to do,
+    // and refusing would roll back whatever the player really changed.
+    const uint64_t local = invsync_local_hash();
+    if (local == g.pend_hash) {
+        free_pending();
+        return 2;
+    }
+    if (local != g.pend_base) {
         log_line("INVSYNC", "the host's inventory moved since the client's edit (base"
                             " %016llx) -- the edit is refused",
                  (unsigned long long)g.pend_base);
@@ -726,6 +738,7 @@ bool invsync_apply_pending(const char* why) {
     // An echo of what this peer already holds. Clearing a bucket frees items a
     // screen may be showing, so nothing is touched that does not have to be.
     if (invsync_local_hash() == g.pend_hash) {
+        g.host_hash = g.pend_hash;
         free_pending();
         return true;
     }

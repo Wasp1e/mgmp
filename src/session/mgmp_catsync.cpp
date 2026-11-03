@@ -9,6 +9,7 @@
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
+#include "mgmp_invsync.h"    // invsync_screen_open
 #include "mgmp_lockstep.h"   // lockstep_in_battle
 
 #include <windows.h>
@@ -528,6 +529,26 @@ void catsync_send_equipment() {
     }
 }
 
+bool catsync_has_pending() { return g.pend_count != 0; }
+void catsync_drop_pending() { free_pending(); }
+
+void catsync_mark_sent() {
+    ensure_state();
+    RunCats rc{};
+    if (!g.on || g.is_client || !run_cats(rc)) return;
+    for (uint32_t i = 0; i < rc.count; ++i) {
+        uint64_t id = 0;
+        void* cat = nullptr;
+        uint8_t* bytes = nullptr;
+        if (!mem_read(&rc.ids[i], &id, sizeof(id)) || !id) continue;
+        if (!safe_by_id((void*)rc.registry, id, &cat) || !cat) continue;
+        const uint32_t n = serialize_cat(cat, &bytes);
+        if (!n) continue;
+        if (uint64_t* prev = remembered(id)) *prev = fnv1a(bytes, n);
+        free(bytes);
+    }
+}
+
 void catsync_take_equipment(bool keep) {
     ensure_state();
     if (!g.on || g.is_client) return;
@@ -637,9 +658,9 @@ static bool stash_pending(const CatDataMsg& m) {
 // same helper shape as mgmp_invsync.
 static bool defer_applies() { return g.is_client && config().net_follow; }
 
-void catsync_apply_pending(const char* why) {
+bool catsync_apply_pending(const char* why) {
     ensure_state();
-    if (!g.on || !g.is_client || !g.pend_count) return;
+    if (!g.on || !g.is_client || !g.pend_count) return false;
 
     const uint32_t n = g.pend_count;
     for (uint32_t i = 0; i < n; ++i) {
@@ -652,6 +673,7 @@ void catsync_apply_pending(const char* why) {
     }
     free_pending();
     g.held_in_battle = false;   // re-arms the line for the next battle
+    return true;
 }
 
 void catsync_on_message(const CatDataMsg& m) {
@@ -701,7 +723,11 @@ void catsync_on_message(const CatDataMsg& m) {
     // already lands. That is still before EnterNode, so it is in time for the
     // battle or shop the node opens, and it is off the battle screen, so it
     // never writes into a live fight.
-    if (!lockstep_in_battle()) {
+    //
+    // An open inventory holds the same way: a push now lands on the map too, and
+    // the screen is showing these cats' slots. follow_edit_pump drains it.
+    const bool hold = lockstep_in_battle() || invsync_screen_open();
+    if (!hold) {
         g.declined_in_battle = false;   // re-arms the line for the next battle
     } else if (defer_applies()) {
         if (!stash_pending(m)) {

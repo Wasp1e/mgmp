@@ -107,13 +107,13 @@ struct State {
     // Last tick MapScreen::update ran. See follow_on_map: this is what tells
     // the save flush whether the run is between nodes or inside one.
     uint64_t map_tick       = 0;
-    uint64_t inv_tick       = 0;
 
     // CLIENT: see watch_edits.
     uint64_t edit_tick      = 0;
     uint64_t edit_base      = 0;
     uint64_t edit_seen      = 0;
     bool     edit_rebase    = true;
+    bool     inv_open       = false;
 
     // A jump asked for by the debug panel, applied at the tail of the next
     // MapScreen::update -- the same site the follow path enters nodes from.
@@ -672,7 +672,9 @@ static void take_client_edit() {
     if (!edit) return;
     catsync_take_equipment(edit > 0);
     if (edit > 0) {
-        log_line("FOLLOW", "took the client's equipment edit");
+        catsync_mark_sent();
+        log_line("FOLLOW", edit == 1 ? "took the client's equipment edit"
+                                     : "took the client's equipment, its bag matched");
         return;
     }
     log_line("FOLLOW", "!! refused the client's equipment edit -- the host changed the"
@@ -681,6 +683,32 @@ static void take_client_edit() {
     invsync_forget();
     catsync_publish("a refused edit");
     invsync_publish("a refused edit");
+}
+
+// CLIENT, with no inventory screen up. A push held over a screen is older than
+// whatever the player did on that screen: applied now, the bag would get back an
+// item the player has since put on a cat, and the cat would keep it. The user saw
+// items in both on 2026-11-03. So an unsent edit goes out instead,
+// with the base this peer really holds. The host sees it missed its change, refuses
+// it and sends everything again, and both halves arrive together.
+static void take_host_push() {
+    if (!catsync_has_pending() && !invsync_has_pending()) return;
+
+    const uint64_t sig = catsync_equipment_sig() ^ invsync_local_hash();
+    if (!g.edit_rebase && sig && sig != g.edit_base) {
+        log_line("FOLLOW", "the host changed something during this player's equipment"
+                           " edit -- asking it to settle that");
+        invsync_drop_pending();
+        catsync_drop_pending();
+        g.edit_base = sig;
+        g.edit_seen = sig;
+        catsync_send_equipment();
+        invsync_send_edit();
+        return;
+    }
+    catsync_apply_pending("on the map");
+    invsync_apply_pending("on the map");
+    g.edit_rebase = true;
 }
 
 static void watch_edits() {
@@ -701,6 +729,9 @@ static void watch_edits() {
 
 // Once a second, on the map or in a shop: the two places equipment changes hands
 // with nothing else running. A battle would write cats its Characters derive from.
+// Each publish sends only what moved, so a chest or a host's equip reaches the
+// client now instead of at the next node. Order matters on the host: its own change
+// goes out first, so the edit it now takes is judged against it.
 void follow_edit_pump() {
     constexpr uint64_t kEveryMs = 1000;
     if (!g.on) return;
@@ -712,10 +743,22 @@ void follow_edit_pump() {
     const bool in_shop = g.have_here && strcmp(node_type_name(g.here_type), "shop") == 0;
     if (!follow_on_map() && !in_shop) return;
 
+    // Everything here trusts this reading, and a wrong "closed" would free items
+    // under a live screen, so the log has to show it working.
+    const bool open = invsync_screen_open();
+    if (open != g.inv_open) {
+        g.inv_open = open;
+        log_line("FOLLOW", "inventory screen %s", open ? "up" : "down");
+    }
+
     if (g.is_client) {
-        if (!pending_any()) watch_edits();
-    } else if (!invsync_screen_open()) {
-        take_client_edit();
+        if (pending_any()) return;
+        if (!invsync_screen_open()) take_host_push();
+        watch_edits();
+    } else {
+        catsync_publish("changed on the map");
+        invsync_publish("changed on the map");
+        if (!invsync_screen_open()) take_client_edit();
     }
 }
 
@@ -729,15 +772,6 @@ void* follow_map_update(void* map_screen) {
     // save flush reads -- see follow_on_map.
     g.map_tick = GetTickCount64();
 
-    // A chest changes the inventory between nodes, and the push at the next node
-    // left the client without the item until then. Once a second because the
-    // publish only sends when the inventory hash moved.
-    if (g.map_tick - g.inv_tick >= 1000) {
-        g.inv_tick = g.map_tick;
-        invsync_publish("changed on the map");
-    }
-    if (!invsync_screen_open() && invsync_apply_pending("on the map"))
-        g.edit_rebase = true;
 
     // --- a jump asked for by the debug panel --------------------------------
     //

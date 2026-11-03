@@ -95,7 +95,9 @@ void catsync_on_message(const CatDataMsg& m);
 // immediately before this peer enters the node the host entered -- the same
 // point invsync_apply_pending uses, and for the same two reasons: it is off the
 // battle screen, and it is still in time for whatever the node opens.
-void catsync_apply_pending(const char* why);
+//
+// True if anything was applied.
+bool catsync_apply_pending(const char* why);
 
 // The run's cat whose CatData+0 is `uid`, or null. That is the id the battle and
 // choice layers carry, which is not the registry's.
@@ -108,7 +110,12 @@ uint32_t catsync_run_uids(uint64_t* out, uint32_t max);
 // catsync_equipment_sig is a hash over all the run's cats' slots, 0 if unreadable.
 uint64_t catsync_equipment_sig();
 void     catsync_send_equipment();
+bool     catsync_has_pending();
+void     catsync_drop_pending();
 // HOST: apply what is held, or with keep false throw it away.
 void     catsync_take_equipment(bool keep);
+// HOST: count every cat as sent. After an edit: the client has those slots
+// already, and sending them back would undo whatever it did next.
+void     catsync_mark_sent();
 
 } // namespace mgmp

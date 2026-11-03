@@ -324,6 +324,7 @@ struct State {
     uint32_t humans          = 0;   // cats a human brain drives, either peer's
     bool     state_hash_on   = false;
     bool     control_checked = false;
+    bool     split_deferred  = false;   // derive_split had no peer list yet
     // One slot per peer id, which is why ids are allocated lowest-free and stay
     // under kMaxPeers. Our own slot is filled in locally when we publish, so the
     // coverage check below can treat every player identically instead of
@@ -826,6 +827,92 @@ const void* resolve_char_list(void* turn_control) {
     return list;
 }
 
+// THE CONTROL SPLIT: which human cats this peer's input decides. Out of
+// snapshot_cats so lockstep_pump can run it again when it had to wait for PEERS.
+static void derive_split(const Config& cfg) {
+    g.split_deferred = false;
+    for (uint32_t i = 0; i < kMaxCats; ++i) g.local_cat[i] = false;
+
+    if (cfg.net_control_auto) {
+        // Derived identically on both peers rather than negotiated, which is
+        // why it needs no waiting: the human cats and their ids are the same on
+        // both, the owner table came from the host in ENTERNODE, and the rule
+        // for a cat the table has not seen is pure arithmetic. Both peers still
+        // exchange CONTROL afterwards, but as a check on the result -- not as
+        // the source of it. See mgmp_split.h for the rule.
+        //
+        // Position, not peer id: see net_peer_pos.
+        uint32_t P   = net_peer_count();
+        uint32_t pos = net_peer_pos();
+        if (P == 0) {
+            // No PEERS yet. Claim nothing rather than guess: claiming
+            // everything would have two peers driving the same cat, and
+            // claiming half assumes a player count we have not been told.
+            // This used to say so and then split over one player anyway: on
+            // 2026-11-03 a reconnected friend took all four cats and the host
+            // halted on turn 2. lockstep_pump splits again once PEERS is in.
+            g.split_deferred = true;
+            log_line("LOCKSTEP", "!! no peer list yet -- deferring the split; if "
+                                 "this repeats, PEERS never arrived");
+            return;
+        }
+        uint64_t human_id[kMaxCats];
+        uint8_t  player[kMaxCats];
+        uint32_t seen = 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i)
+            if (g.human_cat[i]) human_id[seen++] = cat_persistent_id(g.cats[i]);
+
+        // A session of one is not a split worth remembering: the first cats it
+        // would record are all its own, and the friend arrives to an empty hand.
+        split_assign(g.owners, human_id, seen, P, P >= 2, player);
+        if (P >= 2 && net_role() == NetRole::Host) owners_save();
+
+        uint32_t mine = 0;
+        seen = 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i) {
+            if (!g.human_cat[i]) continue;
+            g.local_cat[i] = (player[seen] == pos);
+            if (g.local_cat[i]) ++mine;
+            log_line("LOCKSTEP", "  cat %u id=%016llx -> player %u", i,
+                     (unsigned long long)human_id[seen], (unsigned)player[seen]);
+            ++seen;
+        }
+
+        if (mine == 0 && g.humans)
+            log_line("LOCKSTEP", "!! %u human cat(s) over %u player(s) leaves this "
+                                 "peer (position %u) with none -- it will watch "
+                                 "this battle", g.humans, P, pos);
+    } else {
+        for (uint32_t i = 0; i < cfg.net_control_count; ++i) {
+            uint8_t idx = cfg.net_control[i];
+            if (idx < g.cat_count) g.local_cat[idx] = true;
+            else log_line("LOCKSTEP", "!! net_control names cat %u but the battle has %u",
+                          (unsigned)idx, g.cat_count);
+        }
+    }
+}
+
+// Tell the other players which cats this peer took. Not while the split waits
+// for PEERS: an empty claim would pass for a real one.
+static void publish_split() {
+    if (g.split_deferred) return;
+    ControlMsg c{};
+    c.battle_id = g.battles.current;
+    c.humans = g.humans;
+    for (uint32_t i = 0; i < g.cat_count && c.count < 32; ++i)
+        if (g.local_cat[i]) c.cats[c.count++] = (uint8_t)i;
+    net_send_control(c);
+
+    // File our own claim in the same table as everyone else's. The coverage
+    // check is a tally over all players, and leaving ourselves out of it
+    // would make every cat we own look unclaimed.
+    uint8_t self = net_self();
+    if (self < kMaxPeers) {
+        g.peer_control[self]      = c;
+        g.have_peer_control[self] = true;
+    }
+}
+
 void snapshot_cats(void* turn_control) {
     if (g.snapped || !turn_control) return;
 
@@ -891,62 +978,7 @@ void snapshot_cats(void* turn_control) {
         if (g.human_cat[i]) ++g.humans;
     }
 
-    // --- the control split ---------------------------------------------
-    for (uint32_t i = 0; i < kMaxCats; ++i) g.local_cat[i] = false;
-
-    if (cfg.net_control_auto) {
-        // Derived identically on both peers rather than negotiated, which is
-        // why it needs no waiting: the human cats and their ids are the same on
-        // both, the owner table came from the host in ENTERNODE, and the rule
-        // for a cat the table has not seen is pure arithmetic. Both peers still
-        // exchange CONTROL afterwards, but as a check on the result -- not as
-        // the source of it. See mgmp_split.h for the rule.
-        //
-        // Position, not peer id: see net_peer_pos.
-        uint32_t P   = net_peer_count();
-        uint32_t pos = net_peer_pos();
-        if (P == 0) {
-            // No PEERS yet. Claim nothing rather than guess: claiming
-            // everything would have two peers driving the same cat, and
-            // claiming half assumes a player count we have not been told.
-            P = 1; pos = 0;
-            log_line("LOCKSTEP", "!! no peer list yet -- deferring the split; if "
-                                 "this repeats, PEERS never arrived");
-        }
-        uint64_t human_id[kMaxCats];
-        uint8_t  player[kMaxCats];
-        uint32_t seen = 0;
-        for (uint32_t i = 0; i < g.cat_count; ++i)
-            if (g.human_cat[i]) human_id[seen++] = cat_persistent_id(g.cats[i]);
-
-        // A session of one is not a split worth remembering: the first cats it
-        // would record are all its own, and the friend arrives to an empty hand.
-        split_assign(g.owners, human_id, seen, P, P >= 2, player);
-        if (P >= 2 && net_role() == NetRole::Host) owners_save();
-
-        uint32_t mine = 0;
-        seen = 0;
-        for (uint32_t i = 0; i < g.cat_count; ++i) {
-            if (!g.human_cat[i]) continue;
-            g.local_cat[i] = (player[seen] == pos);
-            if (g.local_cat[i]) ++mine;
-            log_line("LOCKSTEP", "  cat %u id=%016llx -> player %u", i,
-                     (unsigned long long)human_id[seen], (unsigned)player[seen]);
-            ++seen;
-        }
-
-        if (mine == 0 && g.humans)
-            log_line("LOCKSTEP", "!! %u human cat(s) over %u player(s) leaves this "
-                                 "peer (position %u) with none -- it will watch "
-                                 "this battle", g.humans, P, pos);
-    } else {
-        for (uint32_t i = 0; i < cfg.net_control_count; ++i) {
-            uint8_t idx = cfg.net_control[i];
-            if (idx < g.cat_count) g.local_cat[idx] = true;
-            else log_line("LOCKSTEP", "!! net_control names cat %u but the battle has %u",
-                          (unsigned)idx, g.cat_count);
-        }
-    }
+    derive_split(cfg);
 
     uint32_t local = 0;
     for (uint32_t i = 0; i < g.cat_count; ++i) if (g.local_cat[i]) ++local;
@@ -1070,23 +1102,7 @@ void snapshot_cats(void* turn_control) {
     // otherwise shows up as a battle stalling on that cat's turn with nothing
     // in either log to say why. Making it one-way would put that check in only
     // one of the two logs.
-    {
-        ControlMsg c{};
-        c.battle_id = g.battles.current;
-        c.humans = g.humans;
-        for (uint32_t i = 0; i < g.cat_count && c.count < 32; ++i)
-            if (g.local_cat[i]) c.cats[c.count++] = (uint8_t)i;
-        net_send_control(c);
-
-        // File our own claim in the same table as everyone else's. The coverage
-        // check is a tally over all players, and leaving ourselves out of it
-        // would make every cat we own look unclaimed.
-        uint8_t self = net_self();
-        if (self < kMaxPeers) {
-            g.peer_control[self]      = c;
-            g.have_peer_control[self] = true;
-        }
-    }
+    publish_split();
 
     // The host may already have told us its split before we had a roster to
     // check it against.
@@ -2288,6 +2304,16 @@ uint32_t lockstep_state_fence_hits() { return g_sf.hits; }
 void lockstep_pump() {
     if (!g.active) return;
 
+    if (g.split_deferred && g.snapped && net_peer_count() > 0) {
+        log_line("LOCKSTEP", "the peer list is in -- splitting this battle's cats now");
+        derive_split(config());
+        uint32_t local = 0;
+        for (uint32_t i = 0; i < g.cat_count; ++i) if (g.local_cat[i]) ++local;
+        g.stats.local_cats = local;
+        publish_split();
+        verify_control();
+    }
+
     NetMsg m{};
     while (net_poll(m)) {
         Guard guard;
@@ -2684,6 +2710,48 @@ bool lockstep_fill_choice(void* brain, void* out) {
     return true;
 }
 
+// THE PEER'S CAT IS NOT POLLED WHILE ITS DECISION IS ON THE WIRE. Brain::GetChoice
+// asks the cat's passives (+0x378) and statuses (+0x518) before the brain, and
+// any of them can decide by itself: a cat raised by the boss as undead attacks
+// its own side, decided there, drawing from the stream. On its owner that is
+// one call per decision. Here it used to be one per frame of waiting, each
+// thrown away for type=1 and derived again -- one draw more than the host in
+// the turn of 2026-11-03 (log 221308), then hp apart and a halt the next time
+// it acted. Now the original runs once, when the decision has arrived, and is
+// overwritten as before.
+static bool pend_has(uint8_t cat) {
+    for (uint32_t i = 0; i < g.pend_count; ++i) {
+        const ActionMsg& a = g.pending[(g.pend_head + i) % kMaxPending];
+        if (a.actor == cat && a.battle_id == g.battles.current) return true;
+    }
+    return false;
+}
+
+bool lockstep_hold_poll(void* brain, void* out) {
+    if (!g.active || !brain || !out || g.halted || !g.snapped) return false;
+    const void* actor = nullptr;
+    if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
+        return false;
+    const uint8_t cat = cat_index_of(actor);
+    if (cat == kNoCat || !g.human_cat[cat] || g.local_cat[cat]) return false;
+
+    Guard guard;
+    if (barrier_blocking() || pend_has(cat)) return false;
+    g.local_actor = false;
+    g.poll_cat    = cat;
+    // A whole TurnAction, not just its type: `out` is the caller's raw sret
+    // buffer, nothing has constructed it, and UpdateDecision copies it -- the
+    // std::function at +0x40 with a stack-garbage impl at +0x78 took both
+    // loopback peers down at the first peer turn (2026-11-03 232513). All zero
+    // is an empty std::function.
+    TurnAction none{};
+    memset(&none, 0, sizeof(none));
+    none.type = TA_None;
+    mem_write(out, &none, sizeof(none));
+    show_live_facing(brain, actor, cat);
+    return true;
+}
+
 // Turn a decision that came off the wire into the TurnAction the brain was
 // about to return. Factored out because there are now two callers and they
 // differ only in WHOSE cat it is: the peer's, in the ordinary case, and our
@@ -2841,11 +2909,17 @@ static void pin_end_of_turn_facing() {
 // runs ahead of. So the client stands still here until the host's turn-0 hash is
 // in and any correction it starts is done. Measured 2026-11-02, battle after
 // KnifeInTheWall: every cat equal, streams apart, the host's dump one frame late,
-// halted. What setup drew differently is unknown. Turn 0 only: at any later turn
-// the host can be a whole human turn away.
+// halted. What setup drew differently is unknown.
+//
+// Every turn since 2026-11-03: a stream apart after the friend's revived cat
+// acted, every cat equal, and the host's dump landed after the client's next
+// draw, so the battle halted where turn 22 of the same fight had been corrected.
+// At a turn boundary the host is never a human turn away -- it has every action
+// of the turn that just ended -- so the wait is the host's animation and the
+// link, and the cap only matters if the host stops playing.
 void hold_for_host(const HashMsg& mine) {
-    constexpr uint64_t kHoldMs = 5000;
-    if (net_role() == NetRole::Host || !config().net_desync_halt) return;
+    const uint64_t kHoldMs = mine.turn == 0 ? 5000 : 3000;
+    if (net_role() == NetRole::Host || !config().net_desync_halt || !net_active()) return;
 
     const uint64_t until = GetTickCount64() + kHoldMs;
     while (!g.halted) {
@@ -3025,7 +3099,7 @@ void lockstep_turn_boundary(void* turn_control) {
             report_pair(mine, theirs, (uint8_t)p);
     }
 
-    if (mine.turn == 0) hold_for_host(mine);
+    hold_for_host(mine);
 
     ++g.turn;
 }
@@ -3114,6 +3188,13 @@ bool lockstep_cat_mine(uint64_t id) {
     const int row = id ? g.owners.find(id) : -1;
     const uint32_t owner = (row >= 0 && g.owners.pos[row] < players) ? g.owners.pos[row] : 0;
     return owner == net_peer_pos();
+}
+
+void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out) {
+    Guard guard;
+    const uint32_t P = net_peer_count();
+    split_assign(g.owners, ids, n, P, P >= 2, out);
+    if (P >= 2) owners_save();
 }
 
 void lockstep_owners_write(EnterNodeMsg& m) {

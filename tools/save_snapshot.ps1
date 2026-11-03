@@ -10,6 +10,11 @@
 #   .\tools\save_snapshot.ps1 -List
 #   .\tools\save_snapshot.ps1 -Restore runE       # between every replay
 #
+# Without -Save the snapshot takes the newest steamcampaignNN.sav of any Steam
+# account on this machine -- the folder is named after the account and the slot
+# is whichever was played, so no fixed path is right for everyone. The path is
+# kept beside the snapshot, and -Restore puts it back exactly there.
+#
 # Restoring always snapshots what it is about to overwrite (as `_overwritten`)
 # first. This file moves real campaign progress around; it must never be the
 # reason some of it is gone.
@@ -18,7 +23,7 @@ param(
     [Parameter(ParameterSetName = 'Snap', Mandatory)][string]$Snapshot,
     [Parameter(ParameterSetName = 'Rest', Mandatory)][string]$Restore,
     [Parameter(ParameterSetName = 'List')][switch]$List,
-    [string]$Save = "$env:APPDATA\Glaiel Games\Mewgenics\76561197960271872\saves\steamcampaign01.sav"
+    [string]$Save = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,17 +39,31 @@ function Assert-GameClosed {
     }
 }
 
+function Find-Save {
+    $all = Get-ChildItem "$env:APPDATA\Glaiel Games\Mewgenics\*\saves\steamcampaign*.sav" `
+        -ErrorAction SilentlyContinue
+    if (-not $all) { throw "No steamcampaign*.sav under $env:APPDATA\Glaiel Games\Mewgenics -- pass -Save" }
+    ($all | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+}
+
 switch ($PSCmdlet.ParameterSetName) {
     'Snap' {
+        if (-not $Save) { $Save = Find-Save }
         if (-not (Test-Path $Save)) { throw "No save at $Save" }
         $dst = Join-Path $store "$Snapshot.sav"
         Copy-Item $Save $dst -Force
-        "snapshot -> $dst  ($((Get-Item $dst).Length) bytes)"
+        Set-Content (Join-Path $store "$Snapshot.path") $Save -Encoding UTF8
+        "snapshot $Save -> $dst  ($((Get-Item $dst).Length) bytes)"
     }
     'Rest' {
         Assert-GameClosed
         $src = Join-Path $store "$Restore.sav"
         if (-not (Test-Path $src)) { throw "No snapshot named '$Restore' in $store" }
+        if (-not $Save) {
+            $kept = Join-Path $store "$Restore.path"
+            if (-not (Test-Path $kept)) { throw "No path kept for '$Restore' -- pass -Save" }
+            $Save = (Get-Content $kept -Raw).Trim()
+        }
         if (Test-Path $Save) {
             Copy-Item $Save (Join-Path $store '_overwritten.sav') -Force
         }

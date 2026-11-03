@@ -180,8 +180,15 @@ void emit_line_v(const LogLevel* level, const char* tag, const char* fmt, va_lis
     char    buf[4096];
     LONG    seq = InterlockedIncrement(&g_seq);
     LONG    turn = g_turn;
+    // Wall-clock time to the millisecond: the seq says what came first, this
+    // says how long it took -- "the reload took ten seconds" had no answer in
+    // a log of sequence numbers alone. Local time, so the host's and the
+    // client's logs line up as far as the two machines' clocks do.
+    SYSTEMTIME st;
+    GetLocalTime(&st);
     int     n   = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-                              "%06ld %04ld %-9s ", seq, turn, tag);
+                              "%06ld %04ld %02u:%02u:%02u.%03u %-9s ", seq, turn,
+                              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, tag);
     if (n < 0) return;
 
     const int body = n;   // where the message starts, for the ring

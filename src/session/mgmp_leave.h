@@ -115,6 +115,19 @@ bool leave_in_run();
 // Whether the House scene is what THIS peer is standing in. Cached like the above.
 bool leave_on_house();
 
+// A scene of that name is loaded and not being torn down.
+bool leave_scene_up(const char* name);
+
+// Client: on its way out of a run or back to the menu to reload one.
+bool leave_busy();
+
+// CLIENT: THE LOADING SCREEN. Up from the moment this peer is sent away or a
+// save of the host's arrives, down once it stands in the House or a run again
+// (and has for a moment), or after a minute and a half whatever happened.
+// `step` says where it is, for the screen to show.
+void leave_loading_start();
+bool leave_loading(const char** step);
+
 // CLIENT: a fresh save is waiting, so get to the main menu. Unlike a departure
 // from a run, the House does not count as having arrived: it is a place the
 // client can be standing in, and the save can only be applied from the menu.

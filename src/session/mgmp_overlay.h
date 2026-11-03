@@ -90,4 +90,9 @@ struct CursorMsg;
 // message: mgmp_cursor takes the tile out of it and this takes the fraction.
 void overlay_on_message(uint8_t from, const CursorMsg& c);
 
+// A GL texture of icons/<name>.png beside mgmp.dll -- the collar and item art
+// tools/icons renders out of the game's SWFs -- or 0. Loaded once per name;
+// a missing file is remembered. On the render thread only.
+uint32_t overlay_icon_texture(const char* name);
+
 } // namespace mgmp

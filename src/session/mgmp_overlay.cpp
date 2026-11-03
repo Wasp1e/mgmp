@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 
 namespace mgmp {
 namespace {
@@ -1448,6 +1450,71 @@ void overlay_on_message(uint8_t from, const CursorMsg& c) {
         g.said_msg = true;
     }
     p.have = true;
+}
+
+// The cursor art's upload, minus its measuring: the same PBO and unpack-state
+// care, since this lands in the game's GL state just the same.
+uint32_t overlay_icon_texture(const char* name) {
+    static std::unordered_map<std::string, GLuint> cache;
+    auto hit = cache.find(name);
+    if (hit != cache.end()) return hit->second;
+    if (!g.resolved) return 0;                 // asked again once GL is there
+    cache[name] = 0;
+
+    wchar_t dir[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)&overlay_icon_texture, &self);
+    GetModuleFileNameW(self, dir, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(dir, L'\\')) *slash = 0;
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%s\\icons\\%S.png", dir, name);
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") || !f) return 0;
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string bytes(n > 0 ? (size_t)n : 0, '\0');
+    const bool ok = n > 0 && fread(&bytes[0], 1, (size_t)n, f) == (size_t)n;
+    fclose(f);
+    if (!ok) return 0;
+
+    int w = 0, h = 0, ch = 0;
+    stbi_uc* px = stbi_load_from_memory((const stbi_uc*)bytes.data(), (int)n, &w, &h, &ch, 4);
+    if (!px) return 0;
+
+    GLint prev_tex = 0, prev_pbo = 0;
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    gl.GetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &prev_pbo);
+    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    struct Store { GLenum e; GLint def; GLint prev; };
+    Store store[] = {
+        { GL_UNPACK_SWAP_BYTES, 0, 0 }, { GL_UNPACK_LSB_FIRST, 0, 0 },
+        { GL_UNPACK_ROW_LENGTH, 0, 0 }, { GL_UNPACK_SKIP_ROWS, 0, 0 },
+        { GL_UNPACK_SKIP_PIXELS, 0, 0 }, { GL_UNPACK_ALIGNMENT, 4, 0 },
+        { GL_UNPACK_SKIP_IMAGES, 0, 0 }, { GL_UNPACK_IMAGE_HEIGHT, 0, 0 },
+    };
+    for (Store& s : store) {
+        gl.GetIntegerv(s.e, &s.prev);
+        if (s.prev != s.def) gl.PixelStorei(s.e, s.def);
+    }
+    GLuint tex = 0;
+    gl.GenTextures(1, &tex);
+    gl.BindTexture(GL_TEXTURE_2D, tex);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    for (Store& s : store)
+        if (s.prev != s.def) gl.PixelStorei(s.e, s.prev);
+    if (prev_pbo) gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, (GLuint)prev_pbo);
+    gl.BindTexture(GL_TEXTURE_2D, (GLuint)prev_tex);
+    stbi_image_free(px);
+    cache[name] = tex;
+    return tex;
 }
 
 } // namespace mgmp

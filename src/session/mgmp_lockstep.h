@@ -70,6 +70,10 @@ void lockstep_pump();
 //                             type=1 to keep waiting.
 bool lockstep_fill_choice(void* brain, void* out);
 
+// Before Brain::GetChoice: true, with `out` set to type=1, when this is the peer's
+// cat and its decision has not arrived -- the original is then not run at all.
+bool lockstep_hold_poll(void* brain, void* out);
+
 // Called from the ApplyTurnAction hook, before the original runs. Clears the
 // outstanding-send guard and validates that what landed is what we expected.
 void lockstep_on_applied(const void* action, const void* actor);
@@ -103,6 +107,10 @@ void lockstep_owners_read(const EnterNodeMsg& m);
 // Whether this player decides for the cat with this persistent id outside a
 // battle. A cat the table does not know, or whose player has left, is the host's.
 bool lockstep_cat_mine(uint64_t id);
+
+// Host: deals these cats out by the battle rule and records it in the owner
+// table, so the run's battles keep the split. out[i] is the owner's position.
+void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out);
 
 // A peer joined or reconnected: replay this battle's decisions to it so it can
 // fast-forward into a fight already under way. To that peer only.

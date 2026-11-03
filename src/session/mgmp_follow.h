@@ -70,6 +70,14 @@ void follow_edit_pump();
 
 void follow_on_message(const EnterNodeMsg& m);
 
+// A player's pick of the next map node, kChoiceNode. The host enters a node only
+// once both players have picked it; see follow_on_enter_node.
+struct ChoiceMsg;
+void follow_on_vote(const ChoiceMsg& m);
+
+// Takes over the map node buttons' click, where the vote is taken.
+void follow_set_base(uintptr_t base);
+
 // HOST: tell a peer that just joined which node the run is standing in. ENTERNODE
 // is otherwise published only at the instant of entry, so a peer connecting
 // afterwards would sit on the map forever.

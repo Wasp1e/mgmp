@@ -49,6 +49,8 @@
 #include "mgmp_session.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_follow.h"
+#include "mgmp_classpick.h"
+#include "mgmp_cutscene.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
 #include "mgmp_rng.h"
@@ -200,6 +202,7 @@ void __fastcall h_NextTurn(void* self) {
 }
 
 void* __fastcall h_GetChoice(void* self, void* out) {
+    if (lockstep_active() && lockstep_hold_poll(self, out)) return out;
     void* ret = o_GetChoice(self, out);
 
     // --- run B: inject the recorded decision -----------------------------
@@ -875,6 +878,9 @@ int hooks_install() {
     lockstep_set_base(g_base);
     cursor_set_base(g_base);
     choice_set_base(g_base);
+    follow_set_base(g_base);
+    classpick_set_base(g_base);
+    cutscene_set_base(g_base);
     savefile_set_base(g_base);
     leave_set_base(g_base);
     overlay_set_base(g_base);

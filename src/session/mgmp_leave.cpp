@@ -89,6 +89,10 @@ struct State {
     bool     said_gave_up = false;
     bool     said_no_click = false;
     bool     said_sidebar  = false;   // the pause sidebar was seen ticking
+    // Quit To Menu without the pause menu -- see direct_quit.
+    void   (*quit_body)(void*) = nullptr;
+    bool     direct_tried  = false;
+    uint64_t direct_at     = 0;
     uint32_t left         = 0;      // departures actually completed
     uint32_t received     = 0;
 
@@ -279,6 +283,37 @@ void arm_departure() {
     g.said_sidebar  = false;
     g.escapes       = 0;
     g.escape_polls  = kEscapePolls - 1;   // the first one goes out on the next poll
+    g.direct_tried  = false;
+}
+
+// QUIT TO MENU, WITHOUT THE PAUSE MENU. Escape only opens it with the window in
+// the foreground -- SDL drops keys a window without focus is sent, so a friend
+// in another window sat on "window NOT focused" for seventy tries. The button's
+// own work is reachable instead: Button_PauseMenu_QuitToMenu's lambda_3 (inside
+// PauseMenu::SetupMainSidebar) asks TrySavescum (sub_1402972A0) and then runs
+// the inner lambda sub_14029CF60, {_, Component*, Component*}: it adds the
+// fade-out Transition to the current scene, whose end sets the go-to-menu flag.
+// NOT sub_14029CE60, lambda_4's twin: that one is Quit To Desktop, its end clears
+// the app's running flag, and on 2026-11-04 it closed the friend's game.
+// Both are only read as Components (+0x18 scene, +0x28 director), so the
+// MewDirector, a Component too, stands in for the PauseMenu that is not open.
+// The savescum question is the one part skipped: the client is not the one
+// leaving, the host already has.
+constexpr uintptr_t kRva_QuitBody = 0x29CF60;
+const uint8_t kQuitPrologue[8] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83 };
+constexpr uint64_t  kDirectWaitMs = 8000;   // then the Escapes after all
+
+bool safe_quit(void* closure) {
+    __try { g.quit_body(closure); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool direct_quit() {
+    if (!g.quit_body || !g.director_slot) return false;
+    void* dir = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir) return false;
+    void* closure[3] = { nullptr, dir, dir };
+    return safe_quit(closure);
 }
 
 void report_broken() {
@@ -334,8 +369,14 @@ void leave_shutdown() {
     g.pending = false;
 }
 
-void leave_set_base(uintptr_t /*base*/) {
+void leave_set_base(uintptr_t base) {
     ensure_state();
+    g.quit_body = nullptr;
+    if (memcmp((const void*)(base + kRva_QuitBody), kQuitPrologue, sizeof(kQuitPrologue)) == 0)
+        g.quit_body = (void(*)(void*))(base + kRva_QuitBody);
+    else
+        log_line("LEAVE", "!! the quit-to-menu body moved -- leaving takes the pause menu, "
+                          "and the window has to be in front for that");
     g.director_slot = (const void**)addr_of_data(D_MewDirectorPtr);
     g.broken = false;
     g.said_broken = false;
@@ -358,6 +399,69 @@ void leave_set_base(uintptr_t /*base*/) {
 // which is finer than the thing it describes changes.
 bool leave_in_run() { return g.where == Where::InRun; }
 
+bool leave_scene_up(const char* name) {
+    SceneList s;
+    if (!read_scenes(s)) return false;
+    for (uint32_t i = 0; i < s.count; ++i)
+        if (!s.dying[i] && strcmp(s.name[i], name) == 0) return true;
+    return false;
+}
+
+bool leave_busy() { return g.pending || g.reload; }
+
+namespace {
+struct Loading {
+    bool     up      = false;
+    uint64_t since   = 0;
+    uint64_t settled = 0;
+} g_load;
+constexpr uint64_t kLoadSettleMs = 1500;
+constexpr uint64_t kLoadMaxMs    = 90000;
+
+void loading_tick() {
+    if (!g.is_client) { g_load.up = false; return; }
+    const uint64_t now  = GetTickCount64();
+    const bool     busy = g.pending || g.reload;
+    if (busy && !g_load.up) leave_loading_start();
+    if (!g_load.up) return;
+    const bool home = g.where == Where::InRun ||
+                      (g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) == 0);
+    if (!busy && home) {
+        if (!g_load.settled) g_load.settled = now;
+        if (now - g_load.settled > kLoadSettleMs) {
+            g_load.up = false;
+            log_line("LEAVE", "loaded -- the loading screen is down after %llu ms",
+                     (unsigned long long)(now - g_load.since));
+        }
+    } else {
+        g_load.settled = 0;
+    }
+    if (g_load.up && now - g_load.since > kLoadMaxMs) {
+        g_load.up = false;
+        log_line("LEAVE", "!! still not back after %llu s -- the loading screen gives way",
+                 (unsigned long long)(kLoadMaxMs / 1000));
+    }
+}
+} // namespace
+
+void leave_loading_start() {
+    if (g_load.up) return;
+    g_load.up      = true;
+    g_load.since   = GetTickCount64();
+    g_load.settled = 0;
+}
+
+bool leave_loading(const char** step) {
+    if (!g_load.up) return false;
+    if (step) {
+        if (g.pending) *step = u8"\u0412\u044b\u0445\u043e\u0434\u0438\u043c \u0438\u0437 \u0437\u0430\u0431\u0435\u0433\u0430 \u0445\u043e\u0441\u0442\u0430\u2026";
+        else if (g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) != 0)
+            *step = u8"\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u0435\u043c \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430\u2026";
+        else *step = u8"\u041f\u043e\u0447\u0442\u0438 \u0433\u043e\u0442\u043e\u0432\u043e\u2026";
+    }
+    return true;
+}
+
 bool leave_on_house() {
     return g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) == 0;
 }
@@ -372,6 +476,7 @@ void leave_request_reload() {
 
 void leave_pump() {
     ensure_state();
+    loading_tick();
 
     // THE COOLDOWN IS SERVICED BEFORE EVERY EARLY RETURN, and that ordering is
     // the whole bug this function shipped with.
@@ -439,7 +544,22 @@ void leave_pump() {
     // the way it does when the player presses the key. The limit only holds once
     // the menu has been seen: on 2026-11-02 five Escapes in the House opened
     // nothing, and the friend stayed there with the host's run in hand.
-    if (g.pending && g.is_client && !g.cooldown &&
+    // Not once Quit To Menu has been pressed: the menu it opened is the game's
+    // now, and on 2026-11-04 three more Escapes landed there and paused it twice.
+    // First the quit itself, no keys and no focus needed; the Escapes only if
+    // that has not taken this peer out after a while.
+    if (g.pending && g.is_client && !g.cooldown && !g.direct_tried && g.quit_body) {
+        g.direct_tried = true;
+        g.direct_at    = GetTickCount64();
+        const bool ok  = direct_quit();
+        log_line("LEAVE", ok ? "the host left the run -- quitting to the menu for you directly%s"
+                             : "!! the direct quit faulted -- trying the pause menu%s",
+                 lockstep_in_battle() ? "  [a battle is live -- this tears it down]" : "");
+        if (!ok) g.direct_at = 0;
+    }
+    const bool direct_waiting = g.direct_tried && g.direct_at &&
+                                GetTickCount64() - g.direct_at < kDirectWaitMs;
+    if (g.pending && g.is_client && !g.cooldown && g.presses == 0 && !direct_waiting &&
         (g.escapes < kMaxEscapes || !g.said_sidebar) &&
         ++g.escape_polls >= kEscapePolls) {
         g.escape_polls = 0;

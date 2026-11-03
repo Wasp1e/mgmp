@@ -112,6 +112,9 @@ uint8_t net_self();
 // Members of the session, host included. 0 before the first PEERS.
 uint8_t net_peer_count();
 
+// Host: send the membership to everyone again, as on a connect.
+void net_republish_roster();
+
 // This peer's INDEX in the sorted membership list. Differs from its id once
 // anyone has disconnected, and it is the index -- never the id -- that the
 // control split is computed from.

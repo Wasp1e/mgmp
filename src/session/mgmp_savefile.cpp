@@ -10,6 +10,7 @@
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"   // follow_on_map
 #include "mgmp_leave.h"    // leave_on_house, leave_request_reload
+#include "mgmp_lockstep.h" // lockstep_in_battle
 // A slot click starts a run, which makes the three per-run dedupe caches stale.
 // See the block in savefile_on_slot_click.
 #include "mgmp_catsync.h"
@@ -273,7 +274,6 @@ struct State {
 
     // The House has no node pushes, so its sync is the save itself: the file's
     // mtime is watched while the host stands there. See house_tick.
-    uint32_t house_ticks = 0;
     bool     in_house    = false;
     bool     in_run      = false;
     bool     house_owed  = false;     // back from a run; send even if unchanged
@@ -597,15 +597,22 @@ uint64_t save_mtime() {
 // Nothing in the House can be replicated turn by turn: it has no re-seed, so
 // two peers drift on the first roll. What it does have is a save, so the client
 // is simply handed the file whenever it changes and reloads. A mid-write file
-// is the hazard, hence two readings a second apart before anything goes out,
-// and a floor between pushes because each one costs the client a trip through
-// the menu.
+// is the hazard, hence two equal readings before anything goes out, and a floor
+// between pushes because each one costs the client a trip through the menu.
+//
+// The readings are a third of a second apart, by the clock. They were sixty
+// FRAMES apart, a second at best and more with two games sharing one machine,
+// which put one to two of the ten seconds a day change took on 2026-11-04
+// before the client even started.
 void house_tick() {
-    constexpr uint32_t kTickFrames  = 60;       // about once a second
+    constexpr uint64_t kTickMs      = 300;
     constexpr uint64_t kMinGapMs    = 30000;
 
     if (!g.published || !g.have_slot || !net_active()) return;
-    if (++g.house_ticks % kTickFrames) return;
+    static uint64_t last_tick = 0;
+    const uint64_t  tick_now  = GetTickCount64();
+    if (tick_now - last_tick < kTickMs) return;
+    last_tick = tick_now;
 
     const bool house = leave_on_house();
     const bool run   = leave_in_run();
@@ -623,9 +630,30 @@ void house_tick() {
     // in the House for as long as the host looked at the map. On the map because
     // that is the one place save_adventure may be called from.
     if (g.in_house && !house && run && follow_on_map()) savefile_on_leaving_house();
-    if (!house) return;
 
     const uint64_t now   = GetTickCount64();
+
+    // ...or a fight straight from the House, with no map at all: the Guillotine
+    // on 2026-11-03 left the friend at home and the host at the join barrier.
+    // The game saves as the fight starts; that file takes the client into the
+    // same battle, measured the same night when the friend reconnected, and the
+    // barrier holds the host until it is there.
+    if (g.in_house && !house && run && lockstep_in_battle()) {
+        const uint64_t mtime = save_mtime();
+        const bool settled   = mtime && mtime == g.seen_mtime;
+        g.seen_mtime = mtime;
+        if (!settled) return;
+        g.in_house = false;
+        log_line("SAVEFILE", "a fight started in the House -- sending its save so the "
+                             "client follows into it");
+        if (publish(kNoPeer, /*fresh=*/true)) {
+            g.sent_at    = now;
+            g.sent_mtime = mtime;
+        }
+        return;
+    }
+    if (!house) return;
+
     const uint64_t mtime = save_mtime();
     const bool settled   = mtime && mtime == g.seen_mtime;
     g.seen_mtime = mtime;
@@ -1005,6 +1033,7 @@ void savefile_on_message(const SaveFileMsg& m) {
 
     log_line("SAVEFILE", "<- host's save: slot %u '%s', %u bytes, hash %016llx",
              m.slot, m.name, m.size, (unsigned long long)h);
+    leave_loading_start();
 }
 
 int savefile_autoselect(void* ss) {

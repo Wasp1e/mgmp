@@ -12,6 +12,8 @@
 #include "mgmp_runhist.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_follow.h"
+#include "mgmp_classpick.h"
+#include "mgmp_cutscene.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
@@ -237,6 +239,12 @@ void handle_hello(uint8_t from, const Hello& h) {
     // stale DLL presenting itself as a turn-0 desync. Every client must get
     // this, whatever phase the host is in.
     net_send_hello_to(from, our_hello());
+
+    // ...and the membership. A friend who reconnects through the same Steam
+    // channel comes back on the link the host never saw close, so nothing
+    // republished PEERS: on 2026-11-03 it split the next battle over one
+    // player and claimed every cat.
+    net_republish_roster();
 
     // The host owns the run, so it publishes the simulation stream. The client
     // does not need to reproduce the host's RNG *history*, only to arrive at
@@ -557,6 +565,8 @@ void session_update() {
         lockstep_pump();
         choice_pump();
         follow_edit_pump();
+        classpick_pump();
+        cutscene_pump();
         cursor_off_board();
         // The host's save is published from here rather than at the click,
         // because the click routinely happens before a peer has connected --

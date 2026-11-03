@@ -8,7 +8,9 @@
 #include "mgmp_savefile.h"
 #include "mgmp_follow.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_meow.h"
 #include "mgmp_net.h"
+#include <cmath>
 #include "mgmp_config.h"
 #include "mgmp_tuning.h"
 #include "mgmp_mem.h"
@@ -114,6 +116,21 @@ struct State {
     uint64_t edit_seen      = 0;
     bool     edit_rebase    = true;
     bool     inv_open       = false;
+
+    // THE VOTE. Both players pick the next node, as in Slay the Spire 2, and the
+    // host walks only when the picks agree. -1 is "not picked".
+    int32_t  host_vote      = -1;
+    int32_t  client_vote    = -1;   // host: the client's; client: what it last sent
+    bool     vote_go        = false;
+    bool     vote_bypass    = false;
+    // A swallowed EnterNode leaves the marker selected on that node; the next map
+    // tick puts it back. Only the client's fallback still gets here.
+    bool     unstick        = false;
+
+    // The other player's pick, bobbing on this map. See blink_pick.
+    int32_t  pick           = -1;
+    void*    pick_graphic   = nullptr;
+    float    pick_pos[2]    = {};
 
     // A jump asked for by the debug panel, applied at the tail of the next
     // MapScreen::update -- the same site the follow path enters nodes from.
@@ -356,6 +373,9 @@ static void weather_apply(uint32_t count, const char want[kMaxNodeWeather][kNode
 }
 
 static void take_client_edit();
+static void unstick_marker(void* map_screen);
+static void show_pick(int32_t index);
+static void blink_pick(void* map_screen);
 
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
@@ -374,11 +394,21 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // for -- and acting on it would put the two peers on different nodes, which
     // no amount of battle-layer lockstep can recover from. Swallowing rather
     // than disabling the UI keeps the change to one function.
+    //
+    // Swallowed, but now a vote: the host goes only where both players clicked.
     if (g.is_client) {
         ++g.suppressed;
-        log_line("FOLLOW", "suppressed local map input: node %u (%s) -- the host"
-                           " drives the run",
-                 known ? index : 0xFFFFFFFFu, node_type_name(type));
+        if (known && g.client_vote != (int32_t)index) {
+            g.client_vote = (int32_t)index;
+            ChoiceMsg v{};
+            v.kind      = kChoiceNode;
+            v.index     = index;
+            v.node_seed = g.have_here ? g.here_seed : 0;
+            net_send_choice(v);
+            log_line("FOLLOW", "this player picked node %u (%s) -- waiting for the host",
+                     index, node_type_name(type));
+        }
+        g.unstick = true;
         return false;
     }
 
@@ -392,6 +422,11 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
                            " -- cannot publish it; the client will not follow");
         return true;
     }
+
+    g.host_vote   = -1;
+    g.client_vote = -1;
+    g.vote_go     = false;
+    show_pick(-1);
 
     uint32_t count = 0; void* data = nullptr;
     read_nodes(map_screen, count, data);
@@ -569,6 +604,19 @@ void place_marker(void* map_screen, void* node) {
     mem_write(object + kObject_Pos, xyz, sizeof(xyz));
 }
 
+// Back to the node the run is standing in, selection included, so a click on any
+// node is taken again. That node is the last one entered; without one, the
+// marker's own.
+static void unstick_marker(void* map_screen) {
+    void* at = g.have_here ? node_at(map_screen, g.here_index) : nullptr;
+    if (!at) {
+        uint8_t* marker = nullptr;
+        if (mem_read((const uint8_t*)map_screen + kMap_Marker, &marker, sizeof(marker)) && marker)
+            mem_read(marker + kMarker_AtNode, &at, sizeof(at));
+    }
+    if (at) place_marker(map_screen, at);
+}
+
 bool follow_marker_node(uint32_t& index)   { return read_marker_node(kMarker_AtNode,   index); }
 bool follow_selected_node(uint32_t& index) { return read_marker_node(kMarker_Selected, index); }
 
@@ -585,6 +633,152 @@ void follow_on_run_restart() {
     g.have_here = false;      // the node we were in belongs to the run just left
     lockstep_on_run_restart();
     log_line("FOLLOW", "new load of the run: %08x", g.run_id);
+}
+
+// THE OTHER PLAYER'S PICK, SHOWN ON THE NODE ITSELF. A frame drawn where its
+// pointer was came out a node's height off on 2026-11-03: the two map views were
+// scrolled differently, and the mod has no camera to correct by. A fade did
+// nothing, the picture is a swf::MovieClip and not a Renderer. Its position is
+// known, though, MapNode+0x160 -> +0x70, the one place_marker reads, so the node
+// bobs up and down in this player's own camera and goes back when the pick ends.
+static void restore_pick() {
+    if (!g.pick_graphic) return;
+    mem_write((uint8_t*)g.pick_graphic + kGraphic_Pos, g.pick_pos, sizeof(g.pick_pos));
+    g.pick_graphic = nullptr;
+}
+
+static void show_pick(int32_t index) {
+    if (index == g.pick) return;
+    restore_pick();
+    g.pick = index;
+}
+
+static void blink_pick(void* map_screen) {
+    if (g.pick < 0) return;
+    void* node    = node_at(map_screen, (uint32_t)g.pick);
+    void* graphic = nullptr;
+    if (!node || !mem_read((const uint8_t*)node + kNode_Graphic, &graphic, sizeof(graphic)) ||
+        !graphic)
+        return;
+    if (graphic != g.pick_graphic) {
+        restore_pick();
+        if (!mem_read((const uint8_t*)graphic + kGraphic_Pos, g.pick_pos, sizeof(g.pick_pos)))
+            return;
+        g.pick_graphic = graphic;
+    }
+    constexpr double kPeriodMs = 700.0;
+    constexpr float  kHop      = 10.0f;
+    const double t = (double)(GetTickCount64() % (uint64_t)kPeriodMs) / kPeriodMs;
+    const float  y = g.pick_pos[1] - kHop * (float)sin(t * 3.14159265358979);
+    const float  p[2] = { g.pick_pos[0], y };
+    mem_write((uint8_t*)graphic + kGraphic_Pos, p, sizeof(p));
+}
+
+// THE VOTE IS TAKEN AT THE CLICK. Holding EnterNode instead let the game select the
+// node and walk the marker, and then the map took no other click: two different
+// picks could not be changed by either player, measured twice on 2026-11-03. The
+// node buttons' std::function target is sub_140228700, {vftable, MapNode*}; not
+// running it leaves the map exactly as it was, so the player can click again.
+//
+// Client: never runs, the pick goes to the host. Host: runs once the other player
+// picked the same node, or when the host clicks its own pick a second time.
+constexpr uintptr_t kRva_NodeClickSlot = 0xF00620;   // _Do_call of that _Func_impl
+constexpr uintptr_t kRva_NodeClick     = 0x228700;
+
+using fn_node_click = void (__fastcall*)(void*, void*, void*, void*);
+fn_node_click o_node_click = nullptr;
+
+static void send_vote(uint32_t index) {
+    ChoiceMsg v{};
+    v.kind      = kChoiceNode;
+    v.index     = index;
+    v.node_seed = g.have_here ? g.here_seed : 0;
+    net_send_choice(v);
+}
+
+static bool vote_click(void* node) {
+    if (!g.on || !net_active() || !g.map || !node) return true;
+    Guard guard;
+    uint32_t index = 0;
+    if (!index_of_node(g.map, node, index)) return true;
+    const char* type = node_type_name(node_type(node));
+
+    if (g.is_client) {
+        if (g.client_vote != (int32_t)index) {
+            g.client_vote = (int32_t)index;
+            send_vote(index);
+            meow_play();
+            log_line("FOLLOW", "this player picked node %u (%s) -- waiting for the host",
+                     index, type);
+        }
+        return false;
+    }
+    if (g.vote_bypass || net_peer_count() < 2) return true;
+
+    const bool same = g.host_vote == (int32_t)index;
+    if (!same) {
+        g.host_vote = (int32_t)index;
+        send_vote(index);
+        meow_play();
+    }
+    if (g.client_vote == (int32_t)index) {
+        log_line("FOLLOW", "both players picked node %u -- going", index);
+        return true;
+    }
+    if (same) {
+        log_line("FOLLOW", "the host clicked node %u again -- going without the other"
+                           " player's pick", index);
+        return true;
+    }
+    log_line("FOLLOW", "the host picked node %u (%s) -- waiting for the other player to"
+                       " pick it too; click it again to go alone", index, type);
+    return false;
+}
+
+static void __fastcall node_click(void* closure, void* b, void* c, void* d) {
+    void* node = nullptr;
+    mem_read((const uint8_t*)closure + 8, &node, sizeof(node));
+    if (vote_click(node)) o_node_click(closure, b, c, d);
+}
+
+void follow_set_base(uintptr_t base) {
+    if (o_node_click) return;
+    void** slot = (void**)(base + kRva_NodeClickSlot);
+    void*  have = nullptr;
+    DWORD  prot = 0;
+    if (!mem_read(slot, &have, sizeof(have)) || (uintptr_t)have != base + kRva_NodeClick ||
+        !VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+        log_line("FOLLOW", "!! the map node click moved -- the map vote is off and the"
+                           " host walks alone");
+        return;
+    }
+    o_node_click = (fn_node_click)have;
+    *slot = (void*)&node_click;
+    VirtualProtect(slot, sizeof(void*), prot, &prot);
+}
+
+void follow_on_vote(const ChoiceMsg& m) {
+    if (!g.on) return;
+    Guard guard;
+    // A pick made on another node is about another map position.
+    if (m.node_seed && g.have_here && m.node_seed != g.here_seed) return;
+    show_pick((int32_t)m.index);
+    meow_play();
+
+    if (g.is_client) {
+        log_line("FOLLOW", "the host picked node %u%s", m.index,
+                 g.client_vote == (int32_t)m.index ? " -- the same as this player"
+                                                   : " -- click it too to go there");
+        return;
+    }
+    g.client_vote = (int32_t)m.index;
+    if (g.host_vote == g.client_vote) {
+        g.vote_go = true;
+        log_line("FOLLOW", "both players picked node %u -- going", m.index);
+    } else {
+        log_line("FOLLOW", "the other player picked node %u%s", m.index,
+                 g.host_vote < 0 ? "" : " -- not the host's pick");
+    }
 }
 
 void follow_catchup(uint8_t peer) {
@@ -771,6 +965,8 @@ void* follow_map_update(void* map_screen) {
     // The map is ticking, so the run is BETWEEN nodes. This is the stamp the
     // save flush reads -- see follow_on_map.
     g.map_tick = GetTickCount64();
+    if (g.unstick) { g.unstick = false; unstick_marker(map_screen); }
+    blink_pick(map_screen);
 
 
     // --- a jump asked for by the debug panel --------------------------------
@@ -778,6 +974,23 @@ void* follow_map_update(void* map_screen) {
     // Handled before the follow path and returning early, because the two are
     // different intentions and letting a jump fall through into the pending
     // follow would enter two nodes on one tick.
+    // --- both players picked the same node ---------------------------------
+    //
+    // Entered here rather than from the message: the host's own click was held, and
+    // the map screen is the one place EnterNode is called from. Same shape as the
+    // panel jump below.
+    if (g.vote_go && !g.is_client) {
+        g.vote_go = false;
+        void* node = g.host_vote >= 0 ? node_at(map_screen, (uint32_t)g.host_vote) : nullptr;
+        if (!node) return nullptr;
+        bool sent = false;
+        g.vote_bypass = true;
+        const bool go = follow_on_enter_node(map_screen, node, &sent);
+        g.vote_bypass = false;
+        if (go) place_marker(map_screen, node);
+        return go ? node : nullptr;
+    }
+
     if (g.jump_pending) {
         g.jump_pending = false;
         const uint32_t index = g.jump_index;
@@ -894,6 +1107,8 @@ void* follow_map_update(void* map_screen) {
     log_line("FOLLOW", "following host into node %u (%s)%s",
              entering, node_type_name(type),
              pending_any() ? " -- more nodes still queued" : "");
+    g.client_vote = -1;
+    show_pick(-1);
     g.edit_rebase = true;
 
     // Battle identity, established without negotiating anything: this is the

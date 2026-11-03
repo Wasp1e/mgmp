@@ -3,6 +3,8 @@
 #include "mgmp_choice.h"
 #include "mgmp_catsync.h"
 #include "mgmp_follow.h"
+#include "mgmp_classpick.h"
+#include "mgmp_cutscene.h"
 #include "mgmp_invsync.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_net.h"
@@ -827,6 +829,9 @@ void choice_pump() {
 // --- receiving -------------------------------------------------------------
 
 void choice_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceNode) { follow_on_vote(m); return; }   // the map's, not ours
+    if (classpick_on_message(m)) return;                         // the class chooser's
+    if (cutscene_on_message(m)) return;                          // a cutscene's
     if (!g.on) return;
     Guard guard;
 

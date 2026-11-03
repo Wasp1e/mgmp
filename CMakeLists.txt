@@ -43,6 +43,7 @@ add_library(mgmp SHARED
     src/core/mgmp_config.cpp
     src/core/mgmp_crash.cpp
     src/core/mgmp_gpak.cpp
+    src/core/mgmp_gametext.cpp
     src/core/mgmp_sigscan.cpp
     src/core/mgmp_resolve.cpp
     src/determinism/mgmp_turnaction.cpp
@@ -64,6 +65,9 @@ add_library(mgmp SHARED
     src/session/mgmp_aim.cpp
     src/session/mgmp_nodehash.cpp
     src/session/mgmp_choice.cpp
+    src/session/mgmp_classpick.cpp
+    src/session/mgmp_cutscene.cpp
+    src/session/mgmp_meow.cpp
     src/session/mgmp_combatlock.cpp
     src/session/mgmp_cursor.cpp
     src/session/mgmp_overlay.cpp
@@ -103,7 +107,7 @@ target_include_directories(mgmp PRIVATE
     # their directory prefix so this one entry covers both.
     third_party/imgui
 )
-target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32)
+target_link_libraries(mgmp PRIVATE minhook kernel32 user32 shell32 winmm)
 
 add_executable(mgmp_loader loader/mgmp_loader.cpp res/mgmp_loader.rc)
 target_compile_definitions(mgmp_loader PRIVATE _CRT_SECURE_NO_WARNINGS)

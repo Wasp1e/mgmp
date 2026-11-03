@@ -513,6 +513,7 @@ bool net_join(const char* addr, uint16_t port) {
 void net_note_self(uint8_t id) { g.self = id; }
 uint8_t net_self() { return g.self; }
 uint8_t net_peer_count() { return g.roster_valid ? g.roster.count : 0; }
+void net_republish_roster() { host_publish_roster(); }
 
 // Our INDEX in the sorted membership list, not our id.
 //

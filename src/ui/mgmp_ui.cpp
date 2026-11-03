@@ -1,6 +1,7 @@
 #include "mgmp_ui.h"
 
 #include <windows.h>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -20,6 +21,10 @@
 #include "mgmp_lockstep.h"
 #include "mgmp_battleid.h"   // kNoBattle
 #include "mgmp_follow.h"
+#include "mgmp_classpick.h"
+#include "mgmp_cutscene.h"
+#include "mgmp_gametext.h"
+#include "mgmp_overlay.h"
 #include "mgmp_combatlock.h"
 #include "mgmp_leave.h"
 
@@ -44,6 +49,9 @@ struct UI {
     HWND     hwnd      = nullptr;
     WNDPROC  prev_wndproc = nullptr;
     uint32_t synthetic_keys = 0;   // posted Escape messages still on their way
+    uint32_t synthetic_input = 0;  // posted clicks/Space/Enter still on their way
+    uint8_t  up_what   = 0;        // ...and the up still to post
+    uint32_t up_frames = 0;
 
     // The pane's own copy of the log. Fed from log_ring_fetch by cursor, so a
     // quiet frame copies nothing.
@@ -60,6 +68,7 @@ struct UI {
     bool autoscroll = true;
 
     float font_scale = 1.0f;
+    bool  forced     = false;   // the class menu is up, panel or not
 
     // Seeded from mgmp.json at ui_init, so the fields already hold whatever the
     // launch was configured for and a reconnect is one click.
@@ -276,6 +285,409 @@ ImVec4 state_colour(NetState s) {
         case NetState::Idle:                              return level_colour(LogLevel::Trace);
         default:                                          return level_colour(LogLevel::Warn);
     }
+}
+
+// The class chooser's collars, under their Russian names where the game's own
+// text gives them (CLASS_UNLOCK_*), the class id otherwise.
+const char* class_label(const char* id) {
+    static const struct { const char* id; const char* ru; } k[] = {
+        { "Fighter", "\xD0\x91\xD0\xBE\xD0\xB5\xD1\x86" },
+        { "Hunter", "\xD0\x9E\xD1\x85\xD0\xBE\xD1\x82\xD0\xBD\xD0\xB8\xD0\xBA" },
+        { "Mage", "\xD0\x9C\xD0\xB0\xD0\xB3" },
+        { "Tank", "\xD0\xA2\xD0\xB0\xD0\xBD\xD0\xBA" },
+        { "Medic", "\xD0\x9A\xD0\xBB\xD0\xB8\xD1\x80\xD0\xB8\xD0\xBA" },
+        { "Thief", "\xD0\x92\xD0\xBE\xD1\x80" },
+        { "Necromancer", "\xD0\x9D\xD0\xB5\xD0\xBA\xD1\x80\xD0\xBE\xD0\xBC\xD0\xB0\xD0\xBD\xD1\x82" },
+        { "Butcher", "\xD0\x9C\xD1\x8F\xD1\x81\xD0\xBD\xD0\xB8\xD0\xBA" },
+        { "Psychic", "\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xBA\xD0\xB8\xD0\xBD\xD0\xB5\xD1\x82\xD0\xB8\xD0\xBA" },
+        { "Tinkerer", "\xD0\xA2\xD0\xB5\xD1\x85\xD0\xBD\xD0\xB8\xD0\xBA" },
+        { "Druid", "\xD0\x94\xD1\x80\xD1\x83\xD0\xB8\xD0\xB4" },
+        { "Monk", "\xD0\x9C\xD0\xBE\xD0\xBD\xD0\xB0\xD1\x85" },
+        { "Jester", "\xD0\xA8\xD1\x83\xD1\x82" },
+    };
+    for (const auto& e : k) if (strcmp(e.id, id) == 0) return e.ru;
+    return id;
+}
+
+// The host's class chooser, for the friend. Drawn whether or not the panel is
+// up: the screen it stands for is on the host's machine, and this is the only
+// place the friend can answer it.
+//
+// Its own look, warm on dark like the game's menus rather than ImGui's blue, and
+// the seven stats of every cat side by side, the game's own words in the
+// tooltips (HOUSE_CAT_INFO_*), so the collars can be dealt by what each cat is
+// good at. The best of each stat is lit.
+struct StatInfo { const char* tag; const char* name; const char* desc; };
+const StatInfo kStats[kClassPickStats] = {
+    { u8"\u0421\u0418\u041b", u8"\u0421\u0438\u043b\u0430", u8"\u0421\u0438\u043b\u0430 \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u0431\u043b\u0438\u0436\u043d\u0438\u0435 \u0430\u0442\u0430\u043a\u0438 \u0438 \u0443\u0440\u043e\u043d \u043e\u0442 \u0430\u0431\u0438\u043b\u043e\u043a \u0431\u043b\u0438\u0436\u043d\u0435\u0433\u043e \u0431\u043e\u044f." },
+    { u8"\u041b\u041e\u0412", u8"\u041b\u043e\u0432\u043a\u043e\u0441\u0442\u044c", u8"\u041b\u043e\u0432\u043a\u043e\u0441\u0442\u044c \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u0434\u0430\u043b\u044c\u043d\u0438\u0435 \u0430\u0442\u0430\u043a\u0438 \u0438 \u0443\u0440\u043e\u043d \u043e\u0442 \u0430\u0431\u0438\u043b\u043e\u043a \u0434\u0430\u043b\u044c\u043d\u0435\u0433\u043e \u0431\u043e\u044f." },
+    { u8"\u0422\u0415\u041b", u8"\u0422\u0435\u043b\u043e\u0441\u043b\u043e\u0436\u0435\u043d\u0438\u0435", u8"\u0422\u0435\u043b\u043e\u0441\u043b\u043e\u0436\u0435\u043d\u0438\u0435 \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u043c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u043e\u0435 \u0437\u0434\u043e\u0440\u043e\u0432\u044c\u0435 \u0438 \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u043f\u043e\u0441\u043b\u0435 \u0431\u043e\u044f." },
+    { u8"\u0418\u041d\u0422", u8"\u0418\u043d\u0442\u0435\u043b\u043b\u0435\u043a\u0442", u8"\u0418\u043d\u0442\u0435\u043b\u043b\u0435\u043a\u0442 \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u0432\u043e\u0441\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u0435 \u043c\u0430\u043d\u044b." },
+    { u8"\u0421\u041a\u0420", u8"\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c", u8"\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u043e\u0447\u0435\u0440\u0451\u0434\u043d\u043e\u0441\u0442\u044c \u0445\u043e\u0434\u043e\u0432 \u0438 \u041e\u0431\u043b\u0430\u0441\u0442\u044c \u043f\u0435\u0440\u0435\u043c\u0435\u0449\u0435\u043d\u0438\u044f." },
+    { u8"\u0425\u0410\u0420", u8"\u0425\u0430\u0440\u0438\u0437\u043c\u0430", u8"\u0425\u0430\u0440\u0438\u0437\u043c\u0430 \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u043c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u0443\u044e \u0438 \u043d\u0430\u0447\u0430\u043b\u044c\u043d\u0443\u044e \u043c\u0430\u043d\u0443." },
+    { u8"\u0423\u0414\u0427", u8"\u0423\u0434\u0430\u0447\u0430", u8"\u0423\u0434\u0430\u0447\u0430 \u0432\u043b\u0438\u044f\u0435\u0442 \u043d\u0430 \u0431\u0430\u0437\u043e\u0432\u044b\u0439 \u0448\u0430\u043d\u0441 \u043a\u0440\u0438\u0442\u0430 \u0438 \u0432\u0441\u0435 \u0441\u043b\u0443\u0447\u0430\u0439\u043d\u044b\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u044f." }
+};
+const char* const kSlots[kClassPickSlots] = { u8"\u0413\u043e\u043b\u043e\u0432\u0430", u8"\u041b\u0438\u0446\u043e", u8"\u0428\u0435\u044f", u8"\u041e\u0440\u0443\u0436\u0438\u0435", u8"\u0411\u0435\u0437\u0434\u0435\u043b\u0443\u0448\u043a\u0430" };
+
+const ImVec4 kInk    (0.96f, 0.90f, 0.80f, 1.00f);
+const ImVec4 kMuted  (0.70f, 0.64f, 0.56f, 1.00f);
+const ImVec4 kAccent (0.95f, 0.62f, 0.25f, 1.00f);
+const ImVec4 kGood   (0.55f, 0.85f, 0.45f, 1.00f);
+
+void push_chooser_style() {
+    ImGuiStyle& s = ImGui::GetStyle();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 12));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 6));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,         ImVec4(0.13f, 0.10f, 0.09f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,          ImVec4(0.19f, 0.15f, 0.13f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBg,          ImVec4(0.30f, 0.17f, 0.10f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TitleBgActive,    ImVec4(0.45f, 0.24f, 0.12f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Border,           ImVec4(0.45f, 0.32f, 0.22f, 0.80f));
+    ImGui::PushStyleColor(ImGuiCol_Text,             kInk);
+    ImGui::PushStyleColor(ImGuiCol_Button,           ImVec4(0.36f, 0.22f, 0.14f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,    ImVec4(0.58f, 0.34f, 0.17f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,     ImVec4(0.75f, 0.45f, 0.20f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg,          ImVec4(0.26f, 0.19f, 0.15f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered,   ImVec4(0.36f, 0.25f, 0.18f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_Header,           ImVec4(0.45f, 0.27f, 0.15f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered,    ImVec4(0.58f, 0.34f, 0.17f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TableHeaderBg,    ImVec4(0.26f, 0.17f, 0.12f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt,    ImVec4(1.0f, 1.0f, 1.0f, 0.03f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg,          ImVec4(0.16f, 0.12f, 0.10f, 0.98f));
+    (void)s;
+}
+
+void pop_chooser_style() {
+    ImGui::PopStyleColor(16);
+    ImGui::PopStyleVar(5);
+}
+
+const char* wearing(const ClassPickView& v, uint32_t c) {
+    for (uint32_t t = 0; t < v.tags; ++t)
+        if (v.tag_holder[t] && v.tag_holder[t] == v.cat_key[c]) return v.tag_name[t];
+    return nullptr;
+}
+
+// The game's own pictures, rendered out of its SWFs by tools/icons and shipped
+// in icons/ beside the DLL. 0 when the file is not there: everything below
+// falls back to words then.
+uint32_t collar_tex(const char* cls) {
+    char n[48];
+    _snprintf_s(n, sizeof(n), _TRUNCATE, "collar_%s", cls);
+    return overlay_icon_texture(n);
+}
+
+bool draw_icon(uint32_t tex, float size, float alpha = 1.0f) {
+    if (!tex) return false;
+    ImGui::Image(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(size, size), ImVec2(0, 0),
+                 ImVec2(1, 1), ImVec4(1, 1, 1, alpha), ImVec4(0, 0, 0, 0));
+    return true;
+}
+
+// The game's heart, white like every font icon and tinted here: the mark on
+// the cats that are this player's, so whose is whose reads at a glance.
+const ImVec4 kHeart(0.95f, 0.36f, 0.42f, 1.0f);
+void draw_heart(float size) {
+    const uint32_t tex = overlay_icon_texture("heart");
+    if (tex) {
+        ImGui::Image(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(size, size), ImVec2(0, 0),
+                     ImVec2(1, 1), kHeart, ImVec4(0, 0, 0, 0));
+    } else {
+        ImGui::TextColored(kHeart, "<3");
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"\u0422\u0432\u043e\u0439 \u043a\u043e\u0442");
+}
+
+// Every cat's stats in one table; the best value of each column in green.
+void draw_stat_table(const ClassPickView& v) {
+    int16_t best[kClassPickStats];
+    for (uint32_t s = 0; s < kClassPickStats; ++s) {
+        best[s] = (int16_t)-32768;
+        for (uint32_t c = 0; c < v.cats; ++c)
+            if (v.have_stats[c] && v.stat[c][s] > best[s]) best[s] = v.stat[c][s];
+    }
+    const ImGuiTableFlags f = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_SizingFixedFit;
+    if (!ImGui::BeginTable("stats", 2 + kClassPickStats, f)) return;
+    ImGui::TableSetupColumn(u8"\u041a\u043e\u0442", ImGuiTableColumnFlags_WidthFixed, 130);
+    ImGui::TableSetupColumn(u8"\u041e\u0448\u0435\u0439\u043d\u0438\u043a", ImGuiTableColumnFlags_WidthFixed, 110);
+    for (uint32_t s = 0; s < kClassPickStats; ++s)
+        ImGui::TableSetupColumn(kStats[s].tag, ImGuiTableColumnFlags_WidthFixed, 38);
+    ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+    for (int col = 0; col < 2 + (int)kClassPickStats; ++col) {
+        ImGui::TableSetColumnIndex(col);
+        ImGui::TableHeader(ImGui::TableGetColumnName(col));
+        if (col >= 2 && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n%s", kStats[col - 2].name, kStats[col - 2].desc);
+    }
+    for (uint32_t c = 0; c < v.cats; ++c) {
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextColored(v.cat_mine[c] ? kAccent : kMuted, "%s", v.cat_name[c][0] ? v.cat_name[c] : "?");
+        if (v.cat_mine[c]) { ImGui::SameLine(); draw_heart(ImGui::GetTextLineHeight()); }
+        if (!v.cat_mine[c] && ImGui::IsItemHovered()) ImGui::SetTooltip(u8"\u041a\u043e\u0442 \u0445\u043e\u0441\u0442\u0430");
+        ImGui::TableSetColumnIndex(1);
+        const char* w = wearing(v, c);
+        if (w) {
+            if (draw_icon(collar_tex(w), ImGui::GetTextLineHeight() + 2)) ImGui::SameLine();
+            ImGui::TextUnformatted(class_label(w));
+        }
+        else   ImGui::TextColored(kMuted, "-");
+        for (uint32_t s = 0; s < kClassPickStats; ++s) {
+            ImGui::TableSetColumnIndex(2 + (int)s);
+            if (!v.have_stats[c]) { ImGui::TextColored(kMuted, "?"); continue; }
+            const bool top = v.stat[c][s] == best[s];
+            ImGui::TextColored(top ? kGood : kInk, "%d", (int)v.stat[c][s]);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s: %d\n%s", kStats[s].name, (int)v.stat[c][s], kStats[s].desc);
+        }
+    }
+    ImGui::EndTable();
+}
+
+// What an item does, the game's own words: name, description, bonuses.
+void item_tooltip(const char* key, const char* extra = nullptr) {
+    ItemText t;
+    gametext_item(key, t);
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+    if (draw_icon(t.icon[0] ? overlay_icon_texture(t.icon) : 0, 48)) ImGui::SameLine();
+    ImGui::TextColored(kAccent, "%s", t.name);
+    if (t.desc[0])  ImGui::TextUnformatted(t.desc);
+    if (t.bonus[0]) ImGui::TextColored(kGood, "%s", t.bonus);
+    if (extra) ImGui::TextColored(kMuted, "%s", extra);
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
+// THE "WORN" ROW, the way the game lays out its own: five paper boxes, weapon,
+// head, neck, face, trinket, the middle three larger. An empty box shows the
+// slot's own grey silhouette (catparts.swf sprite 42, the corner badge of every
+// item icon); a click opens the items that fit it, as pictures.
+const uint32_t    kBoxOrder[kClassPickSlots] = { 3, 0, 2, 1, 4 };
+const char* const kSlotArt[kClassPickSlots]  = { "slot_head", "slot_face", "slot_neck",
+                                                 "slot_weapon", "slot_trinket" };
+
+bool paper_box(const char* id, float size, uint32_t tex, float alpha) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(size, size));
+    const bool hot     = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 q(p.x + size, p.y + size);
+    dl->AddRectFilled(p, q, ImGui::GetColorU32(hot ? ImVec4(0.86f, 0.84f, 0.80f, 1.0f)
+                                                   : ImVec4(0.74f, 0.72f, 0.69f, 1.0f)), 6.0f);
+    dl->AddRect(ImVec2(p.x + 6, p.y + 6), ImVec2(q.x - 6, q.y - 6),
+                ImGui::GetColorU32(ImVec4(0.52f, 0.50f, 0.47f, 1.0f)), 4.0f, 0, 1.5f);
+    dl->AddRect(p, q, ImGui::GetColorU32(ImVec4(0.14f, 0.12f, 0.11f, 1.0f)), 6.0f, 0, 3.0f);
+    if (tex) {
+        const float m = size * 0.13f;
+        dl->AddImage(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(p.x + m, p.y + m),
+                     ImVec2(q.x - m, q.y - m), ImVec2(0, 0), ImVec2(1, 1),
+                     ImGui::GetColorU32(ImVec4(1, 1, 1, alpha)));
+    }
+    return clicked;
+}
+
+void draw_equipped(const ClassPickView& v, uint32_t c) {
+    ImGui::TextColored(kMuted, u8"\u041d\u0430\u0434\u0435\u0442\u043e");
+    const float big = 86.0f, small = 68.0f;
+    for (uint32_t n = 0; n < kClassPickSlots; ++n) {
+        const uint32_t k    = kBoxOrder[n];
+        const float    size = (n == 0 || n == kClassPickSlots - 1) ? small : big;
+        if (n) ImGui::SameLine(0, 10);
+        ImGui::PushID(200 + (int)k);
+        ImGui::BeginGroup();
+        if (size < big) ImGui::Dummy(ImVec2(size, (big - size) * 0.5f));
+        const bool worn = v.slot_name[c][k][0] != 0;
+        ItemText wear;
+        if (worn) gametext_item(v.slot_name[c][k], wear);
+        const uint32_t tex = worn && wear.icon[0] ? overlay_icon_texture(wear.icon)
+                                                  : overlay_icon_texture(kSlotArt[k]);
+        if (paper_box("box", size, tex, worn ? 1.0f : 0.45f)) ImGui::OpenPopup("pick");
+        if (ImGui::IsItemHovered()) {
+            if (worn) item_tooltip(v.slot_name[c][k], u8"\u0429\u0451\u043b\u043a\u043d\u0438, \u0447\u0442\u043e\u0431\u044b \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c");
+            else      ImGui::SetTooltip("%s\n%s", kSlots[k], u8"\u041f\u0443\u0441\u0442\u043e. \u0429\u0451\u043b\u043a\u043d\u0438, \u0447\u0442\u043e\u0431\u044b \u043d\u0430\u0434\u0435\u0442\u044c \u043f\u0440\u0435\u0434\u043c\u0435\u0442");
+        }
+        ImGui::EndGroup();
+
+        if (ImGui::BeginPopup("pick")) {
+            ImGui::TextColored(kAccent, "%s", kSlots[k]);
+            if (worn) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(u8"\u0421\u043d\u044f\u0442\u044c")) {
+                    classpick_unequip(v.cat_key[c], k);
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"\u0421\u043d\u044f\u0442\u044c \u0438 \u0443\u0431\u0440\u0430\u0442\u044c \u0432 \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0435");
+            }
+            int shown = 0;
+            for (uint32_t i = 0; i < v.items; ++i) {
+                if (v.item_kind[i] != k) continue;
+                ItemText t;
+                gametext_item(v.item_name[i], t);
+                const uint32_t it = t.icon[0] ? overlay_icon_texture(t.icon) : 0;
+                if (shown % 6) ImGui::SameLine();
+                ImGui::PushID((int)i);
+                const bool pick = it
+                    ? ImGui::ImageButton("item", ImTextureRef((ImTextureID)(uintptr_t)it), ImVec2(54, 54))
+                    : ImGui::Button(t.name, ImVec2(62, 62));
+                if (ImGui::IsItemHovered())
+                    item_tooltip(v.item_name[i], v.item_list[i] ? u8"\u0418\u0437 \u0445\u0440\u0430\u043d\u0438\u043b\u0438\u0449\u0430" : u8"\u0418\u0437 \u0441\u0443\u043c\u043a\u0438");
+                if (pick) {
+                    classpick_equip(v.cat_key[c], i);
+                    ImGui::CloseCurrentPopup();
+                }
+                ImGui::PopID();
+                ++shown;
+            }
+            if (!shown) ImGui::TextColored(kMuted, u8"\u041d\u0435\u0442 \u043f\u043e\u0434\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u043f\u0440\u0435\u0434\u043c\u0435\u0442\u043e\u0432");
+            ImGui::EndPopup();
+        }
+        ImGui::PopID();
+    }
+}
+
+// One of the friend's cats: its collar and its five slots.
+void draw_cat_card(const ClassPickView& v, uint32_t c) {
+    ImGui::PushID((int)c);
+    ImGui::BeginChild("card", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    const char* w = wearing(v, c);
+    if (draw_icon(w ? collar_tex(w) : collar_tex("Colorless"), 44, w ? 1.0f : 0.35f))
+        ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextColored(kAccent, "%s", v.cat_name[c][0] ? v.cat_name[c] : "?");
+    ImGui::SameLine();
+    draw_heart(ImGui::GetTextLineHeight() + 2);
+    ImGui::SameLine();
+    ImGui::TextColored(w ? kGood : kMuted, "%s", w ? class_label(w) : u8"\u0431\u0435\u0437 \u043e\u0448\u0435\u0439\u043d\u0438\u043a\u0430");
+    if (v.have_stats[c]) {
+        // Its two best stats, the quickest read of what it is for.
+        uint32_t a = 0, b = 1;
+        if (v.stat[c][b] > v.stat[c][a]) { a = 1; b = 0; }
+        for (uint32_t s = 2; s < kClassPickStats; ++s) {
+            if (v.stat[c][s] > v.stat[c][a]) { b = a; a = s; }
+            else if (v.stat[c][s] > v.stat[c][b]) b = s;
+        }
+        ImGui::TextColored(kMuted, u8"\u0441\u0438\u043b\u044c\u043d\u0435\u0435 \u0432\u0441\u0435\u0433\u043e:" " %s %d, %s %d", kStats[a].name, (int)v.stat[c][a],
+                           kStats[b].name, (int)v.stat[c][b]);
+    }
+    ImGui::EndGroup();
+
+    ImGui::Spacing();
+    for (uint32_t t = 0; t < v.tags; ++t) {
+        const bool on    = v.tag_holder[t] == v.cat_key[c];
+        const bool taken = v.tag_holder[t] && !on;
+        if (t % 6) ImGui::SameLine();
+        ImGui::PushID((int)t);
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.50f, 0.22f, 1.0f));
+        ImGui::BeginDisabled(taken);
+        const uint32_t tex = collar_tex(v.tag_name[t]);
+        const bool clicked = tex
+            ? ImGui::ImageButton("collar", ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(52, 52),
+                                 ImVec2(0, 0), ImVec2(1, 1), ImVec4(0, 0, 0, 0),
+                                 ImVec4(1, 1, 1, taken ? 0.3f : 1.0f))
+            : ImGui::Button(class_label(v.tag_name[t]), ImVec2(92, 0));
+        if (clicked) classpick_pick(v.cat_key[c], t);
+        ImGui::EndDisabled();
+        if (on) ImGui::PopStyleColor();
+        if (!taken && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (on) ImGui::SetTooltip("%s\n%s", class_label(v.tag_name[t]), u8"\u0429\u0451\u043b\u043a\u043d\u0438, \u0447\u0442\u043e\u0431\u044b \u0441\u043d\u044f\u0442\u044c");
+            else    ImGui::SetTooltip("%s", class_label(v.tag_name[t]));
+        }
+        if (taken && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(u8"\u042d\u0442\u043e\u0442 \u043e\u0448\u0435\u0439\u043d\u0438\u043a \u0443\u0436\u0435 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u0442\u0435");
+        ImGui::PopID();
+    }
+
+    ImGui::Spacing();
+    draw_equipped(v, c);
+    ImGui::EndChild();
+    ImGui::PopID();
+}
+
+void draw_classpick(const ClassPickView& v) {
+    push_chooser_style();
+    // Centred and big each time it comes up -- the chooser is the whole screen's
+    // business while it is open. Appearing, not FirstUseEver: a resize sticks
+    // while it is up, and the next run's chooser starts large again.
+    const ImVec2 disp = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(disp.x * 0.5f, disp.y * 0.5f), ImGuiCond_Appearing,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(disp.x * 0.62f > 760 ? disp.x * 0.62f : 760,
+                                    disp.y * 0.86f), ImGuiCond_Appearing);
+    if (ImGui::Begin(u8"\u0412\u044b\u0431\u043e\u0440 \u043a\u043b\u0430\u0441\u0441\u0430")) {
+        ImGui::TextColored(kMuted, u8"\u041d\u0430\u0432\u0435\u0434\u0438 \u043d\u0430 \u0441\u0442\u0430\u0442, \u0447\u0442\u043e\u0431\u044b \u0443\u0432\u0438\u0434\u0435\u0442\u044c, \u043d\u0430 \u0447\u0442\u043e \u043e\u043d \u0432\u043b\u0438\u044f\u0435\u0442. \u041b\u0443\u0447\u0448\u0435\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u043f\u043e\u0434\u0441\u0432\u0435\u0447\u0435\u043d\u043e \u0437\u0435\u043b\u0451\u043d\u044b\u043c.");
+        ImGui::Spacing();
+        draw_stat_table(v);
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        bool any = false;
+        for (uint32_t c = 0; c < v.cats; ++c) {
+            if (!v.cat_mine[c]) continue;
+            draw_cat_card(v, c);
+            ImGui::Spacing();
+            any = true;
+        }
+        if (!any) ImGui::TextColored(kMuted, u8"\u0423 \u0442\u0435\u0431\u044f \u043d\u0435\u0442 \u043a\u043e\u0442\u043e\u0432 \u0432 \u044d\u0442\u043e\u043c \u043f\u043e\u0445\u043e\u0434\u0435.");
+    }
+    ImGui::End();
+    pop_chooser_style();
+}
+
+// THE CLIENT'S LOADING SCREEN, over everything while the mod takes it back to
+// the host's game: the pause menu, the main menu, the save screen and the
+// opening all happen under it. A ring of the mod's warm dots, what is happening,
+// and the mod's last few lines for whoever wants to know more. It is a window,
+// so it also takes the mouse: a click on the menu underneath would only race
+// the clicks the mod is making there.
+void draw_loading(const char* step) {
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(io.DisplaySize);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.02f, 0.02f, 0.02f, 1.0f));
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                               ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                               ImGuiWindowFlags_NoScrollWithMouse;
+    ImGui::SetNextWindowFocus();
+    if (ImGui::Begin("##mgmp_loading", nullptr, f)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.45f);
+        const float  r = 34.0f * g.font_scale;
+        const double t = ImGui::GetTime();
+        constexpr int kDots = 12;
+        for (int i = 0; i < kDots; ++i) {
+            const float a   = (float)(i * 2 * 3.14159265 / kDots - t * 4.0);
+            const float age = (float)fmod((double)i / kDots + t * 0.65, 1.0);
+            const ImVec4 col(0.95f, 0.62f, 0.25f, 0.15f + 0.85f * age);
+            dl->AddCircleFilled(ImVec2(c.x + cosf(a) * r, c.y + sinf(a) * r),
+                                (2.5f + 3.5f * age) * g.font_scale, ImGui::GetColorU32(col));
+        }
+        auto centred = [&](float y, const ImVec4& col, const char* text) {
+            const ImVec2 sz = ImGui::CalcTextSize(text);
+            dl->AddText(ImVec2(c.x - sz.x * 0.5f, y), ImGui::GetColorU32(col), text);
+        };
+        centred(c.y + r + 28, ImVec4(0.96f, 0.90f, 0.80f, 1.0f), step ? step : "");
+        centred(c.y + r + 54, ImVec4(0.55f, 0.50f, 0.45f, 1.0f), u8"\u041c\u043e\u0434 \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0442\u0435\u0431\u044f \u0432 \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430, \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0430\u0436\u0438\u043c\u0430\u0442\u044c \u043d\u0435 \u043d\u0443\u0436\u043d\u043e");
+
+        // The mod's last lines, small and dim along the bottom.
+        const float line = ImGui::GetTextLineHeight();
+        const size_t n   = g.lines.size() < 6 ? g.lines.size() : 6;
+        float y = io.DisplaySize.y - 14 - line * (float)n;
+        for (size_t i = g.lines.size() - n; i < g.lines.size(); ++i, y += line) {
+            char text[300];
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "%-9s %s", g.lines[i].tag, g.lines[i].text);
+            dl->AddText(ImVec2(18, y), ImGui::GetColorU32(ImVec4(0.42f, 0.40f, 0.38f, 1.0f)), text);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
 }
 
 void row(const char* label, const char* fmt, ...) {
@@ -612,6 +1024,15 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         --g.synthetic_keys;
         return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
     }
+    // The host's cutscene inputs, posted by ui_post_input and counted like the
+    // Escapes. A real click landing in between passes in a posted one's place
+    // and that one is swallowed after it: the count of clicks is the same.
+    if (g.synthetic_input &&
+        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+         ((msg == WM_KEYDOWN || msg == WM_KEYUP) && (wp == VK_SPACE || wp == VK_RETURN)))) {
+        --g.synthetic_input;
+        return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
+    }
 
     // The toggle is read before ImGui sees anything, so the panel can always be
     // dismissed even if it has somehow captured the keyboard.
@@ -626,7 +1047,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
-    if (g.ready && g.visible) {
+    if (g.ready && (g.visible || g.forced)) {
         if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wp, lp))
             return 1;
 
@@ -654,6 +1075,9 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             default: break;
         }
     }
+
+    // A cutscene moves on the host's clicks: the client's own are not the game's.
+    if (cutscene_filter_input(msg, (uintptr_t)wp)) return 0;
 
     return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
 }
@@ -696,6 +1120,10 @@ bool bring_up() {
 
     ImGui::StyleColorsDark();
     ImGui::GetStyle().FontScaleMain = g.font_scale;
+    // The default font has no Cyrillic, and cat names and the class menu are
+    // Russian. 1.92 loads glyphs as they are drawn, so no range is needed.
+    if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f))
+        io.Fonts->AddFontDefault();
 
     if (!ImGui_ImplWin32_Init(g.hwnd)) {
         log_line("UI", "!! ImGui_ImplWin32_Init failed -- the panel is OFF");
@@ -771,14 +1199,44 @@ void ui_post_escape() {
     PostMessageW(g.hwnd, WM_KEYUP,   VK_ESCAPE, down | 0xC0000000);
 }
 
+void post_input(uint8_t what, bool down) {
+    if (what == 0) {
+        POINT pt{};
+        GetCursorPos(&pt);
+        ScreenToClient(g.hwnd, &pt);
+        PostMessageW(g.hwnd, down ? WM_LBUTTONDOWN : WM_LBUTTONUP, down ? MK_LBUTTON : 0,
+                     MAKELPARAM(pt.x, pt.y));
+    } else {
+        const UINT   vk   = what == 1 ? VK_SPACE : VK_RETURN;
+        const LPARAM base = 1 | ((LPARAM)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16);
+        PostMessageW(g.hwnd, down ? WM_KEYDOWN : WM_KEYUP, vk,
+                     down ? base : (base | 0xC0000000));
+    }
+}
+
+bool ui_post_input(uint8_t what) {
+    if (!g.hwnd || g.up_frames) return false;
+    ++g.synthetic_input;
+    post_input(what, true);
+    g.up_what   = what;
+    g.up_frames = 3;
+    return true;
+}
+
 bool ui_captures_input() {
-    if (!g.ready || !g.visible) return false;
+    if (!g.ready || !(g.visible || g.forced)) return false;
     const ImGuiIO& io = ImGui::GetIO();
     return io.WantCaptureMouse || io.WantCaptureKeyboard;
 }
 
 void ui_on_swap(void* window) {
     (void)window;
+    // Before the panel's own early returns: the up has to follow its down
+    // whether or not the panel is enabled or drawn.
+    if (g.up_frames && --g.up_frames == 0) {
+        ++g.synthetic_input;
+        post_input(g.up_what, false);
+    }
     if (!g.enabled || g.failed) return;
 
     // Deferred from ui_init when there was no current DC then.
@@ -793,7 +1251,11 @@ void ui_on_swap(void* window) {
         }
     }
 
-    if (!g.visible) return;
+    ClassPickView pick;
+    const char* step = nullptr;
+    const bool loading = leave_loading(&step);
+    g.forced = classpick_view(pick) || loading;
+    if (!g.visible && !g.forced) return;
 
     if (!g.ready) {
         if (!bring_up()) { g.failed = true; return; }
@@ -808,8 +1270,12 @@ void ui_on_swap(void* window) {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    draw_session();
-    draw_log();
+    if (g.visible) {
+        draw_session();
+        draw_log();
+    }
+    if (classpick_view(pick)) draw_classpick(pick);
+    if (loading) draw_loading(step);
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

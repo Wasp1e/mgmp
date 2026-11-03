@@ -9,7 +9,7 @@ import sys
 import struct
 from collections import Counter, defaultdict
 
-LINE = re.compile(r"^(\d{6}) (\d{4}) (\S+)\s+(.*)$")
+LINE = re.compile(r"^(\d{6}) (\d{4}) (?:\d\d:\d\d:\d\d\.\d{3} )?(\S+)\s+(.*)$")
 HEX  = re.compile(r"\[([0-9A-F ]+)\]")
 CLS  = re.compile(r"cls=(\S+)")
 

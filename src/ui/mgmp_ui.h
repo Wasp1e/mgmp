@@ -75,4 +75,9 @@ void* ui_window();
 // Press Escape for the game. It goes past the panel, open or not.
 void ui_post_escape();
 
+// A left click (0), Space (1) or Enter (2) for the game, past the panel and the
+// cutscene filter: the down now, the up three frames later. False while the
+// last one's up has not gone yet.
+bool ui_post_input(uint8_t what);
+
 } // namespace mgmp

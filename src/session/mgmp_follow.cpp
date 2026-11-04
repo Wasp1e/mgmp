@@ -703,11 +703,14 @@ static bool vote_click(void* node) {
     if (!index_of_node(g.map, node, index)) return true;
     const char* type = node_type_name(node_type(node));
 
+    // EVERY click is sent and meows, a repeat included: the meow is how each
+    // player hears the other one clicking, not a sound for a pick that changed.
+    // A repeated vote changes nothing at the other end -- the same index again.
     if (g.is_client) {
+        send_vote(index);
+        meow_play();
         if (g.client_vote != (int32_t)index) {
             g.client_vote = (int32_t)index;
-            send_vote(index);
-            meow_play();
             log_line("FOLLOW", "this player picked node %u (%s) -- waiting for the host",
                      index, type);
         }
@@ -716,11 +719,9 @@ static bool vote_click(void* node) {
     if (g.vote_bypass || net_peer_count() < 2) return true;
 
     const bool same = g.host_vote == (int32_t)index;
-    if (!same) {
-        g.host_vote = (int32_t)index;
-        send_vote(index);
-        meow_play();
-    }
+    g.host_vote = (int32_t)index;
+    send_vote(index);
+    meow_play();
     if (g.client_vote == (int32_t)index) {
         log_line("FOLLOW", "both players picked node %u -- going", index);
         return true;

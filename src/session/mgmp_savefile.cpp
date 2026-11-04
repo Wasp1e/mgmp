@@ -606,7 +606,11 @@ uint64_t save_mtime() {
 // before the client even started.
 void house_tick() {
     constexpr uint64_t kTickMs      = 300;
-    constexpr uint64_t kMinGapMs    = 30000;
+    // Was 30 s, from before the day signature below: then every rewrite of the
+    // save was a reload, and the floor was the only thing between the client and
+    // one every few seconds. Now only a new day goes out, and a 30 s floor just
+    // held a real day change back -- six to ten seconds of it on 2026-11-04.
+    constexpr uint64_t kMinGapMs    = 3000;
 
     if (!g.published || !g.have_slot || !net_active()) return;
     static uint64_t last_tick = 0;

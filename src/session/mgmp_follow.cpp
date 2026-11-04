@@ -688,11 +688,12 @@ constexpr uintptr_t kRva_NodeClick     = 0x228700;
 using fn_node_click = void (__fastcall*)(void*, void*, void*, void*);
 fn_node_click o_node_click = nullptr;
 
-static void send_vote(uint32_t index) {
+static void send_vote(uint32_t index, uint32_t meow = 0) {
     ChoiceMsg v{};
     v.kind      = kChoiceNode;
     v.index     = index;
     v.node_seed = g.have_here ? g.here_seed : 0;
+    v.aux       = meow;   // which meow the click makes; see meow_play
     net_send_choice(v);
 }
 
@@ -707,8 +708,9 @@ static bool vote_click(void* node) {
     // player hears the other one clicking, not a sound for a pick that changed.
     // A repeated vote changes nothing at the other end -- the same index again.
     if (g.is_client) {
-        send_vote(index);
-        meow_play();
+        const uint32_t meow = meow_new_seed();
+        send_vote(index, meow);
+        meow_play(meow);
         if (g.client_vote != (int32_t)index) {
             g.client_vote = (int32_t)index;
             log_line("FOLLOW", "this player picked node %u (%s) -- waiting for the host",
@@ -720,8 +722,9 @@ static bool vote_click(void* node) {
 
     const bool same = g.host_vote == (int32_t)index;
     g.host_vote = (int32_t)index;
-    send_vote(index);
-    meow_play();
+    const uint32_t meow = meow_new_seed();
+    send_vote(index, meow);
+    meow_play(meow);
     if (g.client_vote == (int32_t)index) {
         log_line("FOLLOW", "both players picked node %u -- going", index);
         return true;
@@ -764,7 +767,7 @@ void follow_on_vote(const ChoiceMsg& m) {
     // A pick made on another node is about another map position.
     if (m.node_seed && g.have_here && m.node_seed != g.here_seed) return;
     show_pick((int32_t)m.index);
-    meow_play();
+    meow_play(m.aux);   // the clicker's meow, so both hear the same one
 
     if (g.is_client) {
         log_line("FOLLOW", "the host picked node %u%s", m.index,

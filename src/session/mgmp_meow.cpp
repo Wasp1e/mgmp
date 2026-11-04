@@ -27,9 +27,15 @@ bool     g_cs_ready = false;
 uint8_t* g_playing  = nullptr;   // PlaySound reads from it until the sound ends
 uint64_t g_seq      = 0;         // the newest meow asked for; an older one does not play
 
-// The draws are made on the CALLER's thread and handed over: the CRT's rand
-// state is per thread, and a fresh thread's starts at seed 1 -- every meow made
-// in one would have been the same meow.
+// The names come from the seed alone, by splitmix64 rather than the CRT's rand,
+// so the two peers turn one seed into the same list and hear the same meow.
+uint64_t splitmix(uint64_t& s) {
+    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
 struct Job {
     uint64_t seq;
     char     name[kTries][96];
@@ -89,22 +95,37 @@ DWORD WINAPI meow_thread(LPVOID p) {
 
 } // namespace
 
-void meow_play() {
-    if (!g_cs_ready) {
-        InitializeCriticalSection(&g_cs);
-        g_cs_ready = true;
-        srand((unsigned)GetTickCount64());
-    }
-    // A fresh draw for every click: voice, mood and take, a few of them in case
-    // a voice number is not one the game has.
+void ensure_meow() {
+    if (g_cs_ready) return;
+    InitializeCriticalSection(&g_cs);
+    g_cs_ready = true;
+    srand((unsigned)GetTickCount64());
+}
+
+uint32_t meow_new_seed() {
+    ensure_meow();
+    uint32_t s = 0;
+    while (!s) s = ((uint32_t)rand() << 17) ^ ((uint32_t)rand() << 2) ^ (uint32_t)GetTickCount64();
+    return s;
+}
+
+void meow_play(uint32_t seed) {
+    ensure_meow();
+    if (!seed) seed = meow_new_seed();
+    // Voice, mood and take, a few of them in case a voice number is not one the
+    // game has -- all from the seed, so a miss is the same miss on both peers.
     Job* job = new Job;
     EnterCriticalSection(&g_cs);
     job->seq = ++g_seq;
     LeaveCriticalSection(&g_cs);
-    for (int t = 0; t < kTries; ++t)
+    uint64_t s = seed;
+    for (int t = 0; t < kTries; ++t) {
+        const uint64_t r = splitmix(s);
         _snprintf_s(job->name[t], sizeof(job->name[t]), _TRUNCATE,
-                    "audio/voices/%s%d/%s%02d.wav", (rand() & 1) ? "male" : "female",
-                    1 + rand() % kMaxVoice, kMoods[rand() % 4], 1 + rand() % 4);
+                    "audio/voices/%s%d/%s%02d.wav", (r & 1) ? "male" : "female",
+                    1 + (int)((r >> 8) % kMaxVoice), kMoods[(r >> 24) % 4],
+                    1 + (int)((r >> 32) % 4));
+    }
     HANDLE t = CreateThread(nullptr, 0, &meow_thread, job, 0, nullptr);
     if (t) CloseHandle(t);
     else   delete job;

@@ -1,6 +1,7 @@
 // mgmp_choice -- see mgmp_choice.h for why replicating the CHOICE replaces
 // replicating everything the choice does.
 #include "mgmp_peerlog.h"
+#include "mgmp_startrun.h"
 #include "mgmp_choice.h"
 #include "mgmp_catsync.h"
 #include "mgmp_follow.h"
@@ -834,6 +835,7 @@ void choice_on_message(const ChoiceMsg& m) {
     if (classpick_on_message(m)) return;                         // the class chooser's
     if (cutscene_on_message(m)) return;                          // a cutscene's
     if (peerlog_on_choice(m)) return;                            // a request for the log
+    if (startrun_on_message(m)) return;                          // the host setting off
     if (!g.on) return;
     Guard guard;
 

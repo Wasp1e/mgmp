@@ -1,3 +1,4 @@
+#include "mgmp_startrun.h"
 #include "mgmp_cutscene.h"
 #include "mgmp_leave.h"
 #include "mgmp_lockstep.h"
@@ -255,6 +256,7 @@ void* __fastcall drawer_update(void* a, void* b, void* c, void* d) {
     g.drawer    = a;
     g.drawer_at = GetTickCount64();
     void* r = g.o_drawer(a, b, c, d);
+    startrun_house_tick();
     if (g.office_go >= 0) {
         const int npc = g.office_go;
         g.office_go  = -1;

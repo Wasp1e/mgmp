@@ -70,6 +70,7 @@ add_library(mgmp SHARED
     src/session/mgmp_meow.cpp
     src/session/mgmp_peerlog.cpp
     src/session/mgmp_night.cpp
+    src/session/mgmp_startrun.cpp
     src/session/mgmp_combatlock.cpp
     src/session/mgmp_cursor.cpp
     src/session/mgmp_overlay.cpp

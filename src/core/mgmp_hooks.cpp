@@ -27,6 +27,7 @@
 // Character::DoAction -- which fired exactly 12 times for 12 decisions -- is the
 // real command boundary for lockstep.
 #include "mgmp_night.h"
+#include "mgmp_startrun.h"
 #include "mgmp_ability.h"
 #include "mgmp_addresses.h"
 #include "mgmp_catsync.h"
@@ -883,6 +884,7 @@ int hooks_install() {
     classpick_set_base(g_base);
     cutscene_set_base(g_base);
     night_set_base(g_base);
+    startrun_set_base(g_base);
     savefile_set_base(g_base);
     leave_set_base(g_base);
     overlay_set_base(g_base);

@@ -1,5 +1,6 @@
 // mgmp_nodehash -- see mgmp_nodehash.h for why the meta layer needs its own
 // hash and why it reports rather than halts.
+#include "mgmp_peerlog.h"
 #include "mgmp_nodehash.h"
 
 #include "mgmp_addresses.h"
@@ -195,6 +196,7 @@ void report(uint8_t from, const NodeHashMsg& a, const NodeHashMsg& b) {
     }
 
     ++g.mismatched;
+    peerlog_trouble("a node hash mismatch");
     log_line("NODEHASH", "!! MISMATCH at %s of node %u (%016llx) against peer %u",
              point_name(a.point), a.node_index,
              (unsigned long long)a.node_seed, (unsigned)from);

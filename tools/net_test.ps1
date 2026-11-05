@@ -110,7 +110,7 @@ function Stop-Peers {
 # and believing it is this run's is the exact mistake the timestamps prevent.
 function Get-PeerLog([string]$peer) {
     $dir = Join-Path $root $peers[$peer]
-    Get-ChildItem (Join-Path $dir "mgmp_${peer}_2*.log") -ErrorAction SilentlyContinue |
+    Get-ChildItem (Join-Path $dir "logs\mgmp_${peer}_2*.log") -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime | Select-Object -Last 1
 }
 

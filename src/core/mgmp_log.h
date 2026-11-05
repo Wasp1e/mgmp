@@ -19,6 +19,10 @@ namespace mgmp {
 void log_init(const wchar_t* path, bool console);
 void log_shutdown();
 
+// The file this process is writing, logs\<name>_<stamp>.log; empty before
+// log_init has opened one.
+const wchar_t* log_file_path();
+
 // Emits one complete line (newline appended, flushed).
 void log_line(const char* tag, const char* fmt, ...);
 

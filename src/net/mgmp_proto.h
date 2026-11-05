@@ -51,7 +51,7 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 61;  // 61 a node vote carries its meow in aux, so both peers play the same one, 60 CHOICE kind 16, taking an item off; a PICK of the collar a cat wears takes it off, 59 CHOICE kind 15, the chooser cats' stats, 58 the host says WHICH cutscene it is in, and inputs go to the same one only, 57 CHOICE kind 14, the host's cutscene starts, 56 CHOICE kind 13, the host's cutscene inputs, 55 CHOICE kinds 10-12, the class chooser's items, 54 the peer's cat is not polled until its decision arrives, 53 CHOICE kinds 6-9, the shared class chooser,  2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 28 ACTION carries the owner's facing -- PlayerBrain's own update calls Character::Face on the owning machine only, so a hover or a manual turn moved facing on one peer and the AI and backstab test then read two different boards, 29 ENTERNODE carries run_id -- a battle id is now the node seed mixed with which load of the run this is, because a host that reloaded mid-battle re-entered the same seed and the first attempt's actions and hashes were accepted as the second's, 30 both peers re-apply the end-of-turn facing at the turn boundary -- not one byte moved, version 12's rule again, because a peer without it reads a different board on the very next enemy turn, 31 the client clears a cat's next-fight statuses before applying a CATDATA -- again no byte moved, but a peer without it doubles every status an event grants, 32 ACTION's facing is now Character+0x390, the target the game settles on, and both it and +0x388 are written -- same bytes, different meaning, which is exactly what version 12 said must bump, 33 the client's adventure shop refuses purchases -- no byte moved, but a peer without it can still level a cat the host never hears about, 34 a `fresh` SAVEFILE can now arrive while the client stands in the House, and it is expected to leave for the menu and reload rather than wait to be told, 35 ENTERNODE carries the run's cat owners, 36 SAVEFILE fresh = 2 (catch-up while the host is in a run), 37 a state-only mismatch in HP or shield takes the host's numbers, 38 CURSOR carries the live facing of the sender's cat, 39 ENTERNODE carries the weather list, 40 STATEDUMP carries the stream, and a stream-only mismatch takes the host's, 41 PING is sent, to keep the Steam session open in the House, 42 unseen cats are split in roster order, so both peers must agree on it, 43 the client holds turn 0 for the host so a stream correction can land, 44 the inventory also travels while on the map, 45 CHOICE names the cat and a client picks level-ups for its own cats, 46 a client also picks events for its own cats, 47 the client says when it has a level-up screen
+constexpr uint32_t kProtoVersion = 68;  // 68 the class menu carries each cat's mutations (kChoiceClassMuts); 67 the host's night comes to the client (MSG_NIGHT); 66 the client's log comes to the host (MSG_LOGFILE, kChoiceLogRequest); 65 the client takes the host's cat split when the two differ, the office's first talk goes with its opening, a matching map vote is quiet; 64 the class menu comes in two screens, collars then gear (kChoiceClassEnd aux = 1 or 2); 63 63 the office's conversations come from the host (kChoiceOfficeTalk); 62 62 NPC offices (a start named "office:<npc>", "office-exit") and the host's click position in count -- a 61 build plays "office:3" as a cutscene name and the game throws; 61 a node vote carries its meow in aux, so both peers play the same one, 60 CHOICE kind 16, taking an item off; a PICK of the collar a cat wears takes it off, 59 CHOICE kind 15, the chooser cats' stats, 58 the host says WHICH cutscene it is in, and inputs go to the same one only, 57 CHOICE kind 14, the host's cutscene starts, 56 CHOICE kind 13, the host's cutscene inputs, 55 CHOICE kinds 10-12, the class chooser's items, 54 the peer's cat is not polled until its decision arrives, 53 CHOICE kinds 6-9, the shared class chooser,  2 CONTROL, 3 ENTERNODE, 4 SAVEFILE, 5 epoch, 6 CATDATA, 7 INVENTORY, 8 state hash drops facing + roster cap 254, 9 peer envelope + PEERS (up to 4 players), 10 state hash gains ElementList (tiles + equipment), 11 CURSOR, 12 state hash gains live-list membership and stops hashing departed cats, 13/14/15 CURSOR churn while the pointer moved from the board to the screen, 16 CURSOR carries the cursor-art index -- the peer's pointer is now the game's own texture for the state their game is in, 17 CHOICE -- event and level-up option choices, which is what replaces RUNSTATE, 18 the per-battle epoch COUNTER becomes a u64 battle_id -- the node seed both peers already share -- so battle identity survives a peer restarting, 19 CHOICE carries the node seed it was made on -- a held choice used to have no idea which node it belonged to and could surface on a later one, 20 RUNHIST (the run-history object the event roller reads) + NODEHASH (the meta layer finally gets the per-node check the battle layer has had per turn since version 5), 21 AIM -- the range/AOE tiles the other player is aiming at, drawn on this peer by the game's own Brain::DrawAbilityAOE; cosmetic like CURSOR and hashed by nothing, 22 AIM is read from the PLAYERBRAIN'S SELECTION (PlayerBrain+0x3D8/+0x358/+0x360) instead of the cached decision, and the receiver draws the RANGE tiles as well as the AOE -- not one byte of AimMsg moved, which is exactly the kind of change version 12 established has to bump anyway, 23 the range-tile call that came with 22 is REMOVED -- sub_140138A10 applies statuses rather than drawing, so mirroring it mutated the non-owning peer's simulation and cost a run; the bump exists so a peer still running 22 cannot join and do it, 24 the highlight is back and the tiles with it, but only ever called with sub_140151CE0 -- its apply_status half -- swallowed by T_HighlightRefresh and with the whole roster's cat state fenced across the call, 25 a Move aim also shows the ATTACK RANGE from the hovered square -- the game gets those tiles by displacing the cat and moving it back, so the receiver now makes two TacticsObject::Move calls per frame inside the same state fence; not one byte of AimMsg moved, version 12's rule again, 26 STATEDUMP -- on a hash mismatch each peer sends the per-cat table its own hash was taken over, so the log that halts also names the cat and the field instead of requiring two log files side by side, 27 SAVEFILE carries `fresh` -- whether the host is (re)starting a run from the save screen or catching a peer up. A host that goes back to the menu and picks a slot again starts a NEW run, and the client used to decline that save with "already in the run": the g.applied latch is per-PROCESS and the two sends were byte-identical, so nothing on the receiving side could tell them apart, and HOSTLEFT -- the other half of that story: `fresh` handles the host STARTING a run, HOSTLEFT handles it ENDING one. Both shipped in the same unreleased version, which is the only reason they share a number, 28 ACTION carries the owner's facing -- PlayerBrain's own update calls Character::Face on the owning machine only, so a hover or a manual turn moved facing on one peer and the AI and backstab test then read two different boards, 29 ENTERNODE carries run_id -- a battle id is now the node seed mixed with which load of the run this is, because a host that reloaded mid-battle re-entered the same seed and the first attempt's actions and hashes were accepted as the second's, 30 both peers re-apply the end-of-turn facing at the turn boundary -- not one byte moved, version 12's rule again, because a peer without it reads a different board on the very next enemy turn, 31 the client clears a cat's next-fight statuses before applying a CATDATA -- again no byte moved, but a peer without it doubles every status an event grants, 32 ACTION's facing is now Character+0x390, the target the game settles on, and both it and +0x388 are written -- same bytes, different meaning, which is exactly what version 12 said must bump, 33 the client's adventure shop refuses purchases -- no byte moved, but a peer without it can still level a cat the host never hears about, 34 a `fresh` SAVEFILE can now arrive while the client stands in the House, and it is expected to leave for the menu and reload rather than wait to be told, 35 ENTERNODE carries the run's cat owners, 36 SAVEFILE fresh = 2 (catch-up while the host is in a run), 37 a state-only mismatch in HP or shield takes the host's numbers, 38 CURSOR carries the live facing of the sender's cat, 39 ENTERNODE carries the weather list, 40 STATEDUMP carries the stream, and a stream-only mismatch takes the host's, 41 PING is sent, to keep the Steam session open in the House, 42 unseen cats are split in roster order, so both peers must agree on it, 43 the client holds turn 0 for the host so a stream correction can land, 44 the inventory also travels while on the map, 45 CHOICE names the cat and a client picks level-ups for its own cats, 46 a client also picks events for its own cats, 47 the client says when it has a level-up screen
 
 // A frame's payload may not exceed this. RUNSTATE (phase 5) is the only message
 // that will ever approach it; everything in phase 4 is under 128 bytes.
@@ -122,6 +122,10 @@ enum MsgType : uint8_t {
                         // can print the actual diff instead of two log files
                         // that have to be lined up by hand
     MSG_HOSTLEFT =20,   // host -> client: the host is no longer in the run
+    MSG_LOGFILE  =21,   // client -> host: the end of the client's log, after
+                        // trouble or when asked (see mgmp_peerlog.h)
+    MSG_NIGHT    =22,   // host -> client: one event of the House's night, as
+                        // text (see mgmp_night.h); a LogFileMsg on the wire
 };
 
 // A save file is a plain sqlite3 database (the shipped ones start with the
@@ -699,6 +703,17 @@ constexpr uint8_t kChoiceCutStart   = 14;
 constexpr uint8_t kChoiceClassStats = 15;
 // Client -> host: take what cat `cat` wears in slot aux off, into the storage.
 constexpr uint8_t kChoiceClassUnequip = 16;
+// Host -> client: cat `index`'s mutations, as "slot:id,slot:id" in `name` --
+// the game's slot index (0..10) and the part's id in data/mutations/*.gon.
+constexpr uint8_t kChoiceClassMuts    = 19;
+// Host -> client: cat `index`'s stat bonuses (CatData+0x70C), packed as
+// kChoiceClassStats packs the stats.
+constexpr uint8_t kChoiceClassBonus   = 20;
+// Host -> client: the NPC office's conversation number `index` is `name` (see
+// mgmp_cutscene.cpp, office_talk). Empty name: the office has no more to say.
+constexpr uint8_t kChoiceOfficeTalk   = 17;
+// Host -> client: send the host your log (mgmp_peerlog.h). `name` says why.
+constexpr uint8_t kChoiceLogRequest   = 18;
 
 // Host -> client, once the host has committed to a save file.
 //
@@ -906,6 +921,43 @@ struct StateDumpMsg {
 };
 
 inline uint32_t statedump_frame_size(const StateDumpMsg& m) { return m.size + 96; }
+
+// The end of a peer's log. Under the 1 MiB frame cap with room to spare.
+constexpr uint32_t kMaxLogBytes = 768u << 10;
+
+struct LogFileMsg {
+    uint32_t size       = 0;
+    char     reason[64] = {};
+    char     name[96]   = {};       // the sender's file name, UTF-8
+    uint8_t* data       = nullptr;  // encode: borrowed. decode: owned.
+};
+
+inline uint32_t logfile_frame_size(const LogFileMsg& m) { return m.size + 200; }
+
+inline uint32_t enc_logfile(uint8_t* p, uint32_t cap, const LogFileMsg& m,
+                            uint8_t type = MSG_LOGFILE) {
+    if (!m.data || m.size == 0 || m.size > kMaxLogBytes) return 0;
+    Writer w(p, cap);
+    w.u8v(type);
+    w.str(m.reason); w.str(m.name);
+    w.u32v(m.size);
+    w.raw(m.data, m.size);
+    return w.ok ? w.len : 0;
+}
+
+inline bool dec_logfile(Reader& r, LogFileMsg& m) {
+    m.data = nullptr;
+    r.str(m.reason, sizeof(m.reason));
+    r.str(m.name, sizeof(m.name));
+    m.size = r.u32v();
+    if (!r.ok || m.size == 0 || m.size > kMaxLogBytes || r.pos + m.size > r.len) return false;
+    uint8_t* buf = (uint8_t*)malloc(m.size);
+    if (!buf) return false;
+    memcpy(buf, r.buf + r.pos, m.size);
+    r.pos += m.size;
+    m.data = buf;
+    return true;
+}
 
 inline uint32_t enc_statedump(uint8_t* p, uint32_t cap, const StateDumpMsg& m) {
     if (!m.data || m.size == 0 || m.size > kMaxDumpBytes) return 0;
@@ -1432,6 +1484,8 @@ inline const char* msg_name(uint8_t t) {
         case MSG_AIM:     return "AIM";
         case MSG_STATEDUMP: return "STATEDUMP";
         case MSG_HOSTLEFT: return "HOSTLEFT";
+        case MSG_LOGFILE:  return "LOGFILE";
+        case MSG_NIGHT:    return "NIGHT";
         default:          return "?";
     }
 }

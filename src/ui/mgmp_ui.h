@@ -78,6 +78,11 @@ void ui_post_escape();
 // A left click (0), Space (1) or Enter (2) for the game, past the panel and the
 // cutscene filter: the down now, the up three frames later. False while the
 // last one's up has not gone yet.
-bool ui_post_input(uint8_t what);
+// pos: where the click goes, from ui_pack_pos on the other peer; 0 = under this cursor.
+bool ui_post_input(uint8_t what, uint32_t pos = 0);
+
+// A click's place in this window (a WM_ mouse lParam) as a share of its client
+// area, 16 bits a side, so a window of another size puts it on the same thing.
+uint32_t ui_pack_pos(intptr_t lparam);
 
 } // namespace mgmp

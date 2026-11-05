@@ -165,6 +165,8 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_INVENTORY: return dec_inventory(r, m.inventory);
         case MSG_RUNHIST:   return dec_runhist(r, m.runhist);
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
+        case MSG_LOGFILE:   return dec_logfile(r, m.logfile);
+        case MSG_NIGHT:     return dec_logfile(r, m.night);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
         case MSG_PEERS:   return dec_peers(r, m.peers);
@@ -770,6 +772,20 @@ bool net_send_statedump(const StateDumpMsg& m) {
     return ok;
 }
 
+static bool send_text_frame(const LogFileMsg& m, uint8_t type) {
+    const uint32_t need = logfile_frame_size(m);
+    if (need > kMaxFrame) return false;
+    uint8_t* p = (uint8_t*)malloc(need);
+    if (!p) return false;
+    const uint32_t n = enc_logfile(p, need, m, type);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
+
+bool net_send_logfile(const LogFileMsg& m) { return send_text_frame(m, MSG_LOGFILE); }
+bool net_send_night(const LogFileMsg& m)   { return send_text_frame(m, MSG_NIGHT); }
+
 bool net_send_inventory(const InventoryMsg& m) {
     uint32_t need = inventory_frame_size(m);
     if (need > kMaxFrame) {
@@ -790,6 +806,8 @@ void net_msg_release(NetMsg& m) {
     if (m.catdata.data)  { free(m.catdata.data);  m.catdata.data  = nullptr; }
     if (m.runhist.data)  { free(m.runhist.data);  m.runhist.data  = nullptr; }
     if (m.statedump.data){ free(m.statedump.data);m.statedump.data= nullptr; }
+    if (m.logfile.data)  { free(m.logfile.data);  m.logfile.data  = nullptr; }
+    if (m.night.data)    { free(m.night.data);    m.night.data    = nullptr; }
     for (uint32_t i = 0; i < kInvBuckets; ++i)
         if (m.inventory.data[i]) { free(m.inventory.data[i]); m.inventory.data[i] = nullptr; }
 }
@@ -807,6 +825,8 @@ bool net_poll(NetMsg& out) {
         g.queue[g.head].catdata.data  = nullptr;
         g.queue[g.head].runhist.data  = nullptr;
         g.queue[g.head].statedump.data = nullptr;
+        g.queue[g.head].logfile.data   = nullptr;
+        g.queue[g.head].night.data     = nullptr;
         for (uint32_t i = 0; i < kInvBuckets; ++i)
             g.queue[g.head].inventory.data[i] = nullptr;
         g.head = (g.head + 1) % kQueueCap;

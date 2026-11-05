@@ -11,6 +11,9 @@
 #include "mgmp_config.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
+#include <intrin.h>
 
 #include <windows.h>
 
@@ -61,6 +64,53 @@ const char* const kAlwaysSkip[] = { "game_intro" };
 constexpr uint64_t  kHostStartMs      = 10000;
 constexpr uint64_t kStartStaleMs = 30000;   // a start the client never got to
 
+// NPC OFFICES. A cat sent down the House pipe, or an NPC clicked on the House
+// map, takes the game to that NPC's office (Frank's attic upgrade and the like):
+// NPCMapDrawer::GoToNPCOffice(this, npc) at 0x27CE70, npc 0 beanies .. 3 frank
+// .. 7, reached from the click lambdas and the drawer's update (0x2805A0). Its
+// talk is the office's own, not a DialogController, and it is no PlayCutscene:
+// on 2026-11-04 the host sat in Frank's and the client never left the House.
+// The host's visit goes out as a start named "office:<npc>"; the client makes
+// the same call on its own drawer, caught from the drawer's update (vtable
+// 0xEE65A0 slot 10). NPCOffice (vtable 0xF034C0) updates at slot 10, which says
+// one is up; its Exit button is init's lambda_1, _Do_call 0x285EB0 on a closure
+// holding the office at +8 -- called on the client when the host's office closes.
+constexpr uintptr_t kRva_GoToOffice     = 0x27CE70;
+const uint8_t kOfficePrologue[9] = { 0x89, 0x54, 0x24, 0x10, 0x48, 0x89, 0x4C, 0x24, 0x08 };
+constexpr uintptr_t kRva_DrawerVtable   = 0xEE65A0;
+constexpr uintptr_t kRva_DrawerUpdate   = 0x277A30;
+constexpr uintptr_t kRva_OfficeVtable   = 0xF034C0;
+constexpr uintptr_t kRva_OfficeUpdate   = 0x284C30;
+constexpr uintptr_t kRva_OfficeExitCall = 0x285EB0;
+constexpr uintptr_t kRva_OfficeExitVt  = 0xF03D68;   // that lambda's _Func_impl, _Do_call at slot 2
+constexpr uint64_t  kOfficeGoneMs       = 1500;       // its update pauses now and then
+// THE INPUT GATE. The game's input update (0x986800) reads the mouse only when
+// SDL_GetWindowFlags says the window has SDL_WINDOW_INPUT_FOCUS (0x200), at
+// 0x986966 -- a second player's window in the background drops every click
+// the host sends it. SDL_GetWindowFlags is exported; called from there, while
+// the host's cutscene is up here, it says focused.
+constexpr uintptr_t kRva_FocusCallRet   = 0x98696B;
+constexpr uint64_t  kSdlInputFocus      = 0x200;
+// WHAT THE NPC SAYS. An office asks its progression (global +0x5A8) which talk
+// comes next: sub_1401C4410(progression, std::string* out, int npc), which
+// constructs the talk's key in *out ("beanies_quest_fail"...), empty when there
+// is none. Each game asks its own, and the client's House is the save before
+// the host's pipe -- on 2026-11-04 Frank told the two players different things.
+// The host's answers, asked from an office (init 0x280CE6 / 0x281C55, update
+// 0x284D53), go out in order; the client's same calls get them instead. The
+// drawer's own call (0x277A30, the map's alert icons) is left alone.
+constexpr uintptr_t kRva_NextTalk = 0x1C4410;
+const uint8_t kNextTalkPrologue[10] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10 };
+const uintptr_t kTalkRets[] = { 0x280CE6, 0x281C55, 0x284D53 };
+constexpr uint32_t kMaxTalks = 16;
+const char kOfficePrefix[] = "office:";
+const char kOfficeExit[]   = "office-exit";
+
+using fn_office = uint64_t (__fastcall*)(void*, int);
+using fn_exit   = void (__fastcall*)(void*);
+using fn_flags  = uint64_t (__cdecl*)(void*);
+using fn_talk   = void* (__fastcall*)(void*, void*, int);
+
 using fn_play  = void* (__fastcall*)(void*, void*, void*, uint64_t, uint64_t);
 using fn_alloc = void* (__fastcall*)(size_t);
 
@@ -81,7 +131,7 @@ struct State {
     uint32_t  sent = 0, played = 0, swallowed = 0;
 
     // client: the host's inputs not posted yet
-    struct In { uint8_t what; uint64_t at; };
+    struct In { uint8_t what; uint32_t pos; uint64_t at; };
     In        queue[16] = {};
     uint32_t  queued    = 0;
 
@@ -107,6 +157,34 @@ struct State {
     uint64_t  host_input_at = 0;      // client: the host's last click or key
     uint64_t  blocked_since = 0;      // client: first swallowed click with none since
     bool      said_unblock  = false;
+    uint64_t  host_dialog_down_at = 0;   // client: when the host's dialog last closed
+
+    fn_update o_drawer = nullptr;
+    fn_update o_office = nullptr;
+    fn_office o_goto   = nullptr;
+    fn_exit   office_exit = nullptr;
+    void*     drawer      = nullptr;   // the House map's NPCMapDrawer, last seen
+    uint64_t  drawer_at   = 0;
+    void*     office      = nullptr;   // the NPCOffice up, last seen
+    uint64_t  office_at   = 0;
+    bool      office_was  = false;     // host: an office was up last frame
+    bool      going_ours  = false;     // client: the host's visit, being made here
+    bool      exit_wanted = false;     // client: the host left its office
+    uint64_t  exit_at     = 0;
+    int       office_go   = -1;        // client: the host's office, for the drawer's next update
+    fn_exit   o_exit_btn  = nullptr;   // the office's Exit, hooked on its vtable
+    fn_flags  o_flags     = nullptr;
+    uintptr_t focus_ret   = 0;
+    bool      said_focus  = false;
+
+    fn_talk   o_talk      = nullptr;
+    uintptr_t talk_rets[3] = {};
+    void*     prog        = nullptr;    // the progression the game last asked
+    uint32_t  talks_sent  = 0;          // host: this office's talks so far
+    bool      talk_none   = false;      // host: the last one sent was "nothing"
+    uint32_t  talks_used  = 0;          // client: this office's talks taken
+    uint32_t  talks_have  = 0;          // client: the host's, arrived
+    char      talks[kMaxTalks][48] = {};
 };
 
 State g;
@@ -165,9 +243,183 @@ void* __fastcall dialog_update(void* a, void* b, void* c, void* d) {
     return g.o_dialog(a, b, c, d);
 }
 
+bool office_up() { return g.o_office && GetTickCount64() - g.office_at < kOfficeGoneMs; }
+bool safe_go_office(void* drawer, int npc);
+bool safe_exit_office(void* office);
+
+// Both calls are made from inside the game's own update of that component: the
+// two reach the scene being updated through a global (0x13C18F0) the director
+// sets only while it updates one, and from anywhere else it is null -- the
+// first try, from the frame's end, faulted at 0x27D9F3 on 2026-11-04.
+void* __fastcall drawer_update(void* a, void* b, void* c, void* d) {
+    g.drawer    = a;
+    g.drawer_at = GetTickCount64();
+    void* r = g.o_drawer(a, b, c, d);
+    if (g.office_go >= 0) {
+        const int npc = g.office_go;
+        g.office_go  = -1;
+        g.going_ours = true;
+        const bool ok = safe_go_office(a, npc);
+        g.going_ours = false;
+        log_line("CUTSCENE", ok ? "<- the host's NPC office %d opened here"
+                                : "!! the host's NPC office %d faulted opening here", npc);
+    }
+    return r;
+}
+
+void* __fastcall office_update(void* a, void* b, void* c, void* d) {
+    g.office    = a;
+    g.office_at = GetTickCount64();
+    void* r = g.o_office(a, b, c, d);
+    if (g.exit_wanted && net_role() != NetRole::Host) {
+        g.exit_wanted = false;
+        const bool ok = safe_exit_office(a);
+        log_line("CUTSCENE", ok ? "<- the host left its NPC office -- leaving this one"
+                                : "!! leaving the NPC office faulted");
+    }
+    return r;
+}
+
+struct GameStr;
+bool set_game_str(void* s, const char* text);
+
+// See kRva_NextTalk.
+void* __fastcall next_talk(void* prog, void* out, int npc) {
+    void* r = g.o_talk(prog, out, npc);
+    g.prog = prog;
+    const uintptr_t ret = (uintptr_t)_ReturnAddress();
+    bool from_office = false;
+    for (uintptr_t a : g.talk_rets) from_office |= ret == a;
+    if (!from_office || !net_active()) return r;
+    char key[48];
+    if (!mem_read_std_string(out, key, sizeof(key))) key[0] = 0;
+    // An office with nothing left to say asks again every frame (2026-11-04:
+    // eighty of them in two seconds). Only the first "nothing" counts.
+    if (net_role() == NetRole::Host) {
+        if (!key[0] && g.talk_none) return r;
+        g.talk_none = !key[0];
+        if (net_peer_count() >= 2) {
+            ChoiceMsg c{};
+            c.kind  = kChoiceOfficeTalk;
+            c.index = g.talks_sent++;
+            strncpy_s(c.name, key, _TRUNCATE);
+            net_send_choice(c);
+            log_line("CUTSCENE", "-> the NPC office's talk %u is '%s'", c.index, key);
+        }
+        return r;
+    }
+    const uint32_t i = g.talks_used;
+    if (i < g.talks_have && i < kMaxTalks && !g.talks[i][0]) {
+        // The host's said nothing more: so does this one, and it stays there.
+        if (key[0]) set_game_str(out, "");
+        return r;
+    }
+    if (i >= g.talks_have && !key[0]) return r;   // nothing here either, not a talk
+    g.talks_used = i + 1;
+    if (i >= g.talks_have || i >= kMaxTalks) {
+        log_line("CUTSCENE", "!! the NPC office's talk %u is not in from the host -- this game's own '%s'",
+                 i, key);
+        return r;
+    }
+    if (strcmp(key, g.talks[i]) != 0) {
+        if (set_game_str(out, g.talks[i]))
+            log_line("CUTSCENE", "<- the NPC office's talk %u: the host's '%s', not '%s'", i,
+                     g.talks[i], key);
+        else
+            log_line("CUTSCENE", "!! could not hand the office the host's talk '%s'", g.talks[i]);
+    }
+    return r;
+}
+
+// The office asks for its first talk seconds after it opens, and the client's
+// asks at the same moment -- before the host's had crossed (2026-11-05: the
+// friend's office talked as if no cat had gone down the pipe). So the host asks
+// its own progression at once, as the map's icons do every frame, and sends
+// that as talk 0 right behind the opening. The office's own ask sends 0 again.
+void send_first_talk(int npc) {
+    if (!g.o_talk || !g.prog) return;
+    alignas(8) uint8_t tmp[sizeof(GameStr)] = {};
+    char key[48] = {};
+    __try {
+        g.o_talk(g.prog, tmp, npc);
+        if (!mem_read_std_string(tmp, key, sizeof(key))) return;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    // A key past 15 characters is on the game's heap: left there, a few bytes.
+    ChoiceMsg c{};
+    c.kind  = kChoiceOfficeTalk;
+    c.index = 0;
+    strncpy_s(c.name, key, _TRUNCATE);
+    net_send_choice(c);
+    log_line("CUTSCENE", "-> the NPC office's talk 0 is '%s' (asked at the opening)", key);
+}
+
+uint64_t __fastcall go_office(void* drawer, int npc) {
+    if (net_role() == NetRole::Host) { g.talks_sent = 0; g.talk_none = false; }
+    else if (g.going_ours) g.talks_used = 0;
+    if (!g.going_ours && net_active()) {
+        char n[48];
+        _snprintf_s(n, sizeof(n), _TRUNCATE, "%s%d", kOfficePrefix, npc);
+        if (net_role() == NetRole::Host) {
+            if (net_peer_count() >= 2) {
+                ChoiceMsg c{};
+                c.kind = kChoiceCutStart;
+                strncpy_s(c.name, n, _TRUNCATE);
+                net_send_choice(c);
+                log_line("CUTSCENE", "-> NPC office %d opened here, sent", npc);
+                send_first_talk(npc);
+            }
+        } else {
+            strncpy_s(g.own_name, n, _TRUNCATE);
+            g.own_at = GetTickCount64();
+            log_line("CUTSCENE", "NPC office %d opened by this game", npc);
+        }
+    }
+    return g.o_goto(drawer, npc);
+}
+
+bool safe_go_office(void* drawer, int npc) {
+    __try { g.o_goto(drawer, npc); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The host pressing its office's Exit -- what closes the client's, not the
+// office's update pausing, which it does: on 2026-11-04 a pause read as a close
+// and the client was put back in its House with the host still talking.
+bool linked();
+void __fastcall exit_button(void* closure) {
+    if (net_role() == NetRole::Host && linked() && !g.going_ours) {
+        ChoiceMsg c{};
+        c.kind = kChoiceCutStart;
+        strncpy_s(c.name, kOfficeExit, _TRUNCATE);
+        net_send_choice(c);
+        log_line("CUTSCENE", "-> the NPC office's Exit was pressed here, sent");
+    }
+    g.o_exit_btn(closure);
+}
+
+bool focus_wanted();
+
+uint64_t __cdecl window_flags(void* window) {
+    uint64_t f = g.o_flags(window);
+    if (!(f & kSdlInputFocus) && (uintptr_t)_ReturnAddress() == g.focus_ret && focus_wanted()) {
+        if (!g.said_focus)
+            log_line("CUTSCENE", "this window is in the background -- reading the host's clicks anyway");
+        g.said_focus = true;
+        f |= kSdlInputFocus;
+    }
+    return f;
+}
+
+bool safe_exit_office(void* office) {
+    // The button's closure: its vtable is never read by _Do_call, the office is at +8.
+    void* closure[2] = { nullptr, office };
+    __try { g.office_exit(closure); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 void patch(uintptr_t base, uintptr_t vt, uintptr_t want, void* ours, fn_update& orig,
-           const char* what) {
-    void** slot = (void**)(base + vt) + kUpdateSlot;
+           const char* what, uint32_t index = kUpdateSlot) {
+    void** slot = (void**)(base + vt) + index;
     void*  have = nullptr;
     DWORD  prot = 0;
     if (!mem_read(slot, &have, sizeof(have)) || (uintptr_t)have != base + want ||
@@ -186,11 +438,21 @@ const char* up_why() {
     const uint64_t now = GetTickCount64();
     // Not the "Cutscene" scene: it is loaded from boot on, cutscene or not.
     if (g.o_swf && now - g.swf_at < kGoneMs) return "a swf cutscene";
+    if (office_up()) return "an NPC office";
     if (g.o_dialog && now - g.dialog_at < kGoneMs && !lockstep_in_battle()) return "a dialog";
     return nullptr;
 }
 
 bool linked() { return net_active() && net_peer_count() >= 2; }
+
+// Client: a cutscene of the host's is up here, so its clicks must land even
+// with this window behind another. The client's own are swallowed meanwhile.
+bool same_as_host();
+bool dialog_is_hosts();
+bool focus_wanted() {
+    return net_role() != NetRole::Host && linked() && up_why() != nullptr &&
+           (same_as_host() || dialog_is_hosts() || g.queued > 0);
+}
 
 // A client alone in a dialog -- an NPC in its own House -- answers it itself.
 bool host_up() { return GetTickCount64() - g.host_up_at < kHostUpForMs; }
@@ -200,12 +462,25 @@ bool host_up() { return GetTickCount64() - g.host_up_at < kHostUpForMs; }
 const char* my_id() {
     const uint64_t now = GetTickCount64();
     if (g.o_swf && now - g.swf_at < kGoneMs) return g.cur_name[0] ? g.cur_name : "swf";
+    if (office_up()) return "office";
     if (g.o_dialog && now - g.dialog_at < kGoneMs && !lockstep_in_battle()) return "dialog";
     return "";
 }
 
 // The host's clicks go into the same cutscene only.
 bool same_as_host() { return host_up() && strcmp(my_id(), g.host_up_name) == 0; }
+
+// A dialog box closes for a moment between two of an NPC's boxes, and the host
+// may be a reload ahead or behind: a dialog here is the host's to click through
+// while the host is in one or left one this recently. Past that the host is
+// elsewhere -- an NPC the client opened alone -- and the clicks are the client's.
+constexpr uint64_t kHostAwayMs = 6000;
+bool dialog_is_hosts() {
+    const char* id = my_id();
+    if (strcmp(id, "dialog") != 0 && strcmp(id, "office") != 0) return false;
+    if (host_up() && strcmp(g.host_up_name, id) == 0) return true;
+    return g.host_dialog_down_at && GetTickCount64() - g.host_dialog_down_at < kHostAwayMs;
+}
 
 void say(uint32_t state, const char* name = nullptr) {
     ChoiceMsg c{};
@@ -271,6 +546,24 @@ bool make_name(GameStr& s, const char* text) {
     return true;
 }
 
+// Overwrites a constructed std::string the game owns. Its old buffer is kept
+// when the text fits; otherwise a new one comes from the game's heap and the
+// old one is left behind (a few bytes, once a talk).
+bool set_game_str(void* p, const char* text) {
+    GameStr& s = *(GameStr*)p;
+    const size_t n = strlen(text);
+    if (n <= s.cap) {
+        char* buf = s.cap > 15 ? s.ptr : s.buf;
+        memcpy(buf, text, n + 1);
+        s.size = n;
+        return true;
+    }
+    GameStr fresh;
+    if (!make_name(fresh, text)) return false;
+    s = fresh;
+    return true;
+}
+
 bool safe_play(GameStr* name, void* f1, void* f2, uint64_t a, uint64_t b) {
     __try { g.o_play(name, f1, f2, a, b); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -279,6 +572,10 @@ bool safe_play(GameStr* name, void* f1, void* f2, uint64_t a, uint64_t b) {
 // Client: the host's cutscene, here. Two empty std::functions, all zero being
 // what an empty one is; the name on the game's heap, since the game frees it.
 void play_hosts(const char* name, uint32_t flags) {
+    if (strncmp(name, kOfficePrefix, sizeof(kOfficePrefix) - 1) == 0) {
+        g.office_go = atoi(name + sizeof(kOfficePrefix) - 1);   // see drawer_update
+        return;
+    }
     GameStr s;
     alignas(16) uint8_t f1[0x40] = {};
     alignas(16) uint8_t f2[0x40] = {};
@@ -309,9 +606,19 @@ void start_pump(bool up) {
             log_line("CUTSCENE", "!! the host's cutscene '%s' never got its turn here", s.name);
             continue;
         }
+        // An office: from the House map only, so not before this game's drawer
+        // is there -- a client still reloading the House gets it once loaded.
+        const bool office = strncmp(s.name, kOfficePrefix, sizeof(kOfficePrefix) - 1) == 0;
+        if (office && g.exit_wanted) {
+            log_line("CUTSCENE", "the host's NPC office closed before it opened here");
+            continue;
+        }
+        const bool ready = office
+            ? (g.o_goto && g.drawer && now - g.drawer_at < kGoneMs && now - s.at >= 300)
+            : now - s.at >= kOwnWindowMs;
         // Not on top of another, not on the way to the menu, and not before this
         // game has had its own chance to start it.
-        if (kept == 0 && !up && !leave_busy() && now - s.at >= kOwnWindowMs) {
+        if (kept == 0 && !up && !leave_busy() && ready) {
             play_hosts(s.name, s.flags);
             continue;
         }
@@ -330,6 +637,45 @@ const char* input_name(uint8_t what) {
 
 void cutscene_set_base(uintptr_t base) {
     if (g.o_swf || g.o_dialog) return;
+    {
+        void* at = (void*)(base + kRva_GoToOffice);
+        if (memcmp(at, kOfficePrologue, sizeof(kOfficePrologue)) != 0 ||
+            MH_CreateHook(at, (void*)&go_office, (void**)&g.o_goto) != MH_OK ||
+            MH_EnableHook(at) != MH_OK) {
+            g.o_goto = nullptr;
+            log_line("CUTSCENE", "!! GoToNPCOffice moved -- NPC offices open on one screen only");
+        }
+        g.office_exit = (fn_exit)(base + kRva_OfficeExitCall);
+        for (int i = 0; i < 3; ++i) g.talk_rets[i] = base + kTalkRets[i];
+        void* nt = (void*)(base + kRva_NextTalk);
+        if (memcmp(nt, kNextTalkPrologue, sizeof(kNextTalkPrologue)) != 0 ||
+            MH_CreateHook(nt, (void*)&next_talk, (void**)&g.o_talk) != MH_OK ||
+            MH_EnableHook(nt) != MH_OK) {
+            g.o_talk = nullptr;
+            log_line("CUTSCENE", "!! the NPC talk picker moved -- each game's NPCs say their own");
+        }
+        patch(base, kRva_DrawerVtable, kRva_DrawerUpdate, (void*)&drawer_update, g.o_drawer,
+              "NPCMapDrawer");
+        patch(base, kRva_OfficeVtable, kRva_OfficeUpdate, (void*)&office_update, g.o_office,
+              "NPCOffice");
+        {
+            fn_update tmp = nullptr;
+            patch(base, kRva_OfficeExitVt, kRva_OfficeExitCall, (void*)&exit_button, tmp,
+                  "the NPC office's Exit", 2);
+            g.o_exit_btn = (fn_exit)tmp;
+        }
+        void* gf = (void*)GetProcAddress(GetModuleHandleW(nullptr), "SDL_GetWindowFlags");
+        g.focus_ret = base + kRva_FocusCallRet;
+        // The call there must be to it, or the gate is somewhere else now.
+        int32_t rel = 0;
+        const bool there = mem_read((const uint8_t*)base + kRva_FocusCallRet - 4, &rel, 4) &&
+                           gf && (uintptr_t)base + kRva_FocusCallRet + rel == (uintptr_t)gf;
+        if (!there || MH_CreateHook(gf, (void*)&window_flags, (void**)&g.o_flags) != MH_OK ||
+            MH_EnableHook(gf) != MH_OK) {
+            g.o_flags = nullptr;
+            log_line("CUTSCENE", "!! the input focus check moved -- a background window misses the host's clicks");
+        }
+    }
     g.str_alloc = (fn_alloc)addr_of_call(C_GameStrAlloc);
     void* at = (void*)(base + kRva_PlayCutscene);
     if (memcmp(at, kPlayPrologue, sizeof(kPlayPrologue)) != 0 ||
@@ -353,7 +699,20 @@ void cutscene_pump() {
                              : " -- the host's clicks move it here");
         else    log_line("CUTSCENE", "the cutscene is over");
         g.was_up = up;
-        if (!up && linked() && net_role() == NetRole::Host) say(kHostDown);
+        if (!up && linked() && net_role() == NetRole::Host) {
+            say(kHostDown);
+            // The next box is news at once, not a second later.
+            g.said_up_at = 0;
+            g.said_id[0] = 0;
+        }
+    }
+    // The host's Exit (exit_button) closes the client's office, in office_update.
+    if (net_role() != NetRole::Host && g.exit_wanted) {
+        // Left from office_update; this only gives up when none comes up here.
+        const uint64_t now = GetTickCount64();
+        if (!office_up() && g.office_go < 0 && now - g.exit_at > 4000) {
+            g.exit_wanted = false;   // none came up here to leave
+        }
     }
     if (net_role() != NetRole::Host && g.o_play) start_pump(up);
     if (net_role() == NetRole::Host) {
@@ -374,7 +733,7 @@ void cutscene_pump() {
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g.queued; ++i) {
         if (now - g.queue[i].at > kStaleInputMs) continue;
-        if (up && kept == 0 && i == 0 && same_as_host() && ui_post_input(g.queue[i].what)) {
+        if (up && kept == 0 && i == 0 && same_as_host() && ui_post_input(g.queue[i].what, g.queue[i].pos)) {
             ++g.played;
             log_line("CUTSCENE", "<- the host's %s", input_name(g.queue[i].what));
             continue;
@@ -385,8 +744,26 @@ void cutscene_pump() {
 }
 
 bool cutscene_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceOfficeTalk) {
+        if (net_role() == NetRole::Host) return true;
+        if (m.index < kMaxTalks) {
+            strncpy_s(g.talks[m.index], m.name, _TRUNCATE);
+            if (m.index + 1 > g.talks_have) g.talks_have = m.index + 1;
+        }
+        return true;
+    }
     if (m.kind == kChoiceCutStart) {
         if (net_role() == NetRole::Host || !m.name[0]) return true;
+        if (strcmp(m.name, kOfficeExit) == 0) {
+            g.exit_wanted = true;
+            g.exit_at     = GetTickCount64();
+            return true;
+        }
+        if (strncmp(m.name, kOfficePrefix, sizeof(kOfficePrefix) - 1) == 0) {
+            g.exit_wanted = false;
+            g.talks_have  = 0;   // this office's talks follow this
+            g.talks_used  = 0;
+        }
         if (g.nstarts < 4) {
             State::Start& s = g.starts[g.nstarts++];
             strncpy_s(s.name, m.name, _TRUNCATE);
@@ -404,14 +781,23 @@ bool cutscene_on_message(const ChoiceMsg& m) {
         strncpy_s(g.host_up_name, m.name, _TRUNCATE);
         return true;
     }
-    if (m.aux == kHostDown) { g.host_up_at = 0; return true; }
+    if (m.aux == kHostDown) {
+        if (host_up() && strcmp(g.host_up_name, "dialog") == 0)
+            g.host_dialog_down_at = GetTickCount64();
+        g.host_up_at = 0;
+        return true;
+    }
     g.host_up_at    = GetTickCount64();
     g.host_input_at = g.host_up_at;
-    if (g.queued < 16) g.queue[g.queued++] = { (uint8_t)(m.aux > 2 ? 0 : m.aux), GetTickCount64() };
+    // count: where the host clicked (ui_pack_pos) -- an NPC office moves on
+    // only for a click on its speech box, not for one under the client's cursor.
+    if (g.queued < 16)
+        g.queue[g.queued++] = { (uint8_t)(m.aux > 2 ? 0 : m.aux), m.aux == 0 ? m.count : 0u,
+                                GetTickCount64() };
     return true;
 }
 
-bool cutscene_filter_input(unsigned msg, uintptr_t wparam) {
+bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam) {
     if (!linked()) return false;
     uint8_t what = 0;
     bool    down = false;
@@ -433,14 +819,17 @@ bool cutscene_filter_input(unsigned msg, uintptr_t wparam) {
             c.kind = kChoiceCutInput;
             c.aux  = what;
             c.index = ++g.sent;
+            if (what == 0) c.count = ui_pack_pos(lparam);
             net_send_choice(c);
         }
         return false;
     }
-    if (!same_as_host()) return false;
+    const bool hosts_dialog = dialog_is_hosts();
+    if (!same_as_host() && !hosts_dialog) return false;
     // Never for long without the host clicking: whatever this is, it is not
-    // worth leaving the second player without a mouse.
-    {
+    // worth leaving the second player without a mouse. Not in a dialog the host
+    // is in: the host reading a long one is not the host gone.
+    if (!hosts_dialog) {
         constexpr uint64_t kUnblockMs = 8000;
         const uint64_t now = GetTickCount64();
         if (g.host_input_at && now - g.host_input_at < kUnblockMs) g.blocked_since = 0;

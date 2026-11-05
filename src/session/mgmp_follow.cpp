@@ -121,6 +121,7 @@ struct State {
     // host walks only when the picks agree. -1 is "not picked".
     int32_t  host_vote      = -1;
     int32_t  client_vote    = -1;   // host: the client's; client: what it last sent
+    uint32_t host_clicks    = 0;    // host: clicks in a row on host_vote
     bool     vote_go        = false;
     bool     vote_bypass    = false;
     // A swallowed EnterNode leaves the marker selected on that node; the next map
@@ -128,6 +129,7 @@ struct State {
     bool     unstick        = false;
 
     // The other player's pick, bobbing on this map. See blink_pick.
+    bool     inv_from_map   = false;  // the inventory screen came up over the map
     int32_t  pick           = -1;
     void*    pick_graphic   = nullptr;
     float    pick_pos[2]    = {};
@@ -425,6 +427,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
 
     g.host_vote   = -1;
     g.client_vote = -1;
+    g.host_clicks = 0;
     g.vote_go     = false;
     show_pick(-1);
 
@@ -707,10 +710,12 @@ static bool vote_click(void* node) {
     // EVERY click is sent and meows, a repeat included: the meow is how each
     // player hears the other one clicking, not a sound for a pick that changed.
     // A repeated vote changes nothing at the other end -- the same index again.
+    // The click that makes the two picks the same is quiet: aux 0 tells the
+    // other end not to meow either (2026-11-04, the players asked for it).
     if (g.is_client) {
-        const uint32_t meow = meow_new_seed();
+        const uint32_t meow = g.pick == (int32_t)index ? 0 : meow_new_seed();
         send_vote(index, meow);
-        meow_play(meow);
+        if (meow) meow_play(meow);
         if (g.client_vote != (int32_t)index) {
             g.client_vote = (int32_t)index;
             log_line("FOLLOW", "this player picked node %u (%s) -- waiting for the host",
@@ -720,22 +725,30 @@ static bool vote_click(void* node) {
     }
     if (g.vote_bypass || net_peer_count() < 2) return true;
 
+    // Going alone takes kAloneClicks clicks in a row on the one node, not two:
+    // two came too easily, a double click by habit walked off without the friend.
+    constexpr uint32_t kAloneClicks = 5;
     const bool same = g.host_vote == (int32_t)index;
-    g.host_vote = (int32_t)index;
-    const uint32_t meow = meow_new_seed();
+    g.host_vote   = (int32_t)index;
+    g.host_clicks = same ? g.host_clicks + 1 : 1;
+    const uint32_t meow = g.client_vote == (int32_t)index ? 0 : meow_new_seed();
     send_vote(index, meow);
-    meow_play(meow);
+    if (meow) meow_play(meow);
     if (g.client_vote == (int32_t)index) {
         log_line("FOLLOW", "both players picked node %u -- going", index);
+        g.host_clicks = 0;
         return true;
     }
-    if (same) {
-        log_line("FOLLOW", "the host clicked node %u again -- going without the other"
-                           " player's pick", index);
+    if (g.host_clicks >= kAloneClicks) {
+        log_line("FOLLOW", "the host clicked node %u %u times -- going without the other"
+                           " player's pick", index, kAloneClicks);
+        g.host_clicks = 0;
         return true;
     }
-    log_line("FOLLOW", "the host picked node %u (%s) -- waiting for the other player to"
-                       " pick it too; click it again to go alone", index, type);
+    if (!same)
+        log_line("FOLLOW", "the host picked node %u (%s) -- waiting for the other player to"
+                           " pick it too; click it %u more times to go alone", index, type,
+                 kAloneClicks - 1);
     return false;
 }
 
@@ -767,7 +780,11 @@ void follow_on_vote(const ChoiceMsg& m) {
     // A pick made on another node is about another map position.
     if (m.node_seed && g.have_here && m.node_seed != g.here_seed) return;
     show_pick((int32_t)m.index);
-    meow_play(m.aux);   // the clicker's meow, so both hear the same one
+    // The clicker's meow, so both hear the same one. None when the picks now
+    // match: aux 0 from a clicker that saw it, or this end's own pick the same
+    // (a clicker that had not heard of it yet).
+    const int32_t mine = g.is_client ? g.client_vote : g.host_vote;
+    if (m.aux && mine != (int32_t)m.index) meow_play(m.aux);
 
     if (g.is_client) {
         log_line("FOLLOW", "the host picked node %u%s", m.index,
@@ -931,7 +948,8 @@ static void watch_edits() {
 // client now instead of at the next node. Order matters on the host: its own change
 // goes out first, so the edit it now takes is judged against it.
 void follow_edit_pump() {
-    constexpr uint64_t kEveryMs = 1000;
+    // Half a second, and a change goes out on its second look: 0.5-1 s after it.
+    constexpr uint64_t kEveryMs = 500;
     if (!g.on) return;
     Guard guard;
     const uint64_t now = GetTickCount64();
@@ -939,11 +957,18 @@ void follow_edit_pump() {
     g.edit_tick = now;
 
     const bool in_shop = g.have_here && strcmp(node_type_name(g.here_type), "shop") == 0;
-    if (!follow_on_map() && !in_shop) return;
+    // The inventory opened from the map stops the map's update, so "on the map"
+    // went false under it and the client's edits waited for the screen to close
+    // (2026-11-05: "very long to wait"). A screen the map was ticking under when
+    // it came up still counts as the map.
+    const bool open = invsync_screen_open();
+    const bool on_map = follow_on_map();
+    if (!open) g.inv_from_map = false;
+    else if (on_map) g.inv_from_map = true;
+    if (!on_map && !in_shop && !(open && g.inv_from_map && !lockstep_in_battle())) return;
 
     // Everything here trusts this reading, and a wrong "closed" would free items
     // under a live screen, so the log has to show it working.
-    const bool open = invsync_screen_open();
     if (open != g.inv_open) {
         g.inv_open = open;
         log_line("FOLLOW", "inventory screen %s", open ? "up" : "down");

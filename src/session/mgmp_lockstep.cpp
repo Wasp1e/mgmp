@@ -4,6 +4,8 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_barrier.h"
+#include "mgmp_peerlog.h"
+#include "mgmp_night.h"
 #include "mgmp_battleid.h"
 #include "mgmp_hashring.h"
 #include "mgmp_net.h"
@@ -1118,6 +1120,55 @@ void snapshot_cats(void* turn_control) {
 // turn boundary whenever it does: CONTROL can land before this side has a
 // roster to compare it against, and a check that silently does not run is worse
 // than no check at all.
+// TWO PLAYERS WHO DEALT THE CATS DIFFERENTLY. The client's owner table comes
+// with the host's ENTERNODE; a fight with no node before it -- the Guillotine,
+// straight from the House, 2026-11-05 -- leaves the client dealing from the
+// last run's table, and both halted on turn 0 with cat 0 claimed twice. No
+// human has decided anything yet (the join barrier holds them until this
+// check passes), so it is not too late: the client takes the host's split and
+// says so again, and the host waits for that rather than halting.
+//
+// True when the split disagrees and this peer is now waiting or has changed.
+bool settle_split(const uint8_t* ids, uint8_t count) {
+    if (count != 2) return false;
+    uint8_t other = kNoPeer;
+    for (uint8_t i = 0; i < count; ++i) if (ids[i] != net_self()) other = ids[i];
+    if (other >= kMaxPeers) return false;
+
+    bool theirs[kMaxCats] = {};
+    const ControlMsg& c = g.peer_control[other];
+    for (uint8_t j = 0; j < c.count; ++j) if (c.cats[j] < kMaxCats) theirs[c.cats[j]] = true;
+    bool clash = c.humans != g.humans;
+    for (uint32_t i = 0; i < g.cat_count && !clash; ++i)
+        if (g.human_cat[i] && theirs[i] == g.local_cat[i]) clash = true;
+    if (!clash) return false;
+
+    if (net_role() == NetRole::Host) {
+        // The client fixes it and sends its split again; that one is checked.
+        g.have_peer_control[other] = false;
+        log_line("LOCKSTEP", "the client dealt the cats differently -- waiting for it to"
+                             " take the host's split");
+        return true;
+    }
+    if (c.humans != g.humans) return false;   // a different battle: halt below
+    const uint8_t mine = net_peer_pos();
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < g.cat_count; ++i) {
+        if (!g.human_cat[i]) continue;
+        g.local_cat[i] = !theirs[i];
+        if (g.local_cat[i]) ++n;
+        const uint64_t id = cat_persistent_id(g.cats[i]);
+        if (!id) continue;
+        int row = g.owners.find(id);
+        if (row < 0 && g.owners.count < kMaxOwners) row = (int)g.owners.count++;
+        if (row >= 0) { g.owners.id[row] = id; g.owners.pos[row] = theirs[i] ? 0 : mine; }
+    }
+    log_line("LOCKSTEP", "<- this peer dealt the cats differently from the host -- took"
+                         " the host's split: %u cat(s) here", n);
+    publish_split();
+    return false;   // now in step: check it below
+}
+
 void verify_control() {
     if (g.control_checked || !g.snapped) return;
 
@@ -1139,6 +1190,7 @@ void verify_control() {
         // that is only our own lag.
         if (g.peer_control[id].battle_id != g.battles.current) return;
     }
+    if (settle_split(ids, count)) return;
     g.control_checked = true;
 
     // Everyone must agree how many human cats there are before their claims
@@ -1604,6 +1656,7 @@ void halt(const char* why) {
     m.turn = g.turn;
     _snprintf_s(m.reason, sizeof(m.reason), _TRUNCATE, "%s", why);
     net_send_halt(m);
+    peerlog_trouble("halt");
 }
 
 // --- the desync dump --------------------------------------------------------
@@ -2380,6 +2433,14 @@ void lockstep_pump() {
                 leave_on_message(m.hostleft);
                 break;
 
+            case MSG_LOGFILE:
+                peerlog_on_message(m.logfile, m.from);
+                break;
+
+            case MSG_NIGHT:
+                night_on_message(m.night);
+                break;
+
             // Not epoch-gated, and deliberately so: a cat is RUN state, not
             // battle state. It stays true across a battle boundary, so a late
             // one is still correct -- unlike an ACTION, which means nothing
@@ -2459,6 +2520,7 @@ void lockstep_pump() {
                     ++g.stats.desyncs;
                     log_line("LOCKSTEP", "!! peer halted at turn %u: %s",
                              m.halt.turn, m.halt.reason);
+                    peerlog_trouble("the other player halted");
                 }
                 break;
 
@@ -3188,6 +3250,14 @@ bool lockstep_cat_mine(uint64_t id) {
     const int row = id ? g.owners.find(id) : -1;
     const uint32_t owner = (row >= 0 && g.owners.pos[row] < players) ? g.owners.pos[row] : 0;
     return owner == net_peer_pos();
+}
+
+bool lockstep_cat_theirs(uint64_t id) {
+    Guard guard;
+    const uint32_t players = net_peer_count();
+    if (players < 2 || !id) return false;
+    const int row = g.owners.find(id);
+    return row >= 0 && g.owners.pos[row] < players && g.owners.pos[row] != net_peer_pos();
 }
 
 void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out) {

@@ -108,6 +108,10 @@ void lockstep_owners_read(const EnterNodeMsg& m);
 // battle. A cat the table does not know, or whose player has left, is the host's.
 bool lockstep_cat_mine(uint64_t id);
 
+// True when the owner table has cat `id` and gives it to another player. A cat
+// the table has not seen belongs to nobody yet, so this is false for it.
+bool lockstep_cat_theirs(uint64_t id);
+
 // Host: deals these cats out by the battle rule and records it in the owner
 // table, so the run's battles keep the split. out[i] is the owner's position.
 void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out);

@@ -65,6 +65,8 @@ struct NetMsg {
     InventoryMsg inventory;   // owns up to kInvBuckets buffers
     RunHistMsg   runhist;     // owns its buffer, same contract as catdata
     StateDumpMsg statedump;   // owns its buffer, same contract as catdata
+    LogFileMsg   logfile;     // owns its buffer, same contract as catdata
+    LogFileMsg   night;       // MSG_NIGHT, the same
     NodeHashMsg  nodehash;
     HostLeftMsg  hostleft;
     HaltMsg   halt;
@@ -166,6 +168,8 @@ bool net_send_ping();
 // budget to respect and no dedupe to do -- by the time it goes out the run is
 // already over.
 bool net_send_statedump(const StateDumpMsg& m);
+bool net_send_logfile(const LogFileMsg& m);
+bool net_send_night(const LogFileMsg& m);
 bool net_send_halt(const HaltMsg& h);
 bool net_send_refuse(const char* reason);
 // Point-to-point variants, for the handshake: with several clients, a WELCOME

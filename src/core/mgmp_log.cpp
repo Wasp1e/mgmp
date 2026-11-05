@@ -11,6 +11,7 @@ namespace {
 CRITICAL_SECTION g_cs;
 bool             g_cs_ready = false;
 FILE*            g_file     = nullptr;
+wchar_t          g_path[MAX_PATH] = {};   // the stamped file, once open
 bool             g_console  = false;
 LONG volatile    g_seq      = 0;
 LONG volatile    g_turn     = 0;
@@ -132,6 +133,17 @@ void log_init(const wchar_t* path, bool console) {
         // session is one run but actively harmful once two peers are launched
         // repeatedly -- the run that explained a desync is gone the moment you
         // relaunch to look again. Keeping them all is cheap; losing one is not.
+        // Into logs\ beside the configured name, so the mod's folder is not a
+        // pile of them (2026-11-05, the user asked for a folder of its own).
+        wchar_t in_dir[MAX_PATH];
+        {
+            const wchar_t* sl = wcsrchr(path, L'\\');
+            const size_t   at = sl ? (size_t)(sl - path) + 1 : 0;
+            _snwprintf_s(in_dir, _TRUNCATE, L"%.*slogs", (int)at, path);
+            CreateDirectoryW(in_dir, nullptr);
+            _snwprintf_s(in_dir, _TRUNCATE, L"%.*slogs\\%s", (int)at, path, path + at);
+            path = in_dir;
+        }
         wchar_t stamped[MAX_PATH];
         SYSTEMTIME t{};
         GetLocalTime(&t);
@@ -159,8 +171,11 @@ void log_init(const wchar_t* path, bool console) {
         // orientation and every other write here is byte-oriented fwrite, which
         // a wide-oriented stream would then refuse.
         if (g_file) fprintf(g_file, "log    : %ls\n", stamped);
+        if (g_file) wcsncpy_s(g_path, stamped, _TRUNCATE);
     }
 }
+
+const wchar_t* log_file_path() { return g_path; }
 
 void log_shutdown() {
     if (!g_cs_ready) return;

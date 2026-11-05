@@ -33,6 +33,9 @@ constexpr uint32_t kClassPickSlots = 5;   // head, face, neck, weapon, trinket
 constexpr uint32_t kClassPickStats = 7;   // str, dex, con, int, spd, cha, lck
 
 struct ClassPickView {
+    // Which of the host's two screens: 1 the collars (ClassChooser), 2 the gear
+    // (the inventory screen the game opens next). Items only on the second.
+    uint8_t  phase = 1;
     uint32_t cats = 0;
     uint64_t cat_key[kClassPickCats]      = {};
     char     cat_name[kClassPickCats][48] = {};
@@ -48,6 +51,8 @@ struct ClassPickView {
     char     slot_name[kClassPickCats][kClassPickSlots][48] = {};
     int16_t  stat[kClassPickCats][kClassPickStats] = {};
     bool     have_stats[kClassPickCats] = {};
+    char     muts[kClassPickCats][48]   = {};   // "slot:id,..."; see kChoiceClassMuts
+    int16_t  bonus[kClassPickCats][kClassPickStats] = {};   // part of stat[], shown beside it
 };
 
 // True while the host's chooser is up and this peer is the client.

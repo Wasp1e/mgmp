@@ -5,10 +5,14 @@
 #include "mgmp_net.h"
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
+#include "mgmp_resolve.h"
+#include "mgmp_follow.h"
+#include "MinHook.h"
 
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <intrin.h>
 
 namespace mgmp {
 namespace {
@@ -79,7 +83,38 @@ constexpr uint64_t  kScanMs       = 250;
 // cat's +0x70C is all zero -- that is what the menu showed on 2026-11-04 -- so a
 // cat's stats are the first two summed.
 constexpr uintptr_t kCat_Stats      = 0x6F0;
+// MUTATIONS. The cat's tooltip (sub_1400E5500, "HOUSE_CAT_INFO_HAS_MUTATIONS")
+// asks sub_1400CB690(cat, out) for them -- the CatData itself, as the battle
+// does (0x81BD28, Character+0x88); the tooltip's own +0x8A8 is its object's
+// CatData pointer, and +0x8A8 of a CatData is a string (2026-11-05). out is {u32 cap, u32 count,
+// u64* parts}, each {u32 slot, u32 id}, and only the parts whose data has an
+// effect are in it -- a cat with none gets an empty list and no buffer. The id
+// is the part's number in the slot's file of data/mutations/ (700 on, a defect).
+constexpr uintptr_t kRva_PartList   = 0xCB690;
+const uint8_t kPartListPrologue[8] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74 };
+constexpr uint32_t  kFirstMutation  = 300;
 constexpr uintptr_t kCat_StatsBonus = 0x70C;
+
+// THE SECOND SCREEN. Embark commits the chooser's own copies of the cats
+// (+0xB8) back to the cats, so an item put on a cat while the chooser is up is
+// lost -- taken off the lists, then written over: on 2026-11-04 every item the
+// friend put on was gone on the next screen. That next screen is the game's
+// inventory, InventoryScreen2 (vtable 0xF13D00), whose update (slot 10,
+// 0x34D130) rebuilds which cat wears what from the cats each frame. The friend's
+// gear is put on there, from inside that update, as the screen's own drop does.
+constexpr uintptr_t kRva_InvScreenSlot = 0xF13D00 + 10 * 8;
+constexpr uintptr_t kRva_InvScreenTick = 0x34D130;
+constexpr uint64_t  kGearWaitMs = 60000;   // the gear screen has this long to come up
+
+// WHICH CAT. The inventory screen finds its cats as the run does: the keys at
+// MewDirector+0x5C0 looked up in the registry at +0x598 by sub_1400D7220
+// (registry, key) -> CatData*, the key being CatData+0xC48 (sub_1403B2F30). The
+// mod went by CatData+0 from the chooser's copies, and on 2026-11-04 the
+// friend's item went on for one cat and showed up on another -- so it goes by
+// the key, the screen's own way, and says the name of the cat it found.
+constexpr uintptr_t kRva_CatLookup = 0xD7220;
+constexpr uintptr_t kDir_Registry  = 0x598;
+const uint8_t kLookupPrologue[8] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74 };
 
 constexpr uint64_t kFree        = ~0ull;
 constexpr uint64_t kGoneMs      = 500;
@@ -93,6 +128,8 @@ using fn_equip  = bool (__fastcall*)(void*, void*, int, int);
 using fn_kind   = int  (__fastcall*)(void*);
 using fn_locked = bool (__fastcall*)(void*, int);
 using fn_unequip = bool (__fastcall*)(void*, void*, int, int);
+using fn_lookup  = void* (__fastcall*)(void*, uint64_t);
+using fn_parts   = void* (__fastcall*)(void*, void*);
 
 struct Pick { uint64_t key; uint32_t tag; char name[48]; };
 struct Equip { uint64_t key; uint64_t item; uint8_t list; uint8_t kind; char name[48]; bool off; };
@@ -130,6 +167,16 @@ struct State {
     uint32_t equipped  = 0;
     uint64_t scanned_at = 0;
     bool     said_screen = false;
+    fn_this  o_inv      = nullptr;
+    fn_lookup lookup    = nullptr;
+    uint64_t run_tried_at = 0;
+    fn_parts parts      = nullptr;
+    uint64_t mut_key[kClassPickCats] = {};      // whose mutations muts[] holds
+    char     muts[kClassPickCats][48] = {};
+    uint64_t inv_at     = 0;     // the inventory screen's last update
+    uint8_t  phase      = 0;     // what was last sent: 0 none, 1 collars, 2 gear
+    uint64_t chooser_gone_at = 0;
+    bool     gear_seen  = false;
 
     // client
     ClassPickView view, building;
@@ -140,6 +187,37 @@ struct State {
 State g;
 
 bool chooser_up() { return g.chooser && GetTickCount64() - g.seen < kGoneMs; }
+
+bool safe_lookup(void* reg, uint64_t key, void** out) {
+    __try { *out = g.lookup(reg, key); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Cat `c` of the chooser, as the game has it now. See kRva_CatLookup.
+void* run_cat(uint32_t c) {
+    if (c >= g.cats || !g.key[c] || !g.lookup) return nullptr;
+    void* const* slot = (void* const*)addr_of_data(D_MewDirectorPtr);
+    void* dir = nullptr;
+    void* reg = nullptr;
+    void* cat = nullptr;
+    if (!slot || !mem_read(slot, &dir, sizeof(dir)) || !dir ||
+        !mem_read((const uint8_t*)dir + kDir_Registry, &reg, sizeof(reg)) || !reg ||
+        !safe_lookup(reg, g.key[c], &cat) || !cat)
+        return nullptr;
+    uint64_t key = 0;
+    if (!mem_read((const uint8_t*)cat + kCat_Key, &key, sizeof(key)) || key != g.key[c])
+        return nullptr;
+    return cat;
+}
+bool inv_up() { return g.o_inv && GetTickCount64() - g.inv_at < kGoneMs; }
+void apply_equips();
+
+void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
+    g.inv_at = GetTickCount64();
+    // The friend's gear, put on from inside the screen's own update.
+    if (net_role() == NetRole::Host && g.phase == 2 && g.equipped) apply_equips();
+    return g.o_inv(a, b, c, d);
+}
 
 void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
     void* ch = nullptr;
@@ -258,6 +336,44 @@ bool patch(uintptr_t base, uintptr_t slot_rva, uintptr_t want, void* ours, fn_th
     return true;
 }
 
+// EACH PLAYER DRESSES THEIR OWN CATS. The inventory screen asks
+// sub_1400C4980(cat, slot) whether a slot is locked, for every slot as it draws
+// (0x34D1C1...) and again before taking an item off (0x34FA93), and a locked
+// slot takes nothing on and gives nothing up. Asked from that screen about the
+// other player's cat, the answer here is "locked" -- so the game itself keeps
+// the items where they are, nothing is half moved. The mod's own calls
+// (classpick, the host putting on the friend's picks) come from elsewhere and
+// get the game's answer.
+constexpr uintptr_t kInvCodeFrom = 0x34B000;
+constexpr uintptr_t kInvCodeTo   = 0x351000;
+fn_locked o_locked_hook = nullptr;
+uint64_t  said_locked   = 0;
+
+bool __fastcall slot_locked(void* cat, int slot) {
+    const bool r = o_locked_hook(cat, slot);
+    if (r || !cat || !net_active()) return r;
+    const uintptr_t ret = (uintptr_t)_ReturnAddress() - g.base;
+    if (ret < kInvCodeFrom || ret >= kInvCodeTo) return r;
+    uint64_t uid = 0;
+    if (!mem_read(cat, &uid, sizeof(uid)) || !lockstep_cat_theirs(uid)) return r;
+    if (said_locked != uid) {
+        said_locked = uid;
+        char name[48] = {};
+        read_wstring((const uint8_t*)cat + kCat_Name, name, sizeof(name));
+        log_line("CLASSPICK", "'%s' is the other player's cat -- its gear is theirs to change", name);
+    }
+    return true;
+}
+
+void hook_slot_locked(uintptr_t base) {
+    void* at = (void*)(base + kRva_SlotLocked);
+    if (MH_CreateHook(at, (void*)&slot_locked, (void**)&o_locked_hook) != MH_OK ||
+        MH_EnableHook(at) != MH_OK) {
+        o_locked_hook = nullptr;
+        log_line("CLASSPICK", "!! could not hook the slot lock -- either player can dress any cat");
+    }
+}
+
 // --- the host ----------------------------------------------------------------
 
 void claim(void* ch) {
@@ -283,6 +399,32 @@ void claim(void* ch) {
     for (uint32_t i = 0; i < n; ++i)
         log_line("CLASSPICK", "  cat '%s' (%016llx) -> player %u", g.name[i],
                  (unsigned long long)uid[i], (unsigned)g.owner[i]);
+}
+
+// GEAR WITH NO COLLARS FIRST. Cats that have a class already -- the retired
+// ones sent to hold the House against the Guillotine, 2026-11-05 -- go straight
+// to the inventory screen, and the friend saw nothing: its cats came from the
+// chooser. Here they come from the run's own list, the one that screen shows.
+bool claim_run() {
+    uint64_t uid[kClassPickCats] = {};
+    const uint32_t n = catsync_run_uids(uid, kClassPickCats);
+    if (!n) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        void* cat = catsync_cat_by_uid(uid[i]);
+        if (!cat || !mem_read((const uint8_t*)cat + kCat_Key, &g.key[i], sizeof(g.key[i])))
+            return false;
+        read_wstring((const uint8_t*)cat + kCat_Name, g.name[i], sizeof(g.name[i]));
+    }
+    g.cats = n;
+    for (uint32_t i = 0; i < n; ++i) g.uid[i] = uid[i];
+    lockstep_claim_cats(uid, n, g.owner);
+    g.claimed_for = nullptr;
+    log_line("CLASSPICK", "the gear screen came up with no collars before it -- %u cat(s) from"
+                          " the run", n);
+    for (uint32_t i = 0; i < n; ++i)
+        log_line("CLASSPICK", "  cat '%s' (%016llx) -> player %u", g.name[i],
+                 (unsigned long long)uid[i], (unsigned)g.owner[i]);
+    return true;
 }
 
 void apply(const Pick& p) {
@@ -315,6 +457,59 @@ void apply(const Pick& p) {
                                       : "<- the other player put the '%s' collar on '%s'",
              p.name, g.name[ci]);
     g.sent_hash = 0;
+}
+
+struct PartVec { uint32_t cap; uint32_t count; uint64_t* data; };
+
+bool safe_parts(void* genome, PartVec* out) {
+    __try { g.parts(genome, out); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Cat `c`'s mutations into g.muts[c], once per cat: the list the game hands back
+// is its own allocation and is left to it (a few bytes, once a cat).
+void read_mutations(uint32_t c, void* cat) {
+    if (g.mut_key[c] == g.key[c]) return;
+    g.muts[c][0] = 0;
+    void* genome = cat;
+    PartVec v{};
+    const char* why = !g.parts ? "no part list call"
+                    : !cat ? "no cat"
+                    : !safe_parts(genome, &v) ? "the part list faulted"
+                    : v.count > 32 ? "too many parts" : nullptr;
+    if (why) {
+        // Once a cat; it is looked at again next time all the same.
+        static uint64_t said[kClassPickCats] = {};
+        if (said[c] != g.key[c]) {
+            said[c] = g.key[c];
+            log_line("CLASSPICK", "!! cat '%s': no mutations read -- %s (genome %p)", g.name[c], why,
+                     genome);
+        }
+        return;
+    }
+    g.mut_key[c] = g.key[c];
+    if (!v.count || !v.data) {
+        log_line("CLASSPICK", "  cat '%s' has no mutations", g.name[c]);
+        return;
+    }
+    char out[48] = {};
+    char all[192] = {};
+    size_t n = 0, na = 0;
+    for (uint32_t i = 0; i < v.count; ++i) {
+        uint64_t p = 0;
+        if (!mem_read(&v.data[i], &p, sizeof(p))) break;
+        const uint32_t slot = (uint32_t)p, id = (uint32_t)(p >> 32);
+        na += _snprintf_s(all + na, sizeof(all) - na, _TRUNCATE, "%s%u:%u", na ? "," : "", slot, id);
+        if (id < kFirstMutation) continue;
+        char one[16];
+        const int w = _snprintf_s(one, sizeof(one), _TRUNCATE, "%s%u:%u", n ? "," : "", slot, id);
+        if (w <= 0 || n + (size_t)w >= sizeof(out)) break;
+        memcpy(out + n, one, (size_t)w + 1);
+        n += (size_t)w;
+    }
+    strncpy_s(g.muts[c], out, _TRUNCATE);
+    log_line("CLASSPICK", "  cat '%s' parts %s -- mutations: %s", g.name[c], all,
+             out[0] ? out : "none");
 }
 
 bool safe_kind(void* item, int* out) {
@@ -379,7 +574,7 @@ void read_items(Items& out) {
 
 void slot_name(uint32_t cat, uint32_t kind, char* out, size_t cap) {
     out[0] = 0;
-    void* data = catsync_cat_by_uid(g.uid[cat]);
+    void* data = run_cat(cat);
     if (!data) return;
     const uint8_t* slot = (const uint8_t*)data + kCat_Slots + kind * kSlot_Stride;
     uint64_t id = 0;
@@ -389,7 +584,7 @@ void slot_name(uint32_t cat, uint32_t kind, char* out, size_t cap) {
 
 void apply_equip(const Equip& e) {
     const int ci = cat_index(e.key);
-    void* cat = ci >= 0 ? catsync_cat_by_uid(g.uid[ci]) : nullptr;
+    void* cat = ci >= 0 ? run_cat((uint32_t)ci) : nullptr;
     if (ci < 0 || !g.owner[ci] || !cat || e.list > 1 || e.kind >= kClassPickSlots) {
         log_line("CLASSPICK", "!! refused the other player's '%s' -- not their cat", e.name);
         return;
@@ -423,8 +618,10 @@ void apply_equip(const Equip& e) {
         log_line("CLASSPICK", "!! the game would not put '%s' on '%s'", e.name, g.name[ci]);
         return;
     }
-    log_line("CLASSPICK", "<- the other player put '%s' on '%s' (slot %u)", e.name,
-             g.name[ci], (unsigned)kind);
+    char real[48] = {};
+    read_wstring((const uint8_t*)cat + kCat_Name, real, sizeof(real));
+    log_line("CLASSPICK", "<- the other player put '%s' on '%s' (slot %u; the game's cat '%s')",
+             e.name, g.name[ci], (unsigned)kind, real);
     g.sent_hash = 0;
 }
 
@@ -435,7 +632,7 @@ bool safe_unequip(void* cat, void* item, bool* out) {
 
 void apply_unequip(const Equip& e) {
     const int ci = cat_index(e.key);
-    void* cat = ci >= 0 ? catsync_cat_by_uid(g.uid[ci]) : nullptr;
+    void* cat = ci >= 0 ? run_cat((uint32_t)ci) : nullptr;
     if (ci < 0 || !g.owner[ci] || !cat || e.kind >= kClassPickSlots || !g.unequip) {
         log_line("CLASSPICK", "!! refused taking an item off -- not the other player's cat");
         return;
@@ -471,9 +668,9 @@ void send(uint8_t kind, uint32_t index, uint32_t count, uint32_t aux, uint64_t c
     net_send_choice(m);
 }
 
-void publish() {
+void publish(uint8_t phase) {
     void* tags[kClassPickTags];
-    const uint32_t n = read_tags(g.chooser, tags);
+    const uint32_t n = phase == 1 ? read_tags(g.chooser, tags) : 0;
     uint64_t holder[kClassPickTags] = {};
     char     cls[kClassPickTags][48] = {};
     uint64_t h = 0xCBF29CE484222325ull ^ g.cats ^ ((uint64_t)n << 32);
@@ -487,30 +684,36 @@ void publish() {
     static Items items;
     static char  slots[kClassPickCats][kClassPickSlots][48];
     items = Items{};
-    read_items(items);
+    if (phase == 2) read_items(items);
     for (uint32_t i = 0; i < items.n; ++i) {
         h = (h ^ items.id[i] ^ ((uint64_t)items.list[i] << 56)) * 0x100000001B3ull;
     }
     static int32_t stats[kClassPickCats][kClassPickStats];
+    static int32_t bonuses[kClassPickCats][kClassPickStats];
     static bool    have[kClassPickCats];
     for (uint32_t c = 0; c < g.cats; ++c) {
-        void* data = catsync_cat_by_uid(g.uid[c]);
+        void* data = run_cat(c);
         int32_t bonus[kClassPickStats] = {};
         have[c] = data && mem_read((const uint8_t*)data + kCat_Stats, stats[c], sizeof(stats[c])) &&
                   mem_read((const uint8_t*)data + kCat_StatsBonus, bonus, sizeof(bonus));
+        read_mutations(c, data);
+        for (const char* s = g.muts[c]; *s; ++s) h = (h ^ (uint8_t)*s) * 0x100000001B3ull;
         if (have[c])
             for (uint32_t s = 0; s < kClassPickStats; ++s) stats[c][s] += bonus[s];
+        for (uint32_t s = 0; s < kClassPickStats; ++s) bonuses[c][s] = have[c] ? bonus[s] : 0;
         if (have[c])
             for (uint32_t s = 0; s < kClassPickStats; ++s)
                 h = (h ^ (uint32_t)stats[c][s]) * 0x100000001B3ull;
     }
     for (uint32_t c = 0; c < g.cats; ++c)
         for (uint32_t k = 0; k < kClassPickSlots; ++k) {
-            slot_name(c, k, slots[c][k], sizeof(slots[c][k]));
+            slots[c][k][0] = 0;
+            if (phase == 2) slot_name(c, k, slots[c][k], sizeof(slots[c][k]));
             for (const char* s = slots[c][k]; *s; ++s) h = (h ^ (uint8_t)*s) * 0x100000001B3ull;
             h = (h ^ (c * 8 + k)) * 0x100000001B3ull;
         }
 
+    h = (h ^ phase) * 0x100000001B3ull;
     const uint64_t now = GetTickCount64();
     if (h == g.sent_hash && now - g.sent_at < kResendMs) return;
     for (uint32_t i = 0; i < g.cats; ++i)
@@ -534,54 +737,103 @@ void publish() {
         m.aux       = (uint32_t)(u16(4) | (u16(5) << 16));
         m.count     = (uint32_t)u16(6);
         net_send_choice(m);
+        auto b16 = [&](uint32_t s) { return (uint64_t)(uint16_t)(int16_t)bonuses[c][s]; };
+        ChoiceMsg bm = m;
+        bm.kind      = kChoiceClassBonus;
+        bm.node_seed = b16(0) | (b16(1) << 16) | (b16(2) << 32) | (b16(3) << 48);
+        bm.aux       = (uint32_t)(b16(4) | (b16(5) << 16));
+        bm.count     = (uint32_t)b16(6);
+        net_send_choice(bm);
     }
-    send(kChoiceClassEnd, n, g.cats, 1, 0, nullptr);
-    if (!g.open_sent)
-        log_line("CLASSPICK", "the class chooser is up -- %u cat(s), %u collar(s), sent to"
-                              " the other player", g.cats, n);
+    for (uint32_t c = 0; c < g.cats; ++c)
+        if (g.muts[c][0]) send(kChoiceClassMuts, c, 0, 0, g.key[c], g.muts[c]);
+    send(kChoiceClassEnd, n, g.cats, phase, 0, nullptr);
+    if (!g.open_sent || g.phase != phase) {
+        if (phase == 1)
+            log_line("CLASSPICK", "the class chooser is up -- %u cat(s), %u collar(s), sent to"
+                                  " the other player", g.cats, n);
+        else
+            log_line("CLASSPICK", "the gear screen is up -- %u cat(s), %u item(s), sent to"
+                                  " the other player", g.cats, items.n);
+    }
     g.open_sent = true;
+    g.phase     = phase;
     g.sent_hash = h;
     g.sent_at   = now;
 }
 
+void apply_equips() {
+    for (uint32_t i = 0; i < g.equipped; ++i)
+        g.equips[i].off ? apply_unequip(g.equips[i]) : apply_equip(g.equips[i]);
+    g.equipped = 0;
+}
+
+void close_menu(const char* why) {
+    if (g.open_sent) {
+        send(kChoiceClassEnd, 0, 0, 0, 0, nullptr);
+        log_line("CLASSPICK", "%s", why);
+    }
+    g.open_sent = false;
+    g.sent_hash = 0;
+    g.phase     = 0;
+}
+
+void forget_cats() {
+    g.claimed_for = nullptr;
+    g.cats        = 0;
+    g.queued      = 0;
+    g.equipped    = 0;
+    g.chooser     = nullptr;
+    g.gear_seen   = false;
+    g.chooser_gone_at = 0;
+}
+
+// Two screens, as the game has them: the collars while the chooser is up, then
+// the gear while the inventory screen it opens next is up. The cats the chooser
+// handed out are kept between the two.
 void host_pump() {
-    if (!chooser_up()) {
-        if (g.open_sent) {
-            send(kChoiceClassEnd, 0, 0, 0, 0, nullptr);
-            log_line("CLASSPICK", "the class chooser closed");
+    const uint64_t now = GetTickCount64();
+    uint8_t phase = 0;
+    // Not the backpack on the map, nor anything in a fight: those are the run's
+    // own inventory, which the cat sync already carries.
+    if (!chooser_up() && !g.cats && inv_up() && !follow_on_map() && !lockstep_in_battle() &&
+        now - g.run_tried_at > kScanMs) {
+        g.run_tried_at = now;
+        if (claim_run()) g.chooser_gone_at = now;
+    }
+    if (chooser_up()) {
+        phase = 1;
+        g.chooser_gone_at = 0;
+        g.gear_seen       = false;
+    } else if (g.cats) {
+        if (!g.chooser_gone_at) {
+            g.chooser_gone_at = now;
+            g.queued          = 0;
+            close_menu("the class chooser closed -- the gear comes on the next screen");
         }
-        g.open_sent   = false;
-        g.claimed_for = nullptr;
-        g.cats        = 0;
-        g.queued      = 0;
-        g.equipped    = 0;
-        g.sent_hash   = 0;
-        g.chooser     = nullptr;
+        if (inv_up()) {
+            phase       = 2;
+            g.gear_seen = true;
+        } else if (g.gear_seen || now - g.chooser_gone_at > kGearWaitMs) {
+            close_menu(g.gear_seen ? "the gear screen closed" : "no gear screen came up");
+            forget_cats();
+            return;
+        }
+    } else {
+        if (g.open_sent) close_menu("the class chooser closed");
+        g.chooser = nullptr;
         return;
     }
-    if (!vote_on()) return;
-    if (g.claimed_for != g.chooser) claim(g.chooser);
-    if (!g.cats) return;
-    for (uint32_t i = 0; i < g.queued; ++i) apply(g.queue[i]);
-    g.queued = 0;
-    // Not under the host's own inventory screen: it holds the lists this
-    // changes, and two hands on one bag is how items doubled on the map.
-    if (g.equipped) {
-        if (invsync_screen_open()) {
-            if (!g.said_screen)
-                log_line("CLASSPICK", "the other player's item waits for your inventory to close");
-            g.said_screen = true;
-        } else {
-            for (uint32_t i = 0; i < g.equipped; ++i)
-                g.equips[i].off ? apply_unequip(g.equips[i]) : apply_equip(g.equips[i]);
-            g.equipped    = 0;
-            g.said_screen = false;
-        }
+    if (!vote_on() || !phase) return;
+    if (phase == 1) {
+        if (g.claimed_for != g.chooser) claim(g.chooser);
+        if (!g.cats) return;
+        for (uint32_t i = 0; i < g.queued; ++i) apply(g.queue[i]);
+        g.queued = 0;
     }
-    const uint64_t now = GetTickCount64();
-    if (g.sent_hash && now - g.scanned_at < kScanMs) return;
+    if (g.sent_hash && g.phase == phase && now - g.scanned_at < kScanMs) return;
     g.scanned_at = now;
-    publish();
+    publish(phase);
 }
 
 } // namespace
@@ -596,6 +848,14 @@ void classpick_set_base(uintptr_t base) {
         return;
     }
     g.click = (fn_click)(base + kRva_TagClick);
+    if (memcmp((const void*)(base + kRva_PartList), kPartListPrologue, 8) == 0)
+        g.parts = (fn_parts)(base + kRva_PartList);
+    else
+        log_line("CLASSPICK", "!! the cat's part list moved -- no mutations for the other player");
+    if (memcmp((const void*)(base + kRva_CatLookup), kLookupPrologue, 8) == 0)
+        g.lookup = (fn_lookup)(base + kRva_CatLookup);
+    else
+        log_line("CLASSPICK", "!! the cat lookup moved -- the other player's gear has no cat to go on");
     g.base  = base;
     if (memcmp((const void*)(base + kRva_Equip), kEquipPrologue, 8) == 0 &&
         memcmp((const void*)(base + kRva_ItemKind), kKindPrologue, 8) == 0 &&
@@ -603,6 +863,7 @@ void classpick_set_base(uintptr_t base) {
         g.equip  = (fn_equip)(base + kRva_Equip);
         g.kind   = (fn_kind)(base + kRva_ItemKind);
         g.locked = (fn_locked)(base + kRva_SlotLocked);
+        hook_slot_locked(base);
         if (memcmp((const void*)(base + kRva_Unequip), kUnequipPrologue, 8) == 0)
             g.unequip = (fn_unequip)(base + kRva_Unequip);
         else
@@ -617,6 +878,9 @@ void classpick_set_base(uintptr_t base) {
           "the collar click");
     patch(base, kRva_EmbarkSlot, kRva_Embark, (void*)&embark, g.o_embark,
           "the embark button");
+    if (!patch(base, kRva_InvScreenSlot, kRva_InvScreenTick, (void*)&inv_tick, g.o_inv,
+               "the inventory screen"))
+        log_line("CLASSPICK", "!! so the other player cannot put gear on their cats");
 }
 
 void classpick_pump() {
@@ -630,7 +894,8 @@ void classpick_pump() {
 
 bool classpick_on_message(const ChoiceMsg& m) {
     if ((m.kind < kChoiceClassCat || m.kind > kChoiceClassEquip) &&
-        m.kind != kChoiceClassStats && m.kind != kChoiceClassUnequip)
+        m.kind != kChoiceClassStats && m.kind != kChoiceClassUnequip && m.kind != kChoiceClassMuts &&
+        m.kind != kChoiceClassBonus)
         return false;
     const bool host = net_role() == NetRole::Host;
 
@@ -695,8 +960,24 @@ bool classpick_on_message(const ChoiceMsg& m) {
             strncpy_s(b.slot_name[m.index][m.count], m.name, _TRUNCATE);
         return true;
     }
+    if (m.kind == kChoiceClassBonus) {
+        if (!host && m.index < kClassPickCats) {
+            int16_t* s = b.bonus[m.index];
+            for (uint32_t i = 0; i < 4; ++i) s[i] = (int16_t)(m.node_seed >> (16 * i));
+            s[4] = (int16_t)(m.aux & 0xFFFF);
+            s[5] = (int16_t)(m.aux >> 16);
+            s[6] = (int16_t)(m.count & 0xFFFF);
+        }
+        return true;
+    }
+    if (m.kind == kChoiceClassMuts) {
+        if (!host && m.index < kClassPickCats) strncpy_s(b.muts[m.index], m.name, _TRUNCATE);
+        return true;
+    }
     if (m.kind == kChoiceClassCat && m.index < kClassPickCats) {
         b.cats = m.count < kClassPickCats ? m.count : kClassPickCats;
+        b.muts[m.index][0] = 0;
+        memset(b.bonus[m.index], 0, sizeof(b.bonus[m.index]));
         b.cat_key[m.index]  = m.cat;
         b.cat_mine[m.index] = m.aux == net_peer_pos();
         strncpy_s(b.cat_name[m.index], m.name, _TRUNCATE);
@@ -706,14 +987,17 @@ bool classpick_on_message(const ChoiceMsg& m) {
         strncpy_s(b.tag_name[m.index], m.name, _TRUNCATE);
     } else if (m.kind == kChoiceClassEnd) {
         if (m.aux) {
-            if (!g.active)
-                log_line("CLASSPICK", "the host's class chooser is up -- pick your cats'"
-                                      " collars in the panel");
+            if (!g.active || g.view.phase != m.aux)
+                log_line("CLASSPICK", m.aux == 1
+                    ? "the host's class chooser is up -- pick your cats' collars in the panel"
+                    : "the host's gear screen is up -- dress your cats in the panel");
+            b.phase    = (uint8_t)m.aux;
             g.view     = b;
             g.active   = true;
             g.last_end = GetTickCount64();
         } else {
-            if (g.active) log_line("CLASSPICK", "the host embarked");
+            if (g.active) log_line("CLASSPICK", g.view.phase == 2 ? "the host's gear screen closed"
+                                                                  : "the host embarked");
             g.active = false;
         }
         b = ClassPickView{};
@@ -728,7 +1012,7 @@ bool classpick_view(ClassPickView& out) {
 }
 
 void classpick_equip(uint64_t cat_key, uint32_t item) {
-    if (!g.active || item >= g.view.items) return;
+    if (!g.active || g.view.phase != 2 || item >= g.view.items) return;
     ChoiceMsg m{};
     m.kind      = kChoiceClassEquip;
     m.cat       = cat_key;
@@ -740,7 +1024,7 @@ void classpick_equip(uint64_t cat_key, uint32_t item) {
 }
 
 void classpick_unequip(uint64_t cat_key, uint32_t kind) {
-    if (!g.active || kind >= kClassPickSlots) return;
+    if (!g.active || g.view.phase != 2 || kind >= kClassPickSlots) return;
     ChoiceMsg m{};
     m.kind = kChoiceClassUnequip;
     m.cat  = cat_key;

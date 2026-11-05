@@ -20,6 +20,6 @@ bool cutscene_on_message(const ChoiceMsg& m);
 
 // From the window procedure, for a click or Space/Enter the game is about to get.
 // True: swallow it.
-bool cutscene_filter_input(unsigned msg, uintptr_t wparam);
+bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam);
 
 } // namespace mgmp

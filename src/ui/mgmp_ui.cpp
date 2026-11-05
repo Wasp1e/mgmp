@@ -27,6 +27,9 @@
 #include "mgmp_overlay.h"
 #include "mgmp_combatlock.h"
 #include "mgmp_leave.h"
+#include "mgmp_peerlog.h"
+#include "mgmp_night.h"
+#include "mgmp_mutations.generated.h"
 
 // Declared by imgui_impl_win32.h's owner rather than the header itself.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -52,6 +55,7 @@ struct UI {
     uint32_t synthetic_input = 0;  // posted clicks/Space/Enter still on their way
     uint8_t  up_what   = 0;        // ...and the up still to post
     uint32_t up_frames = 0;
+    uint32_t up_pos    = 0;
 
     // The pane's own copy of the log. Fed from log_ring_fetch by cursor, so a
     // quiet frame copies nothing.
@@ -68,6 +72,8 @@ struct UI {
     bool autoscroll = true;
 
     float font_scale = 1.0f;
+    ImFont* paper_font = nullptr;   // the night's scrap of paper; see draw_night
+    float   paper_w    = 0.0f;      // its width, from the widest line last frame
     bool  forced     = false;   // the class menu is up, panel or not
 
     // Seeded from mgmp.json at ui_init, so the fields already hold whatever the
@@ -309,6 +315,47 @@ const char* class_label(const char* id) {
     return id;
 }
 
+// What a collar gives, as the game says it: CAT_CLASS_*_DESC in Russian and the
+// class's stat_mods, both out of data/classes/*.gon in this build's
+// resources.gpak (2026-11-05). Null for a class not here.
+const char* class_desc(const char* id) {
+    static const struct { const char* id; const char* ru; } k[] = {
+        { "Fighter", "\xD0\x92\xD1\x8B\xD0\xB1\xD0\xB8\xD0\xB2\xD0\xB0\xD0\xB9 \xD0\xBF\xD0\xBE\xD0\xB1\xD0\xB5\xD0\xB4\xD1\x83 \xD0\xBA\xD1\x83\xD0\xBB\xD0\xB0\xD0\xBA\xD0\xB0\xD0\xBC\xD0\xB8! \xD0\x91\xD0\xBE\xD0\xB9\xD1\x86\xD1\x8B \xD0\xBF\xD1\x80\xD0\xB5\xD0\xBA\xD1\x80\xD0\xB0\xD1\x81\xD0\xBD\xD0\xBE \xD1\x80\xD0\xB0\xD0\xB7\xD0\xB4\xD0\xB0\xD1\x8E\xD1\x82 \xD1\x82\xD1\x83\xD0\xBC\xD0\xB0\xD0\xBA\xD0\xB8 \xD0\xBD\xD0\xB0\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBE \xD0\xB8 \xD0\xBD\xD0\xB0\xD0\xBB\xD0\xB5\xD0\xB2\xD0\xBE, \xD0\xB8\xD1\x85 \xD0\xB1\xD0\xBB\xD0\xB8\xD0\xB6\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xB0\xD1\x82\xD0\xB0\xD0\xBA\xD0\xB8 \xD1\x81\xD0\xB8\xD0\xBB\xD1\x8C\xD0\xBD\xD1\x8B \xD0\xB8 \xD1\x80\xD0\xB0\xD0\xB7\xD1\x8F\xD1\x82 \xD0\xBD\xD0\xB0\xD0\xBF\xD0\xBE\xD0\xB2\xD0\xB0\xD0\xBB!\n\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 +2\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C +1\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 -1" },
+        { "Hunter", "\xD0\xA0\xD0\xB0\xD0\xB7\xD0\xB8 \xD0\xB8\xD0\xB7\xD0\xB4\xD0\xB0\xD0\xBB\xD0\xB5\xD0\xBA\xD0\xB0! \xD0\x9E\xD1\x85\xD0\xBE\xD1\x82\xD0\xBD\xD0\xB8\xD0\xBA\xD0\xB8 \xD0\xBE\xD1\x82\xD0\xBB\xD0\xB8\xD1\x87\xD0\xBD\xD0\xBE \xD1\x81\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBB\xD1\x8F\xD1\x8E\xD1\x82\xD1\x81\xD1\x8F \xD1\x81 \xD0\xBF\xD0\xBE\xD1\x80\xD0\xB0\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5\xD0\xBC \xD1\x86\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xB9 \xD0\xBD\xD0\xB0 \xD1\x80\xD0\xB0\xD1\x81\xD1\x81\xD1\x82\xD0\xBE\xD1\x8F\xD0\xBD\xD0\xB8\xD0\xB8, \xD0\xBD\xD0\xB5 \xD0\xB7\xD0\xB0\xD0\xBB\xD0\xB5\xD0\xB7\xD0\xB0\xD1\x8F \xD0\xB2 \xD0\xB3\xD1\x83\xD1\x89\xD1\x83 \xD0\xB1\xD0\xBE\xD1\x8F!\n\n\xD0\x9B\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C +3\n\xD0\xA3\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 +2\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 -1\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -2" },
+        { "Mage", "\xD0\x92\xD0\xB7\xD0\xBE\xD1\x80\xD0\xB2\xD0\xB8 \xD0\xB2\xD1\x80\xD0\xB0\xD0\xB3\xD0\xBE\xD0\xB2 \xD1\x81\xD0\xB2\xD0\xBE\xD0\xB8\xD1\x85! \xD0\x9C\xD0\xB0\xD0\xB3\xD0\xB8 \xE2\x80\x93 \xD0\xBC\xD0\xB0\xD1\x81\xD1\x82\xD0\xB5\xD1\x80\xD0\xB0 \xD0\xB2\xD1\x81\xD1\x8F\xD1\x87\xD0\xB5\xD1\x81\xD0\xBA\xD0\xB8\xD1\x85 \xD0\xB7\xD0\xB0\xD0\xBA\xD0\xBB\xD0\xB8\xD0\xBD\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xB9 \xD0\xB8 \xD1\x81\xD1\x82\xD0\xB8\xD1\x85\xD0\xB8\xD0\xB9\xD0\xBD\xD0\xBE\xD0\xB3\xD0\xBE \xD1\x83\xD1\x80\xD0\xBE\xD0\xBD\xD0\xB0!\n\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 +2\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +2\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 -1\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 -1" },
+        { "Medic", "\xD0\x94\xD1\x80\xD1\x83\xD0\xB6\xD0\xB1\xD0\xB0 \xD0\xB4\xD0\xBE \xD0\xB3\xD1\x80\xD0\xBE\xD0\xB1\xD0\xB0! \xD0\x9A\xD0\xBB\xD0\xB8\xD1\x80\xD0\xB8\xD0\xBA\xD0\xB8 \xD1\x85\xD0\xBE\xD1\x80\xD0\xBE\xD1\x88\xD0\xB8 \xD0\xB2 \xD0\xBB\xD0\xB5\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB8 \xD1\x81\xD0\xBE\xD0\xBF\xD0\xB0\xD1\x80\xD1\x82\xD0\xB8\xD0\xB9\xD1\x86\xD0\xB5\xD0\xB2 \xD0\xB8 \xD0\xB8\xD1\x81\xD1\x86\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB8 \xD0\xBF\xD0\xBE\xD1\x81\xD0\xBB\xD0\xB5 \xD0\xBC\xD0\xB5\xD1\x82\xD0\xBA\xD0\xB8\xD1\x85 \xD0\xB0\xD1\x82\xD0\xB0\xD0\xBA \xD0\xBF\xD1\x80\xD0\xBE\xD1\x82\xD0\xB8\xD0\xB2\xD0\xBD\xD0\xB8\xD0\xBA\xD0\xB0!\n\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +2\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 +2\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -1\n\xD0\x9B\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -1" },
+        { "Tank", "\xD0\x9F\xD1\x80\xD0\xBE\xD1\x87\xD1\x8C \xD1\x81 \xD0\xB4\xD0\xBE\xD1\x80\xD0\xBE\xD0\xB3\xD0\xB8! \xD0\xA2\xD0\xB0\xD0\xBD\xD0\xBA\xD0\xB8 \xD0\xBA\xD1\x80\xD0\xB0\xD0\xB9\xD0\xBD\xD0\xB5 \xD0\xB6\xD0\xB8\xD0\xB2\xD1\x83\xD1\x87\xD0\xB8 \xD0\xB8 \xD1\x81\xD0\xBD\xD0\xBE\xD1\x81\xD1\x8F\xD1\x82 \xD0\xB2\xD1\x81\xD1\x91 \xD0\xBD\xD0\xB0 \xD1\x81\xD0\xB2\xD0\xBE\xD1\x91\xD0\xBC \xD0\xBF\xD1\x83\xD1\x82\xD0\xB8!\n\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 +4\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 -1\n\xD0\x9B\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -1" },
+        { "Thief", "\xD0\x90\xD1\x82\xD0\xB0\xD0\xBA\xD1\x83\xD0\xB9 \xD0\xB8\xD0\xB7 \xD1\x82\xD0\xB5\xD0\xBD\xD0\xB8! \xD0\x92\xD0\xBE\xD1\x80\xD1\x8B \xD0\xBC\xD0\xB0\xD1\x81\xD1\x82\xD0\xB5\xD1\x80\xD1\x81\xD0\xBA\xD0\xB8 \xD1\x83\xD0\xB2\xD0\xBE\xD1\x80\xD0\xB0\xD1\x87\xD0\xB8\xD0\xB2\xD0\xB0\xD1\x8E\xD1\x82\xD1\x81\xD1\x8F \xD0\xBE\xD1\x82 \xD1\x83\xD0\xB4\xD0\xB0\xD1\x80\xD0\xBE\xD0\xB2 \xD0\xB8 \xD0\xB7\xD0\xB0\xD1\x85\xD0\xBE\xD0\xB4\xD1\x8F\xD1\x82 \xD1\x81\xD0\xBE \xD1\x81\xD0\xBF\xD0\xB8\xD0\xBD\xD1\x8B!\n\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C +4\n\xD0\xA3\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 +1\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 -1\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 -1" },
+        { "Colorless", "\xD0\x9F\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD0\xBE \xD0\xBA\xD0\xBE\xD1\x82\xD0\xB5\xD0\xB9\xD0\xBA\xD0\xB0!" },
+        { "Monk", "\xD0\xA0\xD0\xB0\xD0\xB7\xD0\xBD\xD0\xBE\xD1\x81\xD1\x82\xD0\xBE\xD1\x80\xD0\xBE\xD0\xBD\xD0\xBD\xD0\xB8\xD0\xB5 \xD0\xBC\xD0\xB0\xD1\x81\xD1\x82\xD0\xB5\xD1\x80\xD0\xB0 \xD0\xB1\xD0\xBE\xD0\xB5\xD0\xB2\xD1\x8B\xD1\x85 \xD0\xB8\xD1\x81\xD0\xBA\xD1\x83\xD1\x81\xD1\x81\xD1\x82\xD0\xB2! \xD0\x9C\xD0\xBE\xD0\xBD\xD0\xB0\xD1\x85\xD0\xB8 \xD0\xBC\xD0\xBE\xD0\xB3\xD1\x83\xD1\x82 \xD0\xB0\xD1\x82\xD0\xB0\xD0\xBA\xD0\xBE\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C \xD0\xB2\xD0\xB1\xD0\xBB\xD0\xB8\xD0\xB7\xD0\xB8 \xD0\xB8 \xD0\xBD\xD0\xB0 \xD1\x80\xD0\xB0\xD1\x81\xD1\x81\xD1\x82\xD0\xBE\xD1\x8F\xD0\xBD\xD0\xB8\xD0\xB8 \xD0\xB4\xD0\xB2\xD0\xB0\xD0\xB6\xD0\xB4\xD1\x8B \xD0\xB7\xD0\xB0 \xD1\x85\xD0\xBE\xD0\xB4!\n\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 +2\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +2\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 -1\n\xD0\x9B\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -1" },
+        { "Butcher", "\xD0\xA1\xD0\xBC\xD0\xB0\xD0\xB6\xD1\x8C\xD1\x82\xD0\xB5 \xD0\xBC\xD1\x8F\xD1\x81\xD0\xBE \xD0\xBC\xD0\xB0\xD1\x81\xD0\xBB\xD0\xBE\xD0\xBC! \xD0\x9C\xD1\x8F\xD1\x81\xD0\xBD\xD0\xB8\xD0\xBA\xD0\xB8 \xD1\x81 \xD1\x83\xD0\xB4\xD0\xBE\xD0\xB2\xD0\xBE\xD0\xBB\xD1\x8C\xD1\x81\xD1\x82\xD0\xB2\xD0\xB8\xD0\xB5\xD0\xBC \xD0\xBA\xD1\x80\xD0\xBE\xD0\xBC\xD1\x81\xD0\xB0\xD1\x8E\xD1\x82 \xD1\x81\xD0\xB2\xD0\xBE\xD0\xB8\xD1\x85 \xD0\xB6\xD0\xB5\xD1\x80\xD1\x82\xD0\xB2, \xD0\xBE\xD1\x82\xD1\x80\xD0\xB5\xD0\xB7\xD0\xB0\xD1\x8F \xD0\xBE\xD1\x82 \xD0\xBD\xD0\xB8\xD1\x85 \xD0\xBA\xD1\x83\xD1\x81\xD0\xBA\xD0\xB8 \xD0\xBC\xD1\x8F\xD1\x81\xD0\xB0. \xD0\x90 \xD0\xB5\xD1\x89\xD1\x91 \xD1\x83 \xD0\xBD\xD0\xB8\xD1\x85 \xD0\xB5\xD1\x81\xD1\x82\xD1\x8C \xD0\xBA\xD1\x80\xD1\x8E\xD0\xBA\xD0\xB8, \xD1\x87\xD1\x82\xD0\xBE\xD0\xB1\xD1\x8B \xD0\xBF\xD1\x80\xD0\xB8\xD1\x82\xD1\x8F\xD0\xB3\xD0\xB8\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C \xD0\xB2\xD1\x81\xD1\x91 \xD0\xBF\xD0\xBE\xD0\xB4\xD1\x80\xD1\x8F\xD0\xB4!\n\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 +3\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 +2\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C -2" },
+        { "Druid", "\xD0\x95\xD0\xB4\xD0\xB8\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 \xD1\x81 \xD0\xBF\xD1\x80\xD0\xB8\xD1\x80\xD0\xBE\xD0\xB4\xD0\xBE\xD0\xB9! \xD0\x94\xD1\x80\xD1\x83\xD0\xB8\xD0\xB4\xD1\x8B \xD0\xBF\xD1\x80\xD0\xB8\xD0\xB7\xD1\x8B\xD0\xB2\xD0\xB0\xD1\x8E\xD1\x82 \xD0\xB4\xD1\x80\xD1\x83\xD0\xB6\xD0\xB5\xD0\xBB\xD1\x8E\xD0\xB1\xD0\xBD\xD1\x8B\xD1\x85 \xD0\xB6\xD0\xB8\xD0\xB2\xD0\xBE\xD1\x82\xD0\xBD\xD1\x8B\xD1\x85, \xD0\xB0 \xD0\xB5\xD1\x89\xD1\x91 \xD1\x83 \xD0\xBD\xD0\xB8\xD1\x85 \xD0\xB5\xD1\x81\xD1\x82\xD1\x8C \xD0\x92\xD0\xBE\xD1\x80\xD0\xBE\xD0\xBD\xD0\xB0-\xD0\xBA\xD0\xBE\xD0\xBC\xD0\xBF\xD0\xB0\xD0\xBD\xD1\x8C\xD0\xBE\xD0\xBD!\n\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +3\n\xD0\xA3\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 +1\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 -2" },
+        { "Tinkerer", "\xD0\x9C\xD0\xB0\xD1\x81\xD1\x82\xD0\xB5\xD1\x80\xD0\xB0 \xD0\xBD\xD0\xB0 \xD0\xB2\xD1\x81\xD0\xB5 \xD0\xBB\xD0\xB0\xD0\xBF\xD1\x8B! \xD0\xA2\xD0\xB5\xD1\x85\xD0\xBD\xD0\xB8\xD0\xBA\xD0\xB8 \xD0\xBB\xD0\xBE\xD0\xB2\xD0\xBA\xD0\xBE \xD1\x81\xD0\xBE\xD0\xB1\xD0\xB8\xD1\x80\xD0\xB0\xD1\x8E\xD1\x82 \xD0\xB2\xD1\x80\xD0\xB5\xD0\xBC\xD0\xB5\xD0\xBD\xD0\xBD\xD0\xBE\xD0\xB5 \xD0\xBE\xD1\x80\xD1\x83\xD0\xB6\xD0\xB8\xD0\xB5, \xD0\xB0 \xD0\xB5\xD1\x89\xD1\x91 \xD1\x83 \xD0\xBD\xD0\xB8\xD1\x85 \xD0\xBA\xD1\x83\xD1\x87\xD0\xB0 \xD1\x81\xD0\xB0\xD0\xBC\xD1\x8B\xD1\x85 \xD1\x80\xD0\xB0\xD0\xB7\xD0\xBD\xD1\x8B\xD1\x85 \xD0\xB8 \xD0\xBD\xD0\xB5\xD0\xBE\xD0\xB1\xD1\x8B\xD1\x87\xD0\xBD\xD1\x8B\xD1\x85 \xD0\xBF\xD1\x80\xD0\xB8\xD0\xBC\xD0\xBE\xD1\x87\xD0\xB5\xD0\xBA!\n\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 +4\n\xD0\xA3\xD0\xB4\xD0\xB0\xD1\x87\xD0\xB0 -1\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 -1" },
+        { "Necromancer", "\xD0\x9C\xD0\xB5\xD1\x80\xD1\x82\xD0\xB2\xD0\xB5\xD1\x86\xD1\x8B \xD0\xB2\xD0\xBE\xD1\x81\xD1\x81\xD1\x82\xD0\xB0\xD1\x8E\xD1\x82! \xD0\x9D\xD0\xB5\xD0\xBA\xD1\x80\xD0\xBE\xD0\xBC\xD0\xB0\xD0\xBD\xD1\x82\xD1\x8B \xE2\x80\x93 \xD0\xB2\xD0\xBB\xD0\xB0\xD0\xB4\xD1\x8B\xD0\xBA\xD0\xB8 \xD1\x82\xD1\x80\xD1\x83\xD0\xBF\xD0\xBE\xD0\xB2, \xD0\xB0 \xD0\xB5\xD1\x89\xD1\x91 \xD0\xBC\xD0\xBE\xD0\xB3\xD1\x83\xD1\x82 \xD0\xB2\xD1\x8B\xD1\x81\xD0\xB0\xD1\x81\xD1\x8B\xD0\xB2\xD0\xB0\xD1\x82\xD1\x8C \xD0\xB6\xD0\xB8\xD0\xB7\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xBD\xD1\x83\xD1\x8E \xD1\x81\xD0\xB8\xD0\xBB\xD1\x83 \xD0\xB8\xD0\xB7 \xD1\x81\xD0\xB2\xD0\xBE\xD0\xB8\xD1\x85 \xD0\xB2\xD1\x80\xD0\xB0\xD0\xB3\xD0\xBE\xD0\xB2!\n\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 +2\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +1\n\xD0\xA1\xD0\xB8\xD0\xBB\xD0\xB0 -2" },
+        { "Psychic", "\xD0\x9E\xD1\x87\xD0\xB8\xD1\x81\xD1\x82\xD0\xB8 \xD1\x81\xD0\xB2\xD0\xBE\xD0\xB9 \xD1\x80\xD0\xB0\xD0\xB7\xD1\x83\xD0\xBC! \xD0\xA2\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xBA\xD0\xB8\xD0\xBD\xD0\xB5\xD1\x82\xD0\xB8\xD0\xBA\xD0\xB8 \xD1\x83\xD0\xBF\xD1\x80\xD0\xB0\xD0\xB2\xD0\xBB\xD1\x8F\xD1\x8E\xD1\x82 \xD0\xB2\xD0\xB5\xD1\x89\xD0\xB0\xD0\xBC\xD0\xB8 \xD0\xBD\xD0\xB0 \xD1\x80\xD0\xB0\xD1\x81\xD1\x81\xD1\x82\xD0\xBE\xD1\x8F\xD0\xBD\xD0\xB8\xD0\xB8 \xD0\xB8 \xD0\xB4\xD0\xB2\xD0\xB8\xD0\xB3\xD0\xB0\xD1\x8E\xD1\x82 \xD0\xB2\xD1\x81\xD1\x8F\xD0\xBA\xD0\xBE\xD0\xB5 \xD1\x81\xD0\xB8\xD0\xBB\xD0\xBE\xD0\xB9 \xD0\xBC\xD1\x8B\xD1\x81\xD0\xBB\xD0\xB8! \xD0\xA3 \xD0\xA2\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xBA\xD0\xB8\xD0\xBD\xD0\xB5\xD1\x82\xD0\xB8\xD0\xBA\xD0\xBE\xD0\xB2 +5 \xD0\xBA \xD0\xBD\xD0\xB0\xD1\x87\xD0\xB0\xD0\xBB\xD1\x8C\xD0\xBD\xD0\xBE\xD0\xB9 \xD0\xBC\xD0\xB0\xD0\xBD\xD0\xB5.\n\n\xD0\x98\xD0\xBD\xD1\x82\xD0\xB5\xD0\xBB\xD0\xBB\xD0\xB5\xD0\xBA\xD1\x82 +1\n\xD0\xA5\xD0\xB0\xD1\x80\xD0\xB8\xD0\xB7\xD0\xBC\xD0\xB0 +1\n\xD0\xA1\xD0\xBA\xD0\xBE\xD1\x80\xD0\xBE\xD1\x81\xD1\x82\xD1\x8C +1\n\xD0\xA2\xD0\xB5\xD0\xBB\xD0\xBE\xD1\x81\xD0\xBB\xD0\xBE\xD0\xB6\xD0\xB5\xD0\xBD\xD0\xB8\xD0\xB5 -1" },
+        { "Jester", "\xD0\x9C\xD0\xBE\xD0\xB6\xD0\xB5\xD1\x82 \xD0\xB4\xD0\xB5\xD0\xBB\xD0\xB0\xD1\x82\xD1\x8C \xD0\xB2\xD1\x81\xD1\x91! \xD0\xA3 \xD1\x88\xD1\x83\xD1\x82\xD0\xBE\xD0\xB2 \xD0\xBD\xD0\xB5\xD1\x82 \xD1\x82\xD0\xBE\xD1\x80\xD0\xBC\xD0\xBE\xD0\xB7\xD0\xBE\xD0\xB2!" },
+    };
+    for (const auto& e : k) if (strcmp(e.id, id) == 0) return e.ru;
+    return nullptr;
+}
+
+// The collar's tooltip: its name, what it gives, then `extra` (a hint) if any.
+void collar_tooltip(const char* id, const char* extra = nullptr) {
+    ImGui::BeginTooltip();
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 22.0f);
+    ImGui::TextUnformatted(class_label(id));
+    if (const char* d = class_desc(id)) {
+        ImGui::Separator();
+        ImGui::TextUnformatted(d);
+    }
+    if (extra) {
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", extra);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndTooltip();
+}
+
 // The host's class chooser, for the friend. Drawn whether or not the panel is
 // up: the screen it stands for is on the host's machine, and this is the only
 // place the friend can answer it.
@@ -401,6 +448,37 @@ void draw_heart(float size) {
     if (ImGui::IsItemHovered()) ImGui::SetTooltip(u8"\u0422\u0432\u043e\u0439 \u043a\u043e\u0442");
 }
 
+// A part of the cat, "slot:id" from kChoiceClassMuts, to its line in
+// kMutations. `slot` gets the tooltip's slot index: a pair of parts counts as one
+// (sub_140736810).
+const MutationInfo* find_mutation(unsigned raw, unsigned id, unsigned* slot) {
+    unsigned s = raw;
+    if (s - 0xB <= 1) s = 3;
+    else if (s - 0xD <= 1) s = 4;
+    else if (s - 0xF <= 1) s = 6;
+    else if (s - 0x11 <= 1) s = 7;
+    else if (s == 0x13 || s == 0x14) s = 8;
+    *slot = s;
+    static const int kFile[11] = { 0, 1, 2, 3, 3, -1, 4, 5, 6, 7, 8 };
+    const int f = s < 11 ? kFile[s] : -1;
+    for (const auto& e : kMutations)
+        if (e.file == f && e.id == id) return &e;
+    return nullptr;
+}
+
+// What a cat's mutations add to each stat, from the game's mutation files.
+void mutation_bonus(const char* list, int out[7]) {
+    for (int i = 0; i < 7; ++i) out[i] = 0;
+    for (const char* p = list; p && *p;) {
+        unsigned raw = 0, id = 0, slot = 0;
+        if (sscanf_s(p, "%u:%u", &raw, &id) != 2) break;
+        if (const MutationInfo* m = find_mutation(raw, id, &slot))
+            for (int i = 0; i < 7; ++i) out[i] += m->stat[i];
+        p = strchr(p, ',');
+        if (p) ++p;
+    }
+}
+
 // Every cat's stats in one table; the best value of each column in green.
 void draw_stat_table(const ClassPickView& v) {
     int16_t best[kClassPickStats];
@@ -415,7 +493,7 @@ void draw_stat_table(const ClassPickView& v) {
     ImGui::TableSetupColumn(u8"\u041a\u043e\u0442", ImGuiTableColumnFlags_WidthFixed, 130);
     ImGui::TableSetupColumn(u8"\u041e\u0448\u0435\u0439\u043d\u0438\u043a", ImGuiTableColumnFlags_WidthFixed, 110);
     for (uint32_t s = 0; s < kClassPickStats; ++s)
-        ImGui::TableSetupColumn(kStats[s].tag, ImGuiTableColumnFlags_WidthFixed, 38);
+        ImGui::TableSetupColumn(kStats[s].tag, ImGuiTableColumnFlags_WidthFixed, 58);
     ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
     for (int col = 0; col < 2 + (int)kClassPickStats; ++col) {
         ImGui::TableSetColumnIndex(col);
@@ -424,6 +502,8 @@ void draw_stat_table(const ClassPickView& v) {
             ImGui::SetTooltip("%s\n%s", kStats[col - 2].name, kStats[col - 2].desc);
     }
     for (uint32_t c = 0; c < v.cats; ++c) {
+        int from_muts[7];
+        mutation_bonus(v.muts[c], from_muts);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         ImGui::TextColored(v.cat_mine[c] ? kAccent : kMuted, "%s", v.cat_name[c][0] ? v.cat_name[c] : "?");
@@ -432,8 +512,11 @@ void draw_stat_table(const ClassPickView& v) {
         ImGui::TableSetColumnIndex(1);
         const char* w = wearing(v, c);
         if (w) {
+            ImGui::BeginGroup();
             if (draw_icon(collar_tex(w), ImGui::GetTextLineHeight() + 2)) ImGui::SameLine();
             ImGui::TextUnformatted(class_label(w));
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered()) collar_tooltip(w);
         }
         else   ImGui::TextColored(kMuted, "-");
         for (uint32_t s = 0; s < kClassPickStats; ++s) {
@@ -441,8 +524,18 @@ void draw_stat_table(const ClassPickView& v) {
             if (!v.have_stats[c]) { ImGui::TextColored(kMuted, "?"); continue; }
             const bool top = v.stat[c][s] == best[s];
             ImGui::TextColored(top ? kGood : kInk, "%d", (int)v.stat[c][s]);
+            const int bon = v.bonus[c][s] + from_muts[s];
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s: %d\n%s", kStats[s].name, (int)v.stat[c][s], kStats[s].desc);
+            // The bonus in it (mutations and the like), small, beside it.
+            if (bon) {
+                ImGui::SameLine(0, 3);
+                ImGui::PushFont(nullptr, ImGui::GetFontSize() * 0.72f);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFontSize() * 0.25f);
+                ImGui::TextColored(bon > 0 ? ImVec4(0.55f, 0.85f, 0.45f, 1.0f) : ImVec4(0.90f, 0.45f, 0.40f, 1.0f),
+                                   "%+d", bon);
+                ImGui::PopFont();
+            }
         }
     }
     ImGui::EndTable();
@@ -550,19 +643,52 @@ void draw_equipped(const ClassPickView& v, uint32_t c) {
     }
 }
 
+// The game's slot index (sub_140736810) to the file in data/mutations/.
+int mutation_file(uint32_t slot) {
+    static const int k[11] = { 0, 1, 2, 3, 3, -1, 4, 5, 6, 7, 8 };
+    return slot < 11 ? k[slot] : -1;
+}
+
+// "Eye Mutation: +2 INT, -1 STR" in Russian, one line a mutation, as the game's tooltip.
+void draw_mutations(const char* list) {
+    for (const char* p = list; *p;) {
+        unsigned slot = 0, id = 0;
+        unsigned raw = 0;
+        if (sscanf_s(p, "%u:%u", &raw, &id) != 2) break;
+        const MutationInfo* info = find_mutation(raw, id, &slot);
+        const bool bad = info ? info->defect : id >= 700;
+        const char* name = slot < 11 && kMutationNames[slot][0][0] ? kMutationNames[slot][bad ? 1 : 0]
+                                                                   : u8"\u041c\u0443\u0442\u0430\u0446\u0438\u044f";
+        const ImVec4 col = bad ? ImVec4(0.90f, 0.45f, 0.40f, 1.0f) : ImVec4(0.75f, 0.60f, 0.95f, 1.0f);
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 36.0f);
+        ImGui::TextColored(col, "%s:", name);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(info ? info->ru : "?");
+        ImGui::PopTextWrapPos();
+        p = strchr(p, ',');
+        if (!p) break;
+        ++p;
+    }
+}
+
 // One of the friend's cats: its collar and its five slots.
 void draw_cat_card(const ClassPickView& v, uint32_t c) {
     ImGui::PushID((int)c);
     ImGui::BeginChild("card", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
-    const char* w = wearing(v, c);
-    if (draw_icon(w ? collar_tex(w) : collar_tex("Colorless"), 44, w ? 1.0f : 0.35f))
+    const bool  gear = v.phase == 2;
+    const char* w = gear ? nullptr : wearing(v, c);
+    if (!gear && draw_icon(w ? collar_tex(w) : collar_tex("Colorless"), 44, w ? 1.0f : 0.35f)) {
+        if (w && ImGui::IsItemHovered()) collar_tooltip(w);
         ImGui::SameLine();
+    }
     ImGui::BeginGroup();
     ImGui::TextColored(kAccent, "%s", v.cat_name[c][0] ? v.cat_name[c] : "?");
     ImGui::SameLine();
     draw_heart(ImGui::GetTextLineHeight() + 2);
-    ImGui::SameLine();
-    ImGui::TextColored(w ? kGood : kMuted, "%s", w ? class_label(w) : u8"\u0431\u0435\u0437 \u043e\u0448\u0435\u0439\u043d\u0438\u043a\u0430");
+    if (!gear) {
+        ImGui::SameLine();
+        ImGui::TextColored(w ? kGood : kMuted, "%s", w ? class_label(w) : u8"\u0431\u0435\u0437 \u043e\u0448\u0435\u0439\u043d\u0438\u043a\u0430");
+    }
     if (v.have_stats[c]) {
         // Its two best stats, the quickest read of what it is for.
         uint32_t a = 0, b = 1;
@@ -574,9 +700,16 @@ void draw_cat_card(const ClassPickView& v, uint32_t c) {
         ImGui::TextColored(kMuted, u8"\u0441\u0438\u043b\u044c\u043d\u0435\u0435 \u0432\u0441\u0435\u0433\u043e:" " %s %d, %s %d", kStats[a].name, (int)v.stat[c][a],
                            kStats[b].name, (int)v.stat[c][b]);
     }
+    if (v.muts[c][0]) draw_mutations(v.muts[c]);
     ImGui::EndGroup();
 
     ImGui::Spacing();
+    if (gear) {
+        draw_equipped(v, c);
+        ImGui::EndChild();
+        ImGui::PopID();
+        return;
+    }
     for (uint32_t t = 0; t < v.tags; ++t) {
         const bool on    = v.tag_holder[t] == v.cat_key[c];
         const bool taken = v.tag_holder[t] && !on;
@@ -594,16 +727,13 @@ void draw_cat_card(const ClassPickView& v, uint32_t c) {
         ImGui::EndDisabled();
         if (on) ImGui::PopStyleColor();
         if (!taken && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-            if (on) ImGui::SetTooltip("%s\n%s", class_label(v.tag_name[t]), u8"\u0429\u0451\u043b\u043a\u043d\u0438, \u0447\u0442\u043e\u0431\u044b \u0441\u043d\u044f\u0442\u044c");
-            else    ImGui::SetTooltip("%s", class_label(v.tag_name[t]));
+            collar_tooltip(v.tag_name[t], on ? u8"\u0429\u0451\u043b\u043a\u043d\u0438, \u0447\u0442\u043e\u0431\u044b \u0441\u043d\u044f\u0442\u044c" : nullptr);
         }
         if (taken && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip(u8"\u042d\u0442\u043e\u0442 \u043e\u0448\u0435\u0439\u043d\u0438\u043a \u0443\u0436\u0435 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u0442\u0435");
+            collar_tooltip(v.tag_name[t], u8"\u042d\u0442\u043e\u0442 \u043e\u0448\u0435\u0439\u043d\u0438\u043a \u0443\u0436\u0435 \u043d\u0430 \u0434\u0440\u0443\u0433\u043e\u043c \u043a\u043e\u0442\u0435");
         ImGui::PopID();
     }
 
-    ImGui::Spacing();
-    draw_equipped(v, c);
     ImGui::EndChild();
     ImGui::PopID();
 }
@@ -618,7 +748,10 @@ void draw_classpick(const ClassPickView& v) {
                             ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(disp.x * 0.62f > 760 ? disp.x * 0.62f : 760,
                                     disp.y * 0.86f), ImGuiCond_Appearing);
-    if (ImGui::Begin(u8"\u0412\u044b\u0431\u043e\u0440 \u043a\u043b\u0430\u0441\u0441\u0430")) {
+    // Two windows, as the game has two screens: the collars, then the gear.
+    const char* title = v.phase == 2 ? u8"\u0421\u043d\u0430\u0440\u044f\u0436\u0435\u043d\u0438\u0435###mgmp_gear"
+                                     : u8"\u0412\u044b\u0431\u043e\u0440 \u043a\u043b\u0430\u0441\u0441\u0430###mgmp_class";
+    if (ImGui::Begin(title)) {
         ImGui::TextColored(kMuted, u8"\u041d\u0430\u0432\u0435\u0434\u0438 \u043d\u0430 \u0441\u0442\u0430\u0442, \u0447\u0442\u043e\u0431\u044b \u0443\u0432\u0438\u0434\u0435\u0442\u044c, \u043d\u0430 \u0447\u0442\u043e \u043e\u043d \u0432\u043b\u0438\u044f\u0435\u0442. \u041b\u0443\u0447\u0448\u0435\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u043f\u043e\u0434\u0441\u0432\u0435\u0447\u0435\u043d\u043e \u0437\u0435\u043b\u0451\u043d\u044b\u043c.");
         ImGui::Spacing();
         draw_stat_table(v);
@@ -644,6 +777,202 @@ void draw_classpick(const ClassPickView& v) {
 // and the mod's last few lines for whoever wants to know more. It is a window,
 // so it also takes the mouse: a click on the menu underneath would only race
 // the clicks the mod is making there.
+// The host's night, for the client, once it has reloaded into the morning.
+// THE NIGHT ON A SCRAP OF PAPER, as the game shows it (the user's screenshot,
+// 2026-11-05): a light grey sheet with torn edges and a dark outline, the text
+// in capitals, centred, in a hand-drawn face. The game's own font is a vector
+// font inside its swfs, so Segoe Print Bold stands in -- every Windows 10 has
+// it, Cyrillic included.
+
+// Upper case, the game's way of writing these.
+std::string upper_utf8(const char* s) {
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (wn <= 1) return s;
+    std::wstring w((size_t)wn, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], wn);
+    CharUpperBuffW(&w[0], (DWORD)(wn - 1));
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string out((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], n, nullptr, nullptr);
+    out.resize(strlen(out.c_str()));
+    return out;
+}
+
+// One paragraph, broken into lines no wider than `width`, each centred.
+float g_widest = 0.0f;   // the widest line draw_night laid out this frame
+
+void centred_lines(const std::string& text, float width, float left, float right) {
+    std::string line;
+    size_t at = 0;
+    auto emit = [&](const std::string& l) {
+        const ImVec2 sz = ImGui::CalcTextSize(l.c_str());
+        if (sz.x > g_widest) g_widest = sz.x;
+        ImGui::SetCursorPosX(left + (right - left - sz.x) * 0.5f);
+        const ImVec2 at0 = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
+        // Bolder than Segoe Print Bold, as the game's lettering is.
+        static const float kOff[][2] = { {0, 0}, {1.1f, 0}, {0, 1.0f}, {1.1f, 1.0f}, {0.55f, 0.5f} };
+        for (const auto& o : kOff) dl->AddText(ImVec2(at0.x + o[0], at0.y + o[1]), ink, l.c_str());
+        ImGui::Dummy(ImVec2(sz.x + 1.1f, sz.y + 1.0f));
+    };
+    while (at <= text.size()) {
+        size_t sp = text.find(' ', at);
+        if (sp == std::string::npos) sp = text.size();
+        const std::string word = text.substr(at, sp - at);
+        const std::string next = line.empty() ? word : line + " " + word;
+        if (!line.empty() && ImGui::CalcTextSize(next.c_str()).x > width) {
+            emit(line);
+            line = word;
+        } else {
+            line = next;
+        }
+        at = sp + 1;
+    }
+    if (!line.empty()) emit(line);
+}
+
+// A deterministic wobble, so the tear holds still from frame to frame.
+float tear(uint32_t i, uint32_t salt) {
+    uint32_t h = i * 2654435761u ^ salt * 2246822519u;
+    h ^= h >> 15; h *= 2246822507u; h ^= h >> 13;
+    return (float)(h & 0xFFFF) / 65535.0f;
+}
+
+void paper(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+    std::vector<ImVec2> pts;
+    const float step = 26.0f;
+    // top, left to right
+    for (float x = a.x; x < b.x; x += step)
+        pts.push_back(ImVec2(x, a.y + (tear((uint32_t)(x - a.x), 1) - 0.5f) * 7.0f));
+    // right side, a couple of nicks
+    for (float y = a.y; y < b.y; y += step * 1.6f)
+        pts.push_back(ImVec2(b.x + (tear((uint32_t)(y - a.y), 2) - 0.5f) * 6.0f, y));
+    // bottom, right to left, with a few long tears hanging off it, here and there
+    uint32_t k = 0;
+    for (float x = b.x; x > a.x; x -= step, ++k) {
+        float y = b.y + (tear(k, 3) - 0.5f) * 8.0f;
+        if (tear(k, 6) > 0.84f) y += 14.0f + tear(k, 4) * 24.0f;
+        pts.push_back(ImVec2(x, y));
+    }
+    // left side
+    for (float y = b.y; y > a.y; y -= step * 1.6f)
+        pts.push_back(ImVec2(a.x + (tear((uint32_t)(y - a.y), 5) - 0.5f) * 6.0f, y));
+    const ImU32 shade   = IM_COL32(0, 0, 0, 90);
+    const ImU32 fill    = IM_COL32(222, 222, 218, 250);
+    const ImU32 outline = IM_COL32(40, 38, 36, 255);
+    std::vector<ImVec2> sh(pts);
+    for (ImVec2& p : sh) { p.x += 5; p.y += 6; }
+    dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), shade);
+    dl->AddConcavePolyFilled(pts.data(), (int)pts.size(), fill);
+    dl->AddPolyline(pts.data(), (int)pts.size(), outline, ImDrawFlags_Closed, 3.0f);
+}
+
+void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
+    const ImGuiIO& io = ImGui::GetIO();
+    // The loading screen takes the focus every frame; this goes on top of it.
+    if (over_loading) ImGui::SetNextWindowFocus();
+    // As wide as its widest line and no wider (2026-11-05: a big sheet with a
+    // little text on it), up to most of the screen; long lines wrap there.
+    constexpr float kPadX = 56.0f;
+    const float most  = io.DisplaySize.x * 0.82f;
+    const float width = g.paper_w > 0.0f ? (g.paper_w < most ? g.paper_w : most) : most;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(width, 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(kPadX, 34));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 2));
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
+    bool open = true;
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                               ImGuiWindowFlags_NoMove;
+    if (ImGui::Begin("##mgmp_night", nullptr, f)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->ChannelsSplit(2);
+        dl->ChannelsSetCurrent(1);
+        if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f);
+        const float left  = ImGui::GetCursorPosX();
+        const float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
+        const float wrap  = most - 2.0f * kPadX;   // break at the widest the sheet may be
+        g_widest = 0.0f;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (i) ImGui::Dummy(ImVec2(0, 14));
+            const std::string up = upper_utf8(lines[i]);
+            size_t at = 0;
+            while (at <= up.size()) {
+                size_t br = up.find('\n', at);
+                if (br == std::string::npos) br = up.size();
+                centred_lines(up.substr(at, br - at), wrap, left, right);
+                at = br + 1;
+            }
+        }
+        ImGui::Dummy(ImVec2(0, 10));
+        const char* ok = u8"\u041e\u041a";
+        const ImVec2 okw = ImGui::CalcTextSize(ok);
+        ImGui::SetCursorPosX(left + (right - left - okw.x - 24) * 0.5f);
+        g.paper_w = g_widest + 2.0f * kPadX + 4.0f;
+        if (g.paper_w < 360.0f) g.paper_w = 360.0f;
+        if (ImGui::InvisibleButton("ok", ImVec2(okw.x + 24, okw.y + 6))) open = false;
+        const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
+        const bool hot = ImGui::IsItemHovered();
+        for (int o = 0; o < 4; ++o)
+            dl->AddText(ImVec2(r0.x + 12 + (o & 1) * 1.1f, r0.y + 3 + (o >> 1) * 1.0f),
+                        hot ? IM_COL32(150, 40, 30, 255) : IM_COL32(26, 23, 20, 255), ok);
+        if (hot) dl->AddLine(ImVec2(r0.x + 10, r1.y), ImVec2(r1.x - 10, r1.y), IM_COL32(150, 40, 30, 255), 2.0f);
+        if (g.paper_font) ImGui::PopFont();
+        dl->ChannelsSetCurrent(0);
+        // The tears and the shadow go past the window's edges; the window
+        // clips to itself, and on 2026-11-05 that cut the paper off square.
+        dl->PushClipRectFullScreen();
+        const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 14));
+        dl->PopClipRect();
+        dl->ChannelsMerge();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+    if (!open) night_dismiss();
+}
+
+// The client pressed the end-day sign: a scrap saying whose it is.
+void draw_end_day_note() {
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40, 26));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
+    const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                               ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+    if (ImGui::Begin("##mgmp_endday", nullptr, f)) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->ChannelsSplit(2);
+        dl->ChannelsSetCurrent(1);
+        if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f);
+        const std::string t = upper_utf8(u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442");
+        const ImVec2 sz = ImGui::CalcTextSize(t.c_str());
+        const ImVec2 at0 = ImGui::GetCursorScreenPos();
+        const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
+        for (int o = 0; o < 4; ++o)
+            dl->AddText(ImVec2(at0.x + (o & 1) * 1.1f, at0.y + (o >> 1) * 1.0f), ink, t.c_str());
+        ImGui::Dummy(ImVec2(sz.x + 1.1f, sz.y + 1.0f));
+        if (g.paper_font) ImGui::PopFont();
+        dl->ChannelsSetCurrent(0);
+        dl->PushClipRectFullScreen();
+        const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
+        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12));
+        dl->PopClipRect();
+        dl->ChannelsMerge();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
 void draw_loading(const char* step) {
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -869,6 +1198,22 @@ void draw_connect() {
     ImGui::SetItemTooltip("Drop the session. Pair it with 'join' to exercise"
                           " reconnect without restarting the process.");
 
+    // The friend's log, by hand: it also comes on its own after a halt or a
+    // node hash mismatch. See mgmp_peerlog.h.
+    ImGui::BeginDisabled(!live);
+    const bool host_side = net_role() == NetRole::Host;
+    if (ImGui::Button(host_side ? u8"\u041b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430"
+                                : u8"\u041b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443"))
+        peerlog_ask("asked from the panel");
+    ImGui::EndDisabled();
+    ImGui::SetItemTooltip(host_side
+        ? u8"\u0417\u0430\u0431\u0440\u0430\u0442\u044c \u043b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430 \u0432 logs\\friend"
+        : u8"\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0441\u0432\u043e\u0439 \u043b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443");
+    if (host_side && peerlog_last_saved()[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", peerlog_last_saved());
+    }
+
     ImGui::EndDisabled();
 
     if (busy) {
@@ -1077,7 +1422,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     // A cutscene moves on the host's clicks: the client's own are not the game's.
-    if (cutscene_filter_input(msg, (uintptr_t)wp)) return 0;
+    if (cutscene_filter_input(msg, (uintptr_t)wp, (intptr_t)lp)) return 0;
 
     return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
 }
@@ -1124,6 +1469,13 @@ bool bring_up() {
     // Russian. 1.92 loads glyphs as they are drawn, so no range is needed.
     if (!io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 18.0f))
         io.Fonts->AddFontDefault();
+    // The sex signs come from Segoe UI Symbol, merged into both faces.
+    ImFontConfig merge;
+    merge.MergeMode = true;
+    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisym.ttf", 18.0f, &merge);
+    g.paper_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeprb.ttf", 27.0f);
+    if (!g.paper_font) g.paper_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\comicbd.ttf", 27.0f);
+    if (g.paper_font) io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisym.ttf", 27.0f, &merge);
 
     if (!ImGui_ImplWin32_Init(g.hwnd)) {
         log_line("UI", "!! ImGui_ImplWin32_Init failed -- the panel is OFF");
@@ -1199,11 +1551,20 @@ void ui_post_escape() {
     PostMessageW(g.hwnd, WM_KEYUP,   VK_ESCAPE, down | 0xC0000000);
 }
 
-void post_input(uint8_t what, bool down) {
+void post_input(uint8_t what, bool down, uint32_t pos) {
     if (what == 0) {
         POINT pt{};
-        GetCursorPos(&pt);
-        ScreenToClient(g.hwnd, &pt);
+        RECT  rc{};
+        if (pos && GetClientRect(g.hwnd, &rc) && rc.right > 0 && rc.bottom > 0) {
+            // The host's spot. A move first: the game takes a click's place from
+            // where the mouse last moved, not from the click's own lParam.
+            pt.x = (LONG)(((pos >> 16) & 0xFFFF) * (uint64_t)rc.right / 65535);
+            pt.y = (LONG)((pos & 0xFFFF) * (uint64_t)rc.bottom / 65535);
+            PostMessageW(g.hwnd, WM_MOUSEMOVE, down ? 0 : MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+        } else {
+            GetCursorPos(&pt);
+            ScreenToClient(g.hwnd, &pt);
+        }
         PostMessageW(g.hwnd, down ? WM_LBUTTONDOWN : WM_LBUTTONUP, down ? MK_LBUTTON : 0,
                      MAKELPARAM(pt.x, pt.y));
     } else {
@@ -1214,13 +1575,25 @@ void post_input(uint8_t what, bool down) {
     }
 }
 
-bool ui_post_input(uint8_t what) {
+bool ui_post_input(uint8_t what, uint32_t pos) {
     if (!g.hwnd || g.up_frames) return false;
     ++g.synthetic_input;
-    post_input(what, true);
+    post_input(what, true, pos);
     g.up_what   = what;
+    g.up_pos    = pos;
     g.up_frames = 3;
     return true;
+}
+
+uint32_t ui_pack_pos(intptr_t lparam) {
+    RECT rc{};
+    if (!g.hwnd || !GetClientRect(g.hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return 0;
+    int x = (short)LOWORD(lparam), y = (short)HIWORD(lparam);
+    x = x < 0 ? 0 : x > rc.right ? rc.right : x;
+    y = y < 0 ? 0 : y > rc.bottom ? rc.bottom : y;
+    const uint32_t px = (uint32_t)((uint64_t)x * 65535 / rc.right);
+    const uint32_t py = (uint32_t)((uint64_t)y * 65535 / rc.bottom);
+    return ((px << 16) | py) | (px == 0 && py == 0 ? 1u : 0u);   // never 0: 0 is "no place"
 }
 
 bool ui_captures_input() {
@@ -1235,7 +1608,7 @@ void ui_on_swap(void* window) {
     // whether or not the panel is enabled or drawn.
     if (g.up_frames && --g.up_frames == 0) {
         ++g.synthetic_input;
-        post_input(g.up_what, false);
+        post_input(g.up_what, false, g.up_pos);
     }
     if (!g.enabled || g.failed) return;
 
@@ -1254,7 +1627,11 @@ void ui_on_swap(void* window) {
     ClassPickView pick;
     const char* step = nullptr;
     const bool loading = leave_loading(&step);
-    g.forced = classpick_view(pick) || loading;
+    // The night's window comes up with F1 closed too, like the class chooser.
+    uint32_t nights = 0;
+    const char* const* night = night_view(&nights);
+    const bool refused = night_end_day_refused();
+    g.forced = classpick_view(pick) || loading || night || refused;
     if (!g.visible && !g.forced) return;
 
     if (!g.ready) {
@@ -1276,6 +1653,8 @@ void ui_on_swap(void* window) {
     }
     if (classpick_view(pick)) draw_classpick(pick);
     if (loading) draw_loading(step);
+    if (night) draw_night(night, nights, loading);
+    else if (refused) draw_end_day_note();
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

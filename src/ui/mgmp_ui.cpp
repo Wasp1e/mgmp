@@ -27,6 +27,7 @@
 #include "mgmp_leave.h"
 #include "mgmp_peerlog.h"
 #include "mgmp_night.h"
+#include "mgmp_meow.h"
 
 // Declared by imgui_impl_win32.h's owner rather than the header itself.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -861,6 +862,16 @@ void draw_session() {
 
     draw_connect();
     draw_nodes();
+
+    ImGui::SeparatorText(u8"\u0437\u0432\u0443\u043a");
+    {
+        // The map's meows, the other player's clicks and this one's.
+        int pct = (int)(meow_volume() * 100.0f + 0.5f);
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::SliderInt(u8"\u041c\u044f\u0443\u043a\u0430\u043d\u044c\u0435 \u043d\u0430 \u043a\u0430\u0440\u0442\u0435", &pct, 0, 100, "%d%%"))
+            meow_set_volume(pct / 100.0f);
+        ImGui::SetItemTooltip(u8"\u0413\u0440\u043e\u043c\u043a\u043e\u0441\u0442\u044c \u043c\u044f\u0443\u043a\u0430\u043d\u044c\u044f, \u043a\u043e\u0433\u0434\u0430 \u043a\u0442\u043e-\u0442\u043e \u0432\u044b\u0431\u0438\u0440\u0430\u0435\u0442 \u0443\u0437\u0435\u043b \u043a\u0430\u0440\u0442\u044b. 0%% -- \u0431\u0435\u0437 \u0437\u0432\u0443\u043a\u0430.");
+    }
 
     ImGui::SeparatorText("panel");
     ImGui::SetNextItemWidth(160.0f);

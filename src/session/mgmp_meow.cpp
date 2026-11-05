@@ -1,6 +1,7 @@
 #include "mgmp_meow.h"
 #include "mgmp_gpak.h"
 #include "mgmp_log.h"
+#include "mgmp_config.h"
 
 #include <windows.h>
 #include <mmsystem.h>
@@ -21,6 +22,8 @@ constexpr int kTries    = 8;
 // The files are mastered for the game's mixer, which plays them under the
 // music; on their own through the system they stand out.
 constexpr double kGain = 0.6;
+float g_volume      = 1.0f;   // the panel's slider, on top of kGain
+bool  g_volume_read = false;
 
 CRITICAL_SECTION g_cs;
 bool     g_cs_ready = false;
@@ -61,7 +64,8 @@ void soften(uint8_t* wav, uint32_t size) {
             if (bits != 16) return;
             int16_t* s = (int16_t*)(wav + p + 8);
             const uint32_t n = (len < size - p - 8 ? len : size - p - 8) / 2;
-            for (uint32_t i = 0; i < n; ++i) s[i] = (int16_t)(s[i] * kGain);
+            const double gain = kGain * g_volume;
+            for (uint32_t i = 0; i < n; ++i) s[i] = (int16_t)(s[i] * gain);
             return;
         }
         p += 8 + len + (len & 1);
@@ -93,7 +97,41 @@ DWORD WINAPI meow_thread(LPVOID p) {
     return 0;
 }
 
+// mgmp_meow.txt beside mgmp.dll: one number, the volume.
+void volume_path(wchar_t* out, size_t cap) {
+    wcsncpy_s(out, cap, config().log_path, _TRUNCATE);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    wcsncpy_s(slash ? slash + 1 : out, cap - (slash ? slash + 1 - out : 0), L"mgmp_meow.txt", _TRUNCATE);
+}
+
+void read_volume() {
+    if (g_volume_read) return;
+    g_volume_read = true;
+    wchar_t path[MAX_PATH];
+    volume_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") || !f) return;
+    float v = 1.0f;
+    if (fscanf_s(f, "%f", &v) == 1 && v >= 0.0f && v <= 1.0f) g_volume = v;
+    fclose(f);
+}
+
 } // namespace
+
+float meow_volume() { read_volume(); return g_volume; }
+
+void meow_set_volume(float v) {
+    read_volume();
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+    g_volume = v;
+    wchar_t path[MAX_PATH];
+    volume_path(path, MAX_PATH);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"wb") || !f) return;
+    fprintf(f, "%.2f\n", v);
+    fclose(f);
+}
 
 void ensure_meow() {
     if (g_cs_ready) return;
@@ -111,6 +149,8 @@ uint32_t meow_new_seed() {
 
 void meow_play(uint32_t seed) {
     ensure_meow();
+    read_volume();
+    if (g_volume <= 0.001f) return;   // the slider all the way down: no meow at all
     if (!seed) seed = meow_new_seed();
     // Voice, mood and take, a few of them in case a voice number is not one the
     // game has -- all from the seed, so a miss is the same miss on both peers.

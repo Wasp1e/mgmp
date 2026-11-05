@@ -23,6 +23,11 @@ namespace {
 // realloc (sub_140D4CB38), the way sub_1400483A0 copies such a list.
 constexpr uintptr_t kRva_GoOnAdventure = 0x3B13F0;
 const uint8_t kGoPrologue[8] = { 0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44 };
+// MewDirector::DefendHouse(std::string, CustomVectorInterface<int64> cats),
+// sub_1403B1680, the same box's other way out (sub_1400AE360): the cats go to
+// hold the House, through the gear screen and no chooser. Followed the same way.
+constexpr uintptr_t kRva_DefendHouse = 0x3B1680;
+const uint8_t kDefendPrologue[8] = { 0x4C, 0x89, 0x44, 0x24, 0x18, 0x48, 0x89, 0x54 };
 constexpr uintptr_t kRva_Realloc = 0xD4CB38;
 const uint8_t kReallocThunk[1] = { 0xE9 };
 
@@ -49,6 +54,7 @@ struct StrVec { GameStr* begin; GameStr* end; GameStr* cap; };
 struct KeyVec { uint32_t cap; uint32_t count; uint64_t* data; };
 
 using fn_go      = void* (__fastcall*)(void*, void*, void*, void*);
+using fn_defend  = void* (__fastcall*)(void*, void*, void*);
 using fn_play    = void* (__fastcall*)(void*, void*, void*, double);
 using fn_alloc   = void* (__cdecl*)(size_t);
 using fn_realloc = void* (__cdecl*)(void*, size_t);
@@ -56,6 +62,8 @@ using fn_realloc = void* (__cdecl*)(void*, size_t);
 struct State {
     uintptr_t  base_    = 0;
     fn_go      o_go     = nullptr;
+    fn_defend  o_defend = nullptr;
+    bool       defend   = false;    // client: the pending start is a defense
     fn_play    o_play   = nullptr;
     bool       playing_ours = false;
     bool       cut_pending  = false;
@@ -107,6 +115,36 @@ bool host_with_peer() {
     return net_active() && net_role() == NetRole::Host && net_peer_count() >= 2;
 }
 
+void send_party(void* cats) {
+    KeyVec kv{};
+    uint32_t nk = 0;
+    if (cats && mem_read(cats, &kv, sizeof(kv)) && kv.data) nk = kv.count;
+    if (nk > kMaxParty) nk = kMaxParty;
+    for (uint32_t i = 0; i < nk; ++i) {
+        uint64_t k = 0;
+        mem_read(&kv.data[i], &k, sizeof(k));
+        send(kChoiceRunParty, i, nk, k, nullptr);
+    }
+}
+
+// HOST: the box of cats sent to hold the House.
+void* __fastcall defend_house(void* dir, void* name, void* cats) {
+    if (!g.ours && host_with_peer()) {
+        char s[48];
+        read_str(name, s, sizeof(s));
+        send_party(cats);
+        send(kChoiceRunDefend, 0, 0, 0, s);
+        log_line("STARTRUN", "-> the host's cats defend the House ('%s') -- the other player's"
+                             " game goes to its own gear screen", s);
+    }
+    return g.o_defend(dir, name, cats);
+}
+
+bool safe_defend(void* dir, GameStr* name, KeyVec* cats) {
+    __try { g.o_defend(dir, name, cats); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // HOST: the box of cats goes out as it is confirmed.
 void* __fastcall go_on_adventure(void* dir, void* map, void* collars, void* cats) {
     if (!g.ours && host_with_peer()) {
@@ -125,12 +163,7 @@ void* __fastcall go_on_adventure(void* dir, void* map, void* collars, void* cats
         KeyVec kv{};
         uint32_t nk = 0;
         if (cats && mem_read(cats, &kv, sizeof(kv)) && kv.data) nk = kv.count;
-        if (nk > kMaxParty) nk = kMaxParty;
-        for (uint32_t i = 0; i < nk; ++i) {
-            uint64_t k = 0;
-            mem_read(&kv.data[i], &k, sizeof(k));
-            send(kChoiceRunParty, i, nk, k, nullptr);
-        }
+        send_party(cats);
         send(kChoiceRunStart, 0, 0, 0, name);
         log_line("STARTRUN", "-> the host sets off: '%s', %u collar(s), %u cat(s) -- the other"
                              " player's game opens its own class chooser", name, nc, nk);
@@ -171,8 +204,32 @@ bool make_str(GameStr& s, const char* text) {
     return true;
 }
 
+void defend_after_host() {
+    void* dir = director();
+    if (!dir || !g.party_n || !g.o_defend || !g.realloc_) {
+        log_line("STARTRUN", "!! the host's defense lacks something here -- not followed");
+        return;
+    }
+    GameStr name{};
+    void* keys = nullptr;
+    if (!make_str(name, g.map) || !safe_realloc(g.party_n * sizeof(uint64_t), &keys) || !keys) {
+        log_line("STARTRUN", "!! could not build the host's defense here");
+        return;
+    }
+    memcpy(keys, g.party, g.party_n * sizeof(uint64_t));
+    KeyVec cats{ g.party_n, g.party_n, (uint64_t*)keys };
+    g.ours = true;
+    const bool ok = safe_defend(dir, &name, &cats);
+    g.ours = false;
+    log_line("STARTRUN", ok ? "<- the host's cats defend the House ('%s', %u cat(s)) -- here too,"
+                              " this game's gear screen opens"
+                            : "!! following the host's defense faulted ('%s', %u cat(s))",
+             g.map, g.party_n);
+}
+
 // CLIENT: the host's box of cats, confirmed in this game's House too.
 void go_after_host() {
+    if (g.defend) { defend_after_host(); return; }
     void* dir = director();
     if (!dir || !g.party_n || !g.collars_n || !g.alloc || !g.realloc_) {
         log_line("STARTRUN", "!! the host's start lacks something here (director %p, %u cat(s),"
@@ -269,6 +326,13 @@ void startrun_scene_tick() {
 void startrun_set_base(uintptr_t base) {
     if (g.o_go) return;
     g.base_ = base;
+    void* dh = (void*)(base + kRva_DefendHouse);
+    if (memcmp(dh, kDefendPrologue, 8) != 0 ||
+        MH_CreateHook(dh, (void*)&defend_house, (void**)&g.o_defend) != MH_OK ||
+        MH_EnableHook(dh) != MH_OK) {
+        g.o_defend = nullptr;
+        log_line("STARTRUN", "!! the House defense moved -- the other player does not follow it");
+    }
     void* pc = (void*)(base + kRva_PlayCutscene);
     if (memcmp(pc, kPlayCutscenePrologue, 8) != 0 ||
         MH_CreateHook(pc, (void*)&play_cutscene, (void**)&g.o_play) != MH_OK ||
@@ -303,7 +367,7 @@ void startrun_house_tick() {
 
 bool startrun_on_message(const ChoiceMsg& m) {
     if (m.kind != kChoiceRunParty && m.kind != kChoiceRunStart && m.kind != kChoiceRunCollar &&
-        m.kind != kChoiceRunCutscene)
+        m.kind != kChoiceRunCutscene && m.kind != kChoiceRunDefend)
         return false;
     if (net_role() == NetRole::Host) return true;
     if (m.kind == kChoiceRunCutscene) {
@@ -325,8 +389,16 @@ bool startrun_on_message(const ChoiceMsg& m) {
             strncpy_s(g.collars[m.index], m.name, _TRUNCATE);
             if (m.index + 1 > g.collars_n) g.collars_n = m.index + 1;
         }
+    } else if (m.kind == kChoiceRunDefend) {
+        strncpy_s(g.map, m.name, _TRUNCATE);
+        g.defend     = true;
+        g.pending    = g.o_defend != nullptr;
+        g.pending_at = GetTickCount64();
+        log_line("STARTRUN", "<- the host's cats defend the House ('%s', %u cat(s)) -- following"
+                             " from the House", g.map, g.party_n);
     } else {
         strncpy_s(g.map, m.name, _TRUNCATE);
+        g.defend     = false;
         g.pending    = g.o_go != nullptr;
         g.pending_at = GetTickCount64();
         log_line("STARTRUN", "<- the host confirmed its box of cats ('%s', %u cat(s), %u collar(s))"

@@ -170,6 +170,7 @@ struct State {
     uint64_t scanned_at = 0;
     bool     said_screen = false;
     fn_this  o_inv      = nullptr;
+    fn_this  o_confirm  = nullptr;
     fn_lookup lookup    = nullptr;
     uint64_t run_tried_at = 0;
     fn_parts parts      = nullptr;
@@ -243,6 +244,21 @@ bool safe_rebuild(void* screen) {
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// CLIENT: its gear screen's confirm, <lambda_1> of InventoryScreen2::init
+// (vftable 0xF11D10, _Do_call sub_140351300 -> sub_14034D870), does nothing
+// while the host's gear screen is up: confirmed here it set off this game's own
+// fight or map, and the run or the fight is the host's, by its save. Staying
+// on this screen is also where the host's embark cutscene plays.
+constexpr uintptr_t kRva_GearConfirmSlot = 0xF11D10 + 2 * 8;
+constexpr uintptr_t kRva_GearConfirm     = 0x351300;
+void* __fastcall gear_confirm(void* a, void* b, void* c, void* d) {
+    if (net_role() != NetRole::Host && net_active() && g.active && g.view.phase == 2) {
+        log_line("CLASSPICK", "confirm pressed on this gear screen -- the host confirms, this game follows");
+        return nullptr;
+    }
+    return g.o_confirm(a, b, c, d);
 }
 
 void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
@@ -1275,6 +1291,8 @@ void classpick_set_base(uintptr_t base) {
           "the collar click");
     patch(base, kRva_EmbarkSlot, kRva_Embark, (void*)&embark, g.o_embark,
           "the embark button");
+    patch(base, kRva_GearConfirmSlot, kRva_GearConfirm, (void*)&gear_confirm, g.o_confirm,
+          "the gear screen's confirm");
     if (!patch(base, kRva_InvScreenSlot, kRva_InvScreenTick, (void*)&inv_tick, g.o_inv,
                "the inventory screen"))
         log_line("CLASSPICK", "!! so the other player cannot put gear on their cats");

@@ -17,4 +17,9 @@ uint32_t meow_new_seed();
 // Returns at once; the file is read and played on a thread of its own.
 void meow_play(uint32_t seed);
 
+// The map meows' volume, 0..1 (1 is the level they had before the slider, 0
+// silent). Kept in mgmp_meow.txt beside the mod, so it lasts between games.
+float meow_volume();
+void  meow_set_volume(float v);
+
 } // namespace mgmp

@@ -315,6 +315,16 @@ void handle_hello(uint8_t from, const Hello& h) {
     // and inventory, then the node. The joiner acts on the node the moment it
     // can, and a battle built before its cats arrive is a battle built from the
     // wrong cats.
+    // Not when the save just sent is the host's live run on the map: the fight
+    // the host last entered is over, and re-sending that node and its
+    // decisions put a rejoining friend back into a finished battle, which
+    // halted at its first hash (2026-11-06, node 6, after the post-battle
+    // level-up). The live save already stands where the host does.
+    if (savefile_catchup_was_live()) {
+        log_line("SESSION", "the host is on the map between nodes -- peer %u joins there from"
+                            " the live save, not into the last node", (unsigned)from);
+        return;
+    }
     follow_catchup(from);
 
     // The decisions already taken in the battle it is walking into. Must come

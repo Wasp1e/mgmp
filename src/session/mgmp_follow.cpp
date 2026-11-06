@@ -947,6 +947,11 @@ static void watch_edits() {
 // Each publish sends only what moved, so a chest or a host's equip reaches the
 // client now instead of at the next node. Order matters on the host: its own change
 // goes out first, so the edit it now takes is judged against it.
+void follow_edit_rebase() {
+    Guard guard;
+    g.edit_rebase = true;
+}
+
 void follow_edit_pump() {
     // Half a second, and a change goes out on its second look: 0.5-1 s after it.
     constexpr uint64_t kEveryMs = 500;

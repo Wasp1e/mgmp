@@ -450,11 +450,17 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
     if (!open) night_dismiss();
 }
 
-// The client pressed the end-day sign: a scrap saying whose it is.
-void draw_end_day_note() {
+// A one-line scrap at the top, no buttons, not taking the mouse.
+// `beside_round`: in a fight, top right under the game's turn order (the
+// user's pick, 2026-11-05), not over the round counter; otherwise centred.
+void draw_paper_note(const char* text, bool beside_round = false) {
     const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    if (beside_round)
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f, io.DisplaySize.y * 0.15f),
+                                ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    else
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
+                                ImGuiCond_Always, ImVec2(0.5f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40, 26));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
@@ -466,7 +472,7 @@ void draw_end_day_note() {
         dl->ChannelsSplit(2);
         dl->ChannelsSetCurrent(1);
         if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f);
-        const std::string t = upper_utf8(u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442");
+        const std::string t = upper_utf8(text);
         const ImVec2 sz = ImGui::CalcTextSize(t.c_str());
         const ImVec2 at0 = ImGui::GetCursorScreenPos();
         const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
@@ -1153,7 +1159,16 @@ void ui_on_swap(void* window) {
     uint32_t nights = 0;
     const char* const* night = night_view(&nights);
     const bool refused = night_end_day_refused();
-    g.forced = loading || night || refused;
+    // In a fight: the other player not in it yet (every decision held), or the
+    // cat whose turn it is theirs (its bar greyed) -- a note at the top.
+    const char* note = nullptr;
+    if (refused)
+        note = u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442";
+    else if (lockstep_in_battle() && lockstep_barrier_holding())
+        note = u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e";
+    else if (lockstep_in_battle() && combatlock_engaged())
+        note = u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433";
+    g.forced = loading || night || note;
     if (!g.visible && !g.forced) return;
 
     if (!g.ready) {
@@ -1175,7 +1190,7 @@ void ui_on_swap(void* window) {
     }
     if (loading) draw_loading(step);
     if (night) draw_night(night, nights, loading);
-    else if (refused) draw_end_day_note();
+    else if (note && !loading) draw_paper_note(note, !refused);
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

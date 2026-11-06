@@ -137,6 +137,9 @@ void choice_pump();
 
 void choice_on_message(const ChoiceMsg& m);
 
+// Client: the host's cat as it was before its shop level-up (MSG_CATPRE).
+void choice_on_catpre(const CatDataMsg& m);
+
 // This peer has ENTERED the node with this seed. Called by mgmp_follow from
 // remember_node, on both peers, whenever the node actually changes.
 //

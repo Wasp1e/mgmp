@@ -167,6 +167,7 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
         case MSG_LOGFILE:   return dec_logfile(r, m.logfile);
         case MSG_NIGHT:     return dec_logfile(r, m.night);
+        case MSG_CATPRE:    return dec_catdata(r, m.catpre);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
         case MSG_PEERS:   return dec_peers(r, m.peers);
@@ -742,6 +743,17 @@ bool net_send_catdata(const CatDataMsg& m) {
     return ok;
 }
 
+bool net_send_catpre(const CatDataMsg& m) {
+    const uint32_t need = catdata_frame_size(m);
+    if (need > kMaxFrame) return false;
+    uint8_t* p = (uint8_t*)malloc(need);
+    if (!p) return false;
+    const uint32_t n = enc_catdata(p, need, m, MSG_CATPRE);
+    const bool ok = n && net_send(p, n);
+    free(p);
+    return ok;
+}
+
 bool net_send_runhist(const RunHistMsg& m) {
     uint32_t need = runhist_frame_size(m);
     if (need > kMaxFrame) {
@@ -808,6 +820,7 @@ void net_msg_release(NetMsg& m) {
     if (m.statedump.data){ free(m.statedump.data);m.statedump.data= nullptr; }
     if (m.logfile.data)  { free(m.logfile.data);  m.logfile.data  = nullptr; }
     if (m.night.data)    { free(m.night.data);    m.night.data    = nullptr; }
+    if (m.catpre.data)   { free(m.catpre.data);   m.catpre.data   = nullptr; }
     for (uint32_t i = 0; i < kInvBuckets; ++i)
         if (m.inventory.data[i]) { free(m.inventory.data[i]); m.inventory.data[i] = nullptr; }
 }
@@ -827,6 +840,7 @@ bool net_poll(NetMsg& out) {
         g.queue[g.head].statedump.data = nullptr;
         g.queue[g.head].logfile.data   = nullptr;
         g.queue[g.head].night.data     = nullptr;
+        g.queue[g.head].catpre.data    = nullptr;
         for (uint32_t i = 0; i < kInvBuckets; ++i)
             g.queue[g.head].inventory.data[i] = nullptr;
         g.head = (g.head + 1) % kQueueCap;

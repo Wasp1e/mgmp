@@ -103,6 +103,13 @@ bool catsync_apply_pending(const char* why);
 // choice layers carry, which is not the registry's.
 void* catsync_cat_by_uid(uint64_t uid);
 
+// A cat as the game serializes it, into a buffer the caller frees; 0 on failure.
+uint32_t catsync_serialize(void* cat, uint8_t** out);
+// That cat as a push carries it (key, bytes, hash); m.data is the caller's to free.
+bool     catsync_snapshot(void* cat, CatDataMsg& m);
+// That serialization written back into this peer's cat of the same id, now.
+void     catsync_apply_now(const CatDataMsg& m, const char* why);
+
 // The CatData+0 of every cat in the run. 0 if any of them cannot be read.
 uint32_t catsync_run_uids(uint64_t* out, uint32_t max);
 

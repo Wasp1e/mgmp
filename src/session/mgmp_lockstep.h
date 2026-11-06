@@ -112,6 +112,13 @@ bool lockstep_cat_mine(uint64_t id);
 // the table has not seen belongs to nobody yet, so this is false for it.
 bool lockstep_cat_theirs(uint64_t id);
 
+// True when the owner table has cat `id` at all (a cat of this run's party).
+bool lockstep_cat_known(uint64_t id);
+
+// The owner table's rows, up to `cap`; and one row set (the client, from the host).
+uint32_t lockstep_owners_copy(uint64_t* ids, uint8_t* pos, uint32_t cap);
+void     lockstep_owner_put(uint64_t id, uint8_t pos);
+
 // Host: deals these cats out by the battle rule and records it in the owner
 // table, so the run's battles keep the split. out[i] is the owner's position.
 void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out);
@@ -174,6 +181,10 @@ bool lockstep_halted();
 // mgmp_catsync and mgmp_invsync gate their apply paths on it. See the note on
 // catsync_on_message for the shield that got through before they did.
 bool lockstep_in_battle();
+
+// The join barrier is holding every decision: the other player is not in this
+// battle yet (for the "waiting" note on screen).
+bool lockstep_barrier_holding();
 
 // The aim preview writes Character+0x388, and the backstab test reads it, so a
 // wall-clock-gated presentation write decides damage. Call `begin` on entry to

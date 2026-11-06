@@ -24,6 +24,10 @@
 #include <cstring>
 
 namespace mgmp {
+// The last catch-up copy was the host's live run, flushed on the map (see
+// savefile_catchup_was_live).
+bool g_catchup_live = false;
+
 namespace {
 
 // SaveSelection+0x38 is a std::vector<std::string>: { begin@0x38, end@0x40,
@@ -541,6 +545,7 @@ bool publish(uint8_t to, uint8_t fresh) {
 
     bool ok = (to == kNoPeer) ? net_send_savefile(m) : net_send_savefile_to(to, m);
     free(data);
+    if (to != kNoPeer) g_catchup_live = ok && flushed;
     if (!ok) {
         log_line("SAVEFILE", "!! failed to send %s (%u bytes)", g.name, size);
         return false;
@@ -1213,5 +1218,7 @@ void savefile_on_button_update(void* button) {
     // reason and would hide a refusal we want to hear about.
     g.button_click(button, false);
 }
+
+bool savefile_catchup_was_live() { return g_catchup_live; }
 
 } // namespace mgmp

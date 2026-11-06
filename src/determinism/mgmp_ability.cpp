@@ -2,6 +2,8 @@
 
 #include "mgmp_mem.h"
 
+#include <windows.h>
+#include <cstdio>
 #include <cstring>
 
 namespace mgmp {
@@ -103,6 +105,63 @@ bool ability_gon_name(const void* ability, char* out, size_t out_size) {
     if (!mem_read(chars, out, (size_t)size)) { out[0] = 0; return false; }
     out[size] = 0;
     return true;
+}
+
+namespace {
+// Character's list of every usable ability: rebuilds Character+0xE90 (a
+// CustomVector<Ability*>) and returns its address.
+constexpr uintptr_t kRva_AllAbilities = 0x117FC0;
+const uint8_t kAllAbilitiesPrologue[8] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48 };
+using fn_all_abilities = void* (__fastcall*)(void*);
+
+void* all_abilities(void* character) {
+    static fn_all_abilities fn = nullptr;
+    static int checked = 0;
+    if (!checked) {
+        checked = 1;
+        const uint8_t* p = (const uint8_t*)GetModuleHandleW(nullptr) + kRva_AllAbilities;
+        uint8_t got[8] = {};
+        if (mem_read(p, got, sizeof(got)) && memcmp(got, kAllAbilitiesPrologue, 8) == 0)
+            fn = (fn_all_abilities)p;
+    }
+    if (!fn || !character) return nullptr;
+    __try { return fn(character); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+} // namespace
+
+void* ability_find_by_name(void* character, const char* gon, char* seen, size_t seen_size) {
+    if (seen && seen_size) seen[0] = 0;
+    if (!character || !gon || !gon[0]) return nullptr;
+    char nm[64];
+    const size_t fixed[3] = { kCharAbilMove, kCharAbilAttack, kCharAbilBonus };
+    for (size_t off : fixed) {
+        void* a = (void*)read_ptr(character, off);
+        if (a && ability_gon_name(a, nm, sizeof(nm)) && strcmp(nm, gon) == 0) return a;
+    }
+    uint32_t    count = read_u32(character, kCharSpellCount);
+    const void* data  = read_ptr(character, kCharSpellData);
+    if (count > kMaxSpellSlots) count = kMaxSpellSlots;
+    for (uint32_t i = 0; data && i < count; ++i) {
+        void* a = nullptr;
+        if (!mem_read((const uint8_t*)data + i * sizeof(void*), &a, sizeof(a))) break;
+        if (a && ability_gon_name(a, nm, sizeof(nm)) && strcmp(nm, gon) == 0) return a;
+    }
+    const void* list = all_abilities(character);
+    if (!list) return nullptr;
+    uint32_t    n  = read_u32(list, 4);
+    const void* el = read_ptr(list, 8);
+    if (n > kMaxSpellSlots) n = kMaxSpellSlots;
+    size_t at = 0;
+    for (uint32_t i = 0; el && i < n; ++i) {
+        void* a = nullptr;
+        if (!mem_read((const uint8_t*)el + i * sizeof(void*), &a, sizeof(a))) break;
+        if (!a || !ability_gon_name(a, nm, sizeof(nm))) continue;
+        if (strcmp(nm, gon) == 0) return a;
+        if (seen && at + 1 < seen_size)
+            at += _snprintf_s(seen + at, seen_size - at, _TRUNCATE, "%s%s", at ? ", " : "", nm);
+    }
+    return nullptr;
 }
 
 void* current_actor(const void* turn_control) {

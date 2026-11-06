@@ -8,6 +8,8 @@
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"
 #include "mgmp_startrun.h"
+#include "mgmp_leave.h"
+#include "mgmp_savefile.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -229,6 +231,8 @@ bool inv_up() { return g.o_inv && GetTickCount64() - g.inv_at < kGoneMs; }
 void apply_equips();
 
 bool apply_gear();
+bool run_gear();
+uint64_t key_of(void* cat);
 
 // What the gear screen's sort buttons call after re-sorting (the storage
 // grid's sub_14034AA00, then sub_14034B620): the screen built again from the
@@ -261,19 +265,24 @@ void* __fastcall gear_confirm(void* a, void* b, void* c, void* d) {
     return g.o_confirm(a, b, c, d);
 }
 
+void dim_slots(void* screen);
+void dim_tag(void* tag);
+
 void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
     g.inv_at = GetTickCount64();
     if (net_role() != NetRole::Host) startrun_scene_tick();
     if (net_role() != NetRole::Host && g.gear_n && apply_gear() && !safe_rebuild(a))
         log_line("CLASSPICK", "!! rebuilding this game's gear screen faulted");
     // The friend's gear, put on from inside the screen's own update.
-    if (net_role() == NetRole::Host && g.phase == 2 && g.equipped) {
+    if (net_role() == NetRole::Host && (g.phase == 2 || run_gear()) && g.equipped) {
         apply_equips();
         // The friend's items moved under this screen too: built again, as the
         // client's is (else they showed only at the host's next click).
         if (!safe_rebuild(a)) log_line("CLASSPICK", "!! rebuilding the gear screen faulted");
     }
-    return g.o_inv(a, b, c, d);
+    void* r = g.o_inv(a, b, c, d);
+    dim_slots(a);
+    return r;
 }
 
 void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
@@ -283,6 +292,7 @@ void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
         g.seen    = GetTickCount64();
     }
     void* r = g.o_tick(a, b, c, d);
+    dim_tag(a);
     if (net_role() != NetRole::Host) startrun_scene_tick();
     // From inside the chooser's own update: the embark may ask its popup (a cat
     // with no collar), and a popup outside a scene's update faults -- the
@@ -486,6 +496,7 @@ bool __fastcall slot_locked(void* cat, int slot) {
     // locked. The client's are refused at the equip itself, not drawn crossed.
     if (net_role() != NetRole::Host && g.active && g.view.phase == 2) return r;
     if (host_gear_screen()) return r;
+    if (run_gear()) return r;   // refused at the equip, as before the run
     uint64_t uid = 0;
     if (!mem_read(cat, &uid, sizeof(uid)) || !lockstep_cat_theirs(uid)) return r;
     if (said_locked != uid) {
@@ -514,6 +525,51 @@ bool client_watches(uintptr_t ret) {
            net_active() && g.active && g.view.phase == 2;
 }
 
+// IN A RUN the backpack goes the way the gear screen before it does: each move
+// as it is made, each player dressing their own cats, the host's game moving
+// every item. The whole bag sent once the host's backpack closed made the
+// friend wait for the host (2026-11-06).
+bool in_a_run() { return leave_in_run() || savefile_adventure_is_loaded(); }
+
+bool run_gear() {
+    return net_active() && net_peer_count() >= 2 && in_a_run() && !lockstep_in_battle() &&
+           (net_role() == NetRole::Host ? g.phase != 2 : !(g.active && g.view.phase == 2));
+}
+
+// 1 this player's cat in the run, 0 the other player's, -1 neither.
+int run_owner(void* cat) {
+    uint64_t uid = 0;
+    if (!cat || !mem_read(cat, &uid, sizeof(uid)) || !uid) return -1;
+    if (lockstep_cat_theirs(uid)) return 0;
+    return lockstep_cat_known(uid) ? 1 : -1;
+}
+
+// CLIENT: a move onto or off its own cat, asked of the host.
+void ask_equip(void* cat, void* item, int list) {
+    int kind = -1;
+    if (!cat || !item || !safe_kind(item, &kind)) return;
+    ChoiceMsg m{};
+    m.kind      = kChoiceClassEquip;
+    m.cat       = key_of(cat);
+    mem_read(item, &m.node_seed, sizeof(m.node_seed));
+    m.aux       = (uint32_t)(kind & 0xFF) | ((uint32_t)(list & 0xFF) << 8);
+    mem_read_std_string((const uint8_t*)item + kItem_Key, m.name, sizeof(m.name));
+    net_send_choice(m);
+    log_line("CLASSPICK", "-> asked the host to put '%s' on cat %016llx", m.name,
+             (unsigned long long)m.cat);
+}
+void ask_unequip(void* cat, void* item, int list) {
+    int kind = -1;
+    if (!cat || !item || !safe_kind(item, &kind) || kind < 0 || kind >= (int)kClassPickSlots) return;
+    ChoiceMsg m{};
+    m.kind = kChoiceClassUnequip;
+    m.cat  = key_of(cat);
+    m.aux  = (uint32_t)kind | ((uint32_t)((list & 0xFF) + 1) << 8);   // +1: a list given
+    net_send_choice(m);
+    log_line("CLASSPICK", "-> asked the host to take slot %d off cat %016llx", kind,
+             (unsigned long long)m.cat);
+}
+
 bool safe_kind(void* item, int* out);
 int cat_index(uint64_t key);
 
@@ -529,29 +585,140 @@ bool friends_on_host(void* cat) {
     return ci >= 0 && g.owner[ci];
 }
 
+// THE OTHER PLAYER'S CAT, DIMMED. The screen's update (slot 10, sub_14034D130)
+// reads the cat it shows from +0x108 (a registry key) and shows or hides the
+// "lock_<slot>" clips in two views, +0x40 and +0x48: UI objects whose +0x38 is
+// their node map (sub_14005A100 by name, a const std::string&). Those clips sit
+// in the slots' panel (the UI swf's sprite 3652: the frames and the locks), so
+// that panel's node -- a lock's parent, node+0x38 -- is darkened through its
+// colour transform: node+0x78, mul RGBA then add RGBA, floats (the node's
+// constructor, sub_1409B08C0, sets 1,1,1,1, 0,0,0,0).
+constexpr uintptr_t kRva_NodeByName = 0x5A100;
+constexpr size_t    kInv_CatKey  = 0x108;
+constexpr size_t    kInv_View[2] = { 0x40, 0x48 };
+constexpr size_t    kView_Nodes  = 0x38;
+constexpr size_t    kNode_Parent = 0x38;
+constexpr size_t    kNode_Color  = 0x78;
+constexpr float     kDim         = 0.4f;
+using fn_node_by_name = void* (__fastcall*)(void*, const void*);
+void* cat_by_key(uint64_t key);
+
+struct MsString { char buf[16]; uint64_t size; uint64_t cap; };
+
+void* safe_node(void* map, const MsString* s) {
+    __try { return ((fn_node_by_name)(g.base + kRva_NodeByName))(map, s); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// Whether the cat with this key is the other player's to dress, here and now.
+bool theirs_to_dress(uint64_t key) {
+    if (!key || !net_active()) return false;
+    if (net_role() != NetRole::Host && g.active && g.view.phase == 2) return view_mine(key) == 0;
+    void* cat = cat_by_key(key);
+    if (!cat) return false;
+    if (host_gear_screen()) return friends_on_host(cat);
+    return run_gear() && run_owner(cat) == 0;
+}
+
+// The parent of the node named `child` in a UI object's node map (view+0x38),
+// dimmed or back to full. True if it changed.
+bool dim_parent_of(void* view, const char* child, bool dim) {
+    const float want = dim ? kDim : 1.0f;
+    MsString name{};
+    strcpy_s(name.buf, child);
+    name.size = strlen(name.buf);
+    name.cap  = 15;
+    void* map = nullptr;
+    if (!view || !mem_read((const uint8_t*)view + kView_Nodes, &map, sizeof(map)) || !map)
+        return false;
+    void* node = safe_node(map, &name);
+    void* panel = nullptr;
+    if (!node || !mem_read((const uint8_t*)node + kNode_Parent, &panel, sizeof(panel)) || !panel)
+        return false;
+    float ct[8] = {};
+    if (!mem_read((const uint8_t*)panel + kNode_Color, ct, sizeof(ct))) return false;
+    // Only a transform this has set or the constructor's: one the game's own
+    // tweens are running is left alone.
+    const bool plain = (ct[0] == 1.0f || ct[0] == kDim) && ct[0] == ct[1] && ct[1] == ct[2] &&
+                       ct[4] == 0.0f && ct[5] == 0.0f && ct[6] == 0.0f;
+    if (!plain || ct[0] == want) return false;
+    ct[0] = ct[1] = ct[2] = want;
+    return mem_write((uint8_t*)panel + kNode_Color, ct, sizeof(float) * 3);
+}
+
+// THE CLASS CHOOSER, the same way: each collar's box (ClassTagBox, its update
+// sub_1401402A0) keeps its picture in the UI object at +0x48, a "bg" node in
+// its node map, whose parent is the box's. While the cat on screen
+// (chooser+0xD0) is the other player's, every collar is dimmed: none is this
+// player's to put on it.
+constexpr size_t kTagBox_View = 0x48;
+
+bool chooser_cat_theirs(uint64_t key) {
+    if (!key || key == kFree || !net_active()) return false;
+    if (net_role() != NetRole::Host) return g.active && view_mine(key) == 0;
+    if (net_peer_count() < 2) return false;
+    const int ci = cat_index(key);
+    return ci >= 0 && g.owner[ci];
+}
+
+void dim_tag(void* tag) {
+    static uint64_t said_key = 0;
+    if (!tag || !g.base) return;
+    void* ch = nullptr;
+    void* view = nullptr;
+    if (!mem_read((const uint8_t*)tag + kTag_Chooser, &ch, sizeof(ch)) || !ch ||
+        !mem_read((const uint8_t*)tag + kTagBox_View, &view, sizeof(view)) || !view)
+        return;
+    const uint64_t key = current_cat(ch);
+    const bool dim = chooser_cat_theirs(key);
+    if (dim_parent_of(view, "bg", dim) && key != said_key) {
+        said_key = key;
+        log_line("CLASSPICK", "%s the collars for cat %016llx", dim ? "dimmed" : "undimmed",
+                 (unsigned long long)key);
+    }
+}
+
+void dim_slots(void* screen) {
+    static uint64_t said_key = 0;
+    static bool     said_dim = false;
+    if (!screen || !g.base) return;
+    uint64_t key = 0;
+    if (!mem_read((const uint8_t*)screen + kInv_CatKey, &key, sizeof(key))) return;
+    const bool dim = theirs_to_dress(key);
+    bool changed = false;
+    for (size_t v : kInv_View) {
+        void* view = nullptr;
+        if (mem_read((const uint8_t*)screen + v, &view, sizeof(view)) && view &&
+            dim_parent_of(view, "lock_weapon", dim))
+            changed = true;
+    }
+    if (changed && (key != said_key || dim != said_dim)) {
+        said_key = key;
+        said_dim = dim;
+        log_line("CLASSPICK", "%s cat %016llx's slots", dim ? "dimmed the other player's" : "undimmed",
+                 (unsigned long long)key);
+    }
+}
+
 bool __fastcall equip_hook(void* cat, void* item, int list, int flag) {
     const uintptr_t ret = (uintptr_t)_ReturnAddress() - g.base;
     // Each player dresses their own cats; the host's game alone moves an item,
     // so one is never in two places. The client's drop on its own cat is asked
     // of the host and shows when the host's answer comes back as a move.
     if (client_watches(ret)) {
-        int kind = -1;
-        if (cat && item && view_mine(key_of(cat)) == 1 && safe_kind(item, &kind)) {
-            ChoiceMsg m{};
-            m.kind      = kChoiceClassEquip;
-            m.cat       = key_of(cat);
-            mem_read(item, &m.node_seed, sizeof(m.node_seed));
-            m.aux       = (uint32_t)(kind & 0xFF) | ((uint32_t)(list & 0xFF) << 8);
-            mem_read_std_string((const uint8_t*)item + kItem_Key, m.name, sizeof(m.name));
-            net_send_choice(m);
-            log_line("CLASSPICK", "-> asked the host to put '%s' on cat %016llx", m.name,
-                     (unsigned long long)m.cat);
-        }
+        if (cat && item && view_mine(key_of(cat)) == 1) ask_equip(cat, item, list);
         return false;
     }
-    if (ret >= kInvCodeFrom && ret < kInvCodeTo && host_gear_screen() && friends_on_host(cat))
+    const bool in_inv = ret >= kInvCodeFrom && ret < kInvCodeTo;
+    const int  owner  = in_inv && run_gear() ? run_owner(cat) : -1;
+    if (owner >= 0 && net_role() != NetRole::Host) {
+        if (owner == 1) ask_equip(cat, item, list);
+        return false;
+    }
+    if (owner == 0) return false;   // the host's backpack, the friend's cat
+    if (in_inv && host_gear_screen() && friends_on_host(cat))
         return false;   // the friend's cat: theirs to dress
-    const bool watch = cat && item && ret >= kInvCodeFrom && ret < kInvCodeTo && host_gear_screen();
+    const bool watch = cat && item && in_inv && (host_gear_screen() || owner == 1);
     uint64_t id = 0;
     char key[48] = {};
     if (watch) {
@@ -577,22 +744,19 @@ bool __fastcall equip_hook(void* cat, void* item, int list, int flag) {
 bool __fastcall unequip_hook(void* cat, void* item, int list, int flag) {
     const uintptr_t ret = (uintptr_t)_ReturnAddress() - g.base;
     if (client_watches(ret)) {
-        int kind = -1;
-        if (cat && item && view_mine(key_of(cat)) == 1 && safe_kind(item, &kind) && kind >= 0 &&
-            kind < (int)kClassPickSlots) {
-            ChoiceMsg m{};
-            m.kind = kChoiceClassUnequip;
-            m.cat  = key_of(cat);
-            m.aux  = (uint32_t)kind | ((uint32_t)((list & 0xFF) + 1) << 8);   // +1: a list given
-            net_send_choice(m);
-            log_line("CLASSPICK", "-> asked the host to take slot %d off cat %016llx", kind,
-                     (unsigned long long)m.cat);
-        }
+        if (cat && item && view_mine(key_of(cat)) == 1) ask_unequip(cat, item, list);
         return false;
     }
-    if (ret >= kInvCodeFrom && ret < kInvCodeTo && host_gear_screen() && friends_on_host(cat))
+    const bool in_inv = ret >= kInvCodeFrom && ret < kInvCodeTo;
+    const int  owner  = in_inv && run_gear() ? run_owner(cat) : -1;
+    if (owner >= 0 && net_role() != NetRole::Host) {
+        if (owner == 1) ask_unequip(cat, item, list);
         return false;
-    const bool watch = cat && item && ret >= kInvCodeFrom && ret < kInvCodeTo && host_gear_screen();
+    }
+    if (owner == 0) return false;
+    if (in_inv && host_gear_screen() && friends_on_host(cat))
+        return false;
+    const bool watch = cat && item && in_inv && (host_gear_screen() || owner == 1);
     uint64_t id = 0;
     char key[48] = {};
     if (watch) {
@@ -915,10 +1079,28 @@ void slot_name(uint32_t cat, uint32_t kind, char* out, size_t cap) {
     mem_read_std_string(slot + kItem_Key, out, cap);
 }
 
+void* cat_by_key(uint64_t key);
+
+// HOST: the friend's cat a move of theirs names, and its name for the log.
+void* friends_cat(uint64_t key, char* nm, size_t cap) {
+    nm[0] = 0;
+    void* cat = nullptr;
+    if (g.phase != 2 && run_gear()) {
+        cat = cat_by_key(key);
+        if (cat && run_owner(cat) != 0) cat = nullptr;
+        if (cat) read_wstring((const uint8_t*)cat + kCat_Name, nm, cap);
+        return cat;
+    }
+    const int ci = cat_index(key);
+    cat = ci >= 0 && g.owner[ci] ? run_cat((uint32_t)ci) : nullptr;
+    if (cat) strncpy_s(nm, cap, g.name[ci], _TRUNCATE);
+    return cat;
+}
+
 void apply_equip(const Equip& e) {
-    const int ci = cat_index(e.key);
-    void* cat = ci >= 0 ? run_cat((uint32_t)ci) : nullptr;
-    if (ci < 0 || !g.owner[ci] || !cat || e.list > 1 || e.kind >= kClassPickSlots) {
+    char nm[48];
+    void* cat = friends_cat(e.key, nm, sizeof(nm));
+    if (!cat || e.list > 1 || e.kind >= kClassPickSlots) {
         log_line("CLASSPICK", "!! refused the other player's '%s' -- not their cat", e.name);
         return;
     }
@@ -934,11 +1116,11 @@ void apply_equip(const Equip& e) {
     if (!safe_kind(found, &kind) || kind != e.kind ||
         !safe_locked(cat, kind, &locked) || locked) {
         log_line("CLASSPICK", "'%s' cannot go on '%s' -- the slot is locked or the item moved",
-                 e.name, g.name[ci]);
+                 e.name, nm);
         return;
     }
     if (!safe_equip(cat, found, e.list, &ok) || !ok) {
-        log_line("CLASSPICK", "!! the game would not put '%s' on '%s'", e.name, g.name[ci]);
+        log_line("CLASSPICK", "!! the game would not put '%s' on '%s'", e.name, nm);
         return;
     }
     {
@@ -953,7 +1135,7 @@ void apply_equip(const Equip& e) {
     char real[48] = {};
     read_wstring((const uint8_t*)cat + kCat_Name, real, sizeof(real));
     log_line("CLASSPICK", "<- the other player put '%s' on '%s' (slot %u; the game's cat '%s')",
-             e.name, g.name[ci], (unsigned)kind, real);
+             e.name, nm, (unsigned)kind, real);
     g.sent_hash = 0;
 }
 
@@ -963,9 +1145,9 @@ bool safe_unequip(void* cat, void* item, int list, bool* out) {
 }
 
 void apply_unequip(const Equip& e) {
-    const int ci = cat_index(e.key);
-    void* cat = ci >= 0 ? run_cat((uint32_t)ci) : nullptr;
-    if (ci < 0 || !g.owner[ci] || !cat || e.kind >= kClassPickSlots || !g.unequip) {
+    char nm[48];
+    void* cat = friends_cat(e.key, nm, sizeof(nm));
+    if (!cat || e.kind >= kClassPickSlots || !g.unequip) {
         log_line("CLASSPICK", "!! refused taking an item off -- not the other player's cat");
         return;
     }
@@ -976,11 +1158,11 @@ void apply_unequip(const Equip& e) {
     mem_read_std_string(slot + kItem_Key, key, sizeof(key));
     bool locked = true, ok = false;
     if (!safe_locked(cat, e.kind, &locked) || locked) {
-        log_line("CLASSPICK", "'%s' cannot come off '%s' -- the slot is locked", key, g.name[ci]);
+        log_line("CLASSPICK", "'%s' cannot come off '%s' -- the slot is locked", key, nm);
         return;
     }
     if (!safe_unequip(cat, slot, e.list, &ok) || !ok) {
-        log_line("CLASSPICK", "!! the game would not take '%s' off '%s'", key, g.name[ci]);
+        log_line("CLASSPICK", "!! the game would not take '%s' off '%s'", key, nm);
         return;
     }
     {
@@ -993,7 +1175,7 @@ void apply_unequip(const Equip& e) {
         net_send_choice(m);
     }
     log_line("CLASSPICK", "<- the other player took '%s' off '%s', into the storage", key,
-             g.name[ci]);
+             nm);
     g.sent_hash = 0;
 }
 
@@ -1165,6 +1347,8 @@ bool apply_gear() {
         }
     }
     g.gear_n = 0;
+    // Moved here by the host: not this player's edit for the bag sync to send.
+    if (any) follow_edit_rebase();
     return any;
 }
 
@@ -1199,6 +1383,24 @@ void forget_cats() {
 // handed out are kept between the two.
 void host_pump() {
     const uint64_t now = GetTickCount64();
+    // The owner table, for the client's backpack.
+    static uint64_t owners_at = 0;
+    if (now - owners_at > 2000 && net_active() && net_peer_count() >= 2 && in_a_run()) {
+        owners_at = now;
+        uint64_t ids[16];
+        uint8_t  pos[16];
+        const uint32_t n = lockstep_owners_copy(ids, pos, 16);
+        for (uint32_t i = 0; i < n; ++i) {
+            ChoiceMsg m{};
+            m.kind = kChoiceRunOwner;
+            m.cat  = ids[i];
+            m.aux  = pos[i];
+            net_send_choice(m);
+        }
+    }
+    // The friend's backpack moves, with this game's backpack down (up, they go
+    // from inside its update, see inv_tick).
+    if (g.equipped && !inv_up() && g.phase != 2 && run_gear()) apply_equips();
     uint8_t phase = 0;
     // Not the backpack on the map, nor anything in a fight: those are the run's
     // own inventory, which the cat sync already carries.
@@ -1393,6 +1595,7 @@ void follow_embark() {
 void classpick_pump() {
     if (!g.o_tick || !g.o_click) return;
     if (net_role() == NetRole::Host) { host_pump(); return; }
+    if (g.gear_n && !inv_up() && run_gear()) apply_gear();
     mirror_host();
     if (g.active && GetTickCount64() - g.last_end > kStaleMs) {
         g.active = false;
@@ -1404,9 +1607,14 @@ bool classpick_on_message(const ChoiceMsg& m) {
     if ((m.kind < kChoiceClassCat || m.kind > kChoiceClassEquip) &&
         m.kind != kChoiceClassStats && m.kind != kChoiceClassUnequip && m.kind != kChoiceClassMuts &&
         m.kind != kChoiceClassBonus && m.kind != kChoiceClassWear &&
-        m.kind != kChoiceGearOn && m.kind != kChoiceGearOff)
+        m.kind != kChoiceGearOn && m.kind != kChoiceGearOff && m.kind != kChoiceRunOwner)
         return false;
     const bool host = net_role() == NetRole::Host;
+
+    if (m.kind == kChoiceRunOwner) {
+        if (!host) lockstep_owner_put(m.cat, (uint8_t)m.aux);
+        return true;
+    }
 
     if (m.kind == kChoiceClassPick || m.kind == kChoiceClassWear) {
         if (!host) return true;

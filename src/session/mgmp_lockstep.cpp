@@ -1365,7 +1365,10 @@ const char* barrier_blocking() {
     return barrier_decide(f);
 }
 
+uint64_t g_barrier_at = 0;   // the last poll the join barrier held, for the panel's note
+
 void barrier_wait_tick(const char* why) {
+    g_barrier_at = GetTickCount64();
     if (g.barrier_waits == 0)
         log_line("LOCKSTEP", "join barrier: holding every decision until both peers"
                              " are in battle %u -- %s", g.epoch, why);
@@ -2449,6 +2452,10 @@ void lockstep_pump() {
                 catsync_on_message(m.catdata);
                 break;
 
+            case MSG_CATPRE:
+                choice_on_catpre(m.catpre);
+                break;
+
             // Run state as well, and not epoch-gated for the same reason.
             case MSG_INVENTORY:
                 invsync_on_message(m.inventory);
@@ -2837,6 +2844,18 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     if (msg.type == TA_Ability) {
         AbilitySlot slot{ msg.slot_kind, msg.slot_index };
         a.ability = ability_from_slot(actor, slot);
+        if (!a.ability && slot.kind == SLOT_UNKNOWN && msg.gon[0]) {
+            // Not in a slot on the sender either: one a status lends the cat
+            // (the Dybbuk's punch). The same status is on this board's cat.
+            char seen[256];
+            a.ability = ability_find_by_name((void*)actor, msg.gon, seen, sizeof(seen));
+            if (a.ability)
+                log_line("LOCKSTEP", "cat %u's '%s' is in no slot -- found it by name",
+                         (unsigned)cat, msg.gon);
+            else
+                log_line("LOCKSTEP", "!! cat %u has no '%s' by name either (its list: %s)",
+                         (unsigned)cat, msg.gon, seen[0] ? seen : "-");
+        }
         if (!a.ability) {
             char why[192];
             _snprintf_s(why, sizeof(why), _TRUNCATE,
@@ -3260,6 +3279,30 @@ bool lockstep_cat_theirs(uint64_t id) {
     return row >= 0 && g.owners.pos[row] < players && g.owners.pos[row] != net_peer_pos();
 }
 
+uint32_t lockstep_owners_copy(uint64_t* ids, uint8_t* pos, uint32_t cap) {
+    Guard guard;
+    if (!g.owners.count) owners_load();
+    uint32_t n = g.owners.count < cap ? g.owners.count : cap;
+    for (uint32_t i = 0; i < n; ++i) { ids[i] = g.owners.id[i]; pos[i] = g.owners.pos[i]; }
+    return n;
+}
+
+void lockstep_owner_put(uint64_t id, uint8_t pos) {
+    Guard guard;
+    if (!id) return;
+    const int row = g.owners.find(id);
+    if (row >= 0) { g.owners.pos[row] = pos; return; }
+    if (g.owners.count >= kMaxOwners) return;
+    g.owners.id[g.owners.count]  = id;
+    g.owners.pos[g.owners.count] = pos;
+    ++g.owners.count;
+}
+
+bool lockstep_cat_known(uint64_t id) {
+    Guard guard;
+    return id && g.owners.find(id) >= 0;
+}
+
 void lockstep_claim_cats(const uint64_t* ids, uint32_t n, uint8_t* out) {
     Guard guard;
     const uint32_t P = net_peer_count();
@@ -3332,6 +3375,12 @@ LockstepStats lockstep_stats() {
     LockstepStats s = g.stats;
     s.pending = g.pend_count;
     return s;
+}
+
+// Whether the join barrier is holding this battle's decisions right now: a
+// poll it held in the last half second.
+bool lockstep_barrier_holding() {
+    return g_barrier_at && GetTickCount64() - g_barrier_at < 500;
 }
 
 } // namespace mgmp

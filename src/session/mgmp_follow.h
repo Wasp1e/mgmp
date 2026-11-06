@@ -68,6 +68,10 @@ void* follow_map_update(void* map_screen);
 // Every frame in a session: the client's equipment edits. See follow_edit_pump.
 void follow_edit_pump();
 
+// CLIENT: the equipment just changed by the host's doing (a backpack move it
+// sent): the next look takes it as the base, not as this player's edit.
+void follow_edit_rebase();
+
 void follow_on_message(const EnterNodeMsg& m);
 
 // A player's pick of the next map node, kChoiceNode. The host enters a node only

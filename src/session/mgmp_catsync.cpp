@@ -761,4 +761,18 @@ void catsync_on_message(const CatDataMsg& m) {
     apply_now(m, "on arrival");
 }
 
+uint32_t catsync_serialize(void* cat, uint8_t** out) { return serialize_cat(cat, out); }
+
+// One cat as a push carries it: the run list's key (CatData+0xC48, what
+// apply_now looks up), the game's bytes, their fnv1a. The caller frees m.data.
+bool catsync_snapshot(void* cat, CatDataMsg& m) {
+    m = CatDataMsg{};
+    if (!cat || !mem_read((const uint8_t*)cat + 0xC48, &m.id, sizeof(m.id)) || !m.id) return false;
+    m.size = serialize_cat(cat, &m.data);
+    if (!m.size) return false;
+    m.hash = fnv1a(m.data, m.size);
+    return true;
+}
+void     catsync_apply_now(const CatDataMsg& m, const char* why) { apply_now(m, why); }
+
 } // namespace mgmp

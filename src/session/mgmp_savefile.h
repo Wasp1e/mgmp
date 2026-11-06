@@ -86,6 +86,11 @@ void savefile_set_base(uintptr_t base);
 // the host has not published yet, or on a client.
 void savefile_catchup(uint8_t peer);
 
+// Whether the copy that catch-up just sent was the host's live run, flushed on
+// the map between nodes -- the joiner then stands where the host does, and is
+// not to be sent into the node the host has finished.
+bool savefile_catchup_was_live();
+
 // HOST, from follow_on_enter_node: the run's first node after the House. The
 // client is still standing in the House and has no map to follow onto, so the
 // run goes out as a fresh save ahead of the node. No-op otherwise.

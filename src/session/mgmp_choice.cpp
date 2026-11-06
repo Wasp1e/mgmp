@@ -16,6 +16,8 @@
 #include "mgmp_log.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
+#include "mgmp_rng.h"
+#include "MinHook.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -188,6 +190,24 @@ struct State {
     fn_scene_top  scene_top  = nullptr;
     fn_level_open level_open = nullptr;
     bool     shop_bought = false;
+    // The stream the host's shop level-up rolled from, for the client's to roll
+    // from too (see lvl_init).
+    uint64_t shop_rng[4] = {};
+    uint8_t  shop_rng_have = 0;   // client: halves arrived, bit per half
+    // This player's level-up pick, held until its screen closes: a passive
+    // opens the replace panel on the same screen with +792 already set, and a
+    // cancel there clears +792 again -- sent at the click or at +792, a
+    // cancelled passive stuck the other screen open (2026-11-06, twice).
+    ChoiceMsg lvl_pick{};
+    void*     lvl_pick_screen = nullptr;
+    bool      lvl_pick_have = false;
+    uint64_t  lvl_pick_seen = 0;    // the last update of that screen, taken
+    uint64_t shop_open_uid = 0;   // client: the cat whose shop level-up it is opening
+    uint8_t* pre_data = nullptr;  // client: that cat as the host had it before
+    uint32_t pre_size = 0;
+    uint64_t pre_id   = 0;
+    uint64_t pre_hash = 0;
+    void*    o_lvl_init = nullptr;
     uint64_t shop_cat    = 0;
     uint64_t shop_seed   = 0;
     uint64_t shop_at     = 0;
@@ -366,15 +386,39 @@ void apply_peer_pick(uint8_t kind, void* screen, uint64_t cat) {
         return;
     }
     char mine[48] = {};
-    option_name(kind, begin + (uintptr_t)p.index * kOptStride, mine, sizeof(mine));
-    if (strcmp(mine, p.name) != 0)
-        log_line("CHOICE", "!! %s option %u is '%s' here but '%s' on the client --"
-                           " taking it anyway", kind_name(kind), p.index, mine, p.name);
-    const bool ok = (kind == kChoiceLevelUp) ? inject_level(p.index) : inject_event(p.index);
+    uint32_t pick = p.index;
+    option_name(kind, begin + (uintptr_t)pick * kOptStride, mine, sizeof(mine));
+    if (strcmp(mine, p.name) != 0) {
+        // The two screens rolled their options apart (2026-11-05: a level-up with
+        // the dice item, the friend's "Two" second there and third here). The
+        // client meant the option, not the place: the same one here, if there is.
+        uint32_t same = count;
+        char all[192] = {};
+        size_t at_all = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            char nm[48] = {};
+            option_name(kind, begin + (uintptr_t)i * kOptStride, nm, sizeof(nm));
+            at_all += _snprintf_s(all + at_all, sizeof(all) - at_all, _TRUNCATE, "%s%s",
+                                  i ? ", " : "", nm);
+            if (same == count && strcmp(nm, p.name) == 0) same = i;
+        }
+        if (same < count) {
+            log_line("CHOICE", "%s option %u is '%s' here but '%s' on the client -- taking"
+                               " '%s', which is option %u here", kind_name(kind), p.index, mine,
+                     p.name, p.name, same);
+            pick = same;
+            option_name(kind, begin + (uintptr_t)pick * kOptStride, mine, sizeof(mine));
+        } else {
+            log_line("CHOICE", "!! %s option %u is '%s' here but '%s' on the client, and '%s'"
+                               " is not offered here (%s) -- taking option %u anyway",
+                     kind_name(kind), p.index, mine, p.name, p.name, all, p.index);
+        }
+    }
+    const bool ok = (kind == kChoiceLevelUp) ? inject_level(pick) : inject_event(pick);
     if (ok) {
         ++g.applied;
         log_line("CHOICE", "applied the client's %s choice: option %u/%u ('%s')",
-                 kind_name(kind), p.index, count, mine);
+                 kind_name(kind), pick, count, mine);
     } else {
         log_line("CHOICE", "!! failed to apply the client's %s choice %u", kind_name(kind),
                  p.index);
@@ -511,8 +555,84 @@ void apply_pending(uint8_t kind, void* screen) {
 
 // ---------------------------------------------------------------------------
 
+// THE SHOP LEVEL-UP'S OPTIONS. LevelUpScreen::init (sub_14037A290, this,
+// CatData*, std::function) rolls them, and "from the cat alone" held until an
+// item made them random: with the dice on, on 2026-11-05 the two screens offered
+// four different options each and the friend's pick was not on the host's. So
+// the host's init, for a shop level-up, sends the simulation stream as it starts,
+// and the client's init for it starts from that same stream.
+constexpr uintptr_t kRva_LevelInit = 0x37A290;
+const uint8_t kLevelInitPrologue[8] = { 0x48, 0x8B, 0xC4, 0x4C, 0x89, 0x40, 0x18, 0x48 };
+using fn_lvl_init = void* (__fastcall*)(void*, void*, void*);
+
+void* __fastcall lvl_init(void* screen, void* cat, void* fn) {
+    uint64_t* s = rng_global_stream();
+    if (s && g.on && net_active()) {
+        if (!g.is_client && g.shop_bought) {
+            // The cat before this init raises its level and a stat: the
+            // client's copy had the raise already, from the host's cat push,
+            // and its own screen raised it again -- a level apart, other options
+            // (2026-11-05: level 3 here, 4 there).
+            CatDataMsg pm{};
+            if (catsync_snapshot(cat, pm)) net_send_catpre(pm);
+            free(pm.data);
+            for (uint32_t h = 0; h < 2; ++h) {
+                ChoiceMsg m{};
+                m.kind      = kChoiceShopRng;
+                m.index     = h;
+                m.node_seed = s[h * 2];
+                m.cat       = s[h * 2 + 1];
+                net_send_choice(m);
+            }
+            log_line("CHOICE", "-> the stream this shop level-up rolls from, for the other player's screen");
+        } else if (g.is_client && g.shop_rng_have == 3 && g.shop_open_uid && cat &&
+                   *(const uint64_t*)cat == g.shop_open_uid) {
+            // Only the shop level-up it was sent for: a battle's own level-up
+            // rolls from the stream lockstep keeps, and must not be touched.
+            uint64_t key = 0;
+            mem_read((const uint8_t*)cat + 0xC48, &key, sizeof(key));
+            if (g.pre_data && g.pre_id == key) {
+                CatDataMsg pm{};
+                pm.id   = g.pre_id;
+                pm.size = g.pre_size;
+                pm.hash = g.pre_hash;
+                pm.data = g.pre_data;
+                catsync_apply_now(pm, "as the host had it before this level-up");
+            }
+            free(g.pre_data);
+            g.pre_data = nullptr;
+            memcpy(s, g.shop_rng, sizeof(g.shop_rng));
+            g.shop_rng_have = 0;
+            g.shop_open_uid = 0;
+            log_line("CHOICE", "this shop level-up rolls from the host's stream -- the same options as the host's");
+        }
+    }
+    return ((fn_lvl_init)g.o_lvl_init)(screen, cat, fn);
+}
+
+void choice_on_catpre(const CatDataMsg& m) {
+    if (!g.is_client || !m.data || !m.size) return;
+    free(g.pre_data);
+    g.pre_data = (uint8_t*)malloc(m.size);
+    if (!g.pre_data) return;
+    memcpy(g.pre_data, m.data, m.size);
+    g.pre_size = m.size;
+    g.pre_id   = m.id;
+    g.pre_hash = m.hash;
+}
+
 void choice_set_base(uintptr_t base) {
     g.base = base;
+    if (!g.o_lvl_init) {
+        void* li = (void*)(base + kRva_LevelInit);
+        if (memcmp(li, kLevelInitPrologue, 8) != 0 ||
+            MH_CreateHook(li, (void*)&lvl_init, &g.o_lvl_init) != MH_OK ||
+            MH_EnableHook(li) != MH_OK) {
+            g.o_lvl_init = nullptr;
+            log_line("CHOICE", "!! the level-up screen's init moved -- a shop level-up may offer"
+                               " different options on the two screens");
+        }
+    }
     g.resolved = false;
     g.evt_commit = nullptr;
     g.lvl_click  = nullptr;
@@ -658,6 +778,19 @@ void choice_on_event_update(void* world_event) {
 
 // --- the level-up screen ---------------------------------------------------
 
+void send_level_pick(const char* why) {
+    if (!g.lvl_pick_have) return;
+    g.lvl_pick_have = false;
+    g.lvl_pick_screen = nullptr;
+    g.lvl_pick_seen = 0;
+    const ChoiceMsg& m = g.lvl_pick;
+    if (net_send_choice(m)) {
+        ++g.sent;
+        log_line("CHOICE", "-> level-up option %u/%u (type %u '%s'), %s",
+                 m.index, m.count, m.aux, m.name, why);
+    }
+}
+
 bool choice_on_level_select(void* screen, void* opt) {
     if (!g.on || !screen || !opt) return true;
     if (g.injecting) return true;
@@ -711,7 +844,11 @@ bool choice_on_level_select(void* screen, void* opt) {
         return true;
     }
 
-    ChoiceMsg m{};
+    // A pick held for another screen: that one closed, so it was taken.
+    if (g.lvl_pick_have && (g.lvl_pick_screen != screen || g.lvl_pick.cat != cat)) send_level_pick("its screen is gone");
+
+    ChoiceMsg& m = g.lvl_pick;
+    m = ChoiceMsg{};
     m.kind  = kChoiceLevelUp;
     m.index = found;
     m.count = count;
@@ -719,11 +856,11 @@ bool choice_on_level_select(void* screen, void* opt) {
     m.node_seed = follow_here_seed();
     m.cat   = cat;
     memcpy(m.name, want_name, sizeof(m.name));
-    if (net_send_choice(m)) {
-        ++g.sent;
-        log_line("CHOICE", "-> level-up option %u/%u (type %u '%s')",
-                 m.index, m.count, m.aux, m.name);
-    }
+    g.lvl_pick_screen = screen;
+    g.lvl_pick_have   = true;
+    g.lvl_pick_seen   = 0;
+    log_line("CHOICE", "level-up option %u/%u (type %u '%s') clicked -- sent once its screen closes",
+             m.index, m.count, m.aux, m.name);
     return true;
 }
 
@@ -739,6 +876,20 @@ void choice_on_level_update(void* level_screen) {
     uint8_t committed = 0;
     mem_read((const uint8_t*)level_screen + kLvl_Committed, &committed, 1);
 
+    if (g.lvl_pick_have && g.lvl_pick_screen == level_screen && g.lvl_pick.cat == cat) {
+        if (committed) {
+            g.lvl_pick_seen = GetTickCount64();
+        } else if (g.lvl_pick_seen) {
+            // Taken and then given back: the replace panel cancelled.
+            g.lvl_pick_have = false;
+            g.lvl_pick_seen = 0;
+            log_line("CHOICE", "level-up option '%s' given back (replace cancelled) -- not sent",
+                     g.lvl_pick.name);
+        }
+    } else if (!committed && g.lvl_pick_have &&
+             (g.lvl_pick_screen != level_screen || g.lvl_pick.cat != cat))
+        send_level_pick("its screen is gone");
+
     // Cleared on commit, not compared alone: the next cat's screen can be
     // allocated at the same address.
     if (committed) {
@@ -746,8 +897,20 @@ void choice_on_level_update(void* level_screen) {
     } else if (g.said_screen != level_screen) {
         g.said_screen = level_screen;
         g.screen_at   = GetTickCount64();
-        log_line("CHOICE", "level-up screen for cat %016llx -- %s", (unsigned long long)cat,
-                 mine ? "this player picks" : "the other player picks");
+        char opts[192] = {};
+        {
+            uint8_t* begin = nullptr;
+            uint32_t count = 0;
+            size_t at = 0;
+            if (read_options(level_screen, kLvl_OptBegin, kLvl_OptEnd, begin, count))
+                for (uint32_t i = 0; i < count; ++i) {
+                    char nm[48] = {};
+                    option_name(kChoiceLevelUp, begin + (uintptr_t)i * kOptStride, nm, sizeof(nm));
+                    at += _snprintf_s(opts + at, sizeof(opts) - at, _TRUNCATE, "%s%s", i ? ", " : "", nm);
+                }
+        }
+        log_line("CHOICE", "level-up screen for cat %016llx -- %s (%s)", (unsigned long long)cat,
+                 mine ? "this player picks" : "the other player picks", opts);
         if (!g.is_client && g.shop_bought) {
             g.shop_bought = false;
             ChoiceMsg m{};
@@ -796,6 +959,12 @@ void choice_on_shop_level() {
 }
 
 void choice_pump() {
+    // This player's level-up pick, once its screen has stopped updating.
+    if (g.on && g.lvl_pick_have && g.lvl_pick_seen &&
+        GetTickCount64() - g.lvl_pick_seen > 300) {
+        Guard guard;
+        send_level_pick("its screen closed");
+    }
     if (!g.on || !g.is_client || !g.shop_cat || !g.level_open) return;
     Guard guard;
     if (g.shop_seed != g.here_seed) return;     // still on the way to that shop
@@ -813,6 +982,7 @@ void choice_pump() {
 
     const uint64_t id = g.shop_cat;
     g.shop_cat = 0;
+    g.shop_open_uid = id;
     void* cat  = catsync_cat_by_uid(id);
     void* shop = g_shop;
     if (cat && shop && safe_open_level(scene, cat, shop))
@@ -841,6 +1011,15 @@ void choice_on_message(const ChoiceMsg& m) {
 
     if (m.kind == kChoiceOpen) {
         if (!g.is_client) g.client_open_cat = m.cat;
+        return;
+    }
+    if (m.kind == kChoiceShopRng) {
+        if (g.is_client && m.index < 2) {
+            if (m.index == 0) g.shop_rng_have = 0;
+            g.shop_rng[m.index * 2]     = m.node_seed;
+            g.shop_rng[m.index * 2 + 1] = m.cat;
+            g.shop_rng_have |= (uint8_t)(1u << m.index);
+        }
         return;
     }
     if (m.kind == kChoiceShop) {

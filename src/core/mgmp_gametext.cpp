@@ -1,4 +1,5 @@
 #include "mgmp_gametext.h"
+#include "mgmp_lang.h"
 #include "mgmp_gpak.h"
 #include "mgmp_log.h"
 
@@ -25,10 +26,10 @@ const char* const kItemFiles[] = {
 };
 
 // The bonuses an item's gon entry gives as plain numbers, in this order.
-struct Bonus { const char* key; const char* label; };
+struct Bonus { const char* key; const char* label; const char* en; };
 const Bonus kBonuses[] = {
-    { "str", u8"\u0421\u0438\u043b\u0430" }, { "dex", u8"\u041b\u043e\u0432\u043a\u043e\u0441\u0442\u044c" }, { "con", u8"\u0422\u0435\u043b\u043e\u0441\u043b\u043e\u0436\u0435\u043d\u0438\u0435" }, { "int", u8"\u0418\u043d\u0442\u0435\u043b\u043b\u0435\u043a\u0442" },
-    { "spd", u8"\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c" }, { "cha", u8"\u0425\u0430\u0440\u0438\u0437\u043c\u0430" }, { "lck", u8"\u0423\u0434\u0430\u0447\u0430" }, { "shield", u8"\u0429\u0438\u0442" },
+    { "str", u8"\u0421\u0438\u043b\u0430", "Strength" }, { "dex", u8"\u041b\u043e\u0432\u043a\u043e\u0441\u0442\u044c", "Dexterity" }, { "con", u8"\u0422\u0435\u043b\u043e\u0441\u043b\u043e\u0436\u0435\u043d\u0438\u0435", "Constitution" }, { "int", u8"\u0418\u043d\u0442\u0435\u043b\u043b\u0435\u043a\u0442", "Intelligence" },
+    { "spd", u8"\u0421\u043a\u043e\u0440\u043e\u0441\u0442\u044c", "Speed" }, { "cha", u8"\u0425\u0430\u0440\u0438\u0437\u043c\u0430", "Charisma" }, { "lck", u8"\u0423\u0434\u0430\u0447\u0430", "Luck" }, { "shield", u8"\u0429\u0438\u0442", "Shield" },
 };
 constexpr size_t kNumBonuses = sizeof(kBonuses) / sizeof(kBonuses[0]);
 
@@ -139,7 +140,9 @@ void parse_csv(const char* p, const char* end, const std::unordered_set<std::str
     bool header = true;
     auto end_row = [&]() {
         if (header) {
-            for (size_t i = 0; i < row.size(); ++i) if (row[i] == "ru") ru = (int)i;
+            // The game's own language column, English if it has none.
+            for (size_t i = 0; i < row.size(); ++i) if (row[i] == lang_code()) ru = (int)i;
+            if (ru < 0) for (size_t i = 0; i < row.size(); ++i) if (row[i] == "en") ru = (int)i;
             header = false;
         } else if (ru >= 0 && (int)row.size() > ru && want.count(row[0])) {
             g.text[row[0]] = row[ru];
@@ -249,11 +252,11 @@ bool gametext_item(const char* key, ItemText& out) {
     for (size_t b = 0; b < kNumBonuses; ++b) {
         if (!it->bonus[b]) continue;
         n += snprintf(out.bonus + n, sizeof(out.bonus) - n, "%s%s %+d", n ? ", " : "",
-                      kBonuses[b].label, it->bonus[b]);
+                      tr(kBonuses[b].label, kBonuses[b].en), it->bonus[b]);
         if (n >= sizeof(out.bonus)) break;
     }
     if (!it->durability.empty() && n < sizeof(out.bonus))
-        snprintf(out.bonus + n, sizeof(out.bonus) - n, "%s%s %s", n ? ", " : "", u8"\u041f\u0440\u043e\u0447\u043d\u043e\u0441\u0442\u044c",
+        snprintf(out.bonus + n, sizeof(out.bonus) - n, "%s%s %s", n ? ", " : "", tr(u8"\u041f\u0440\u043e\u0447\u043d\u043e\u0441\u0442\u044c", "Durability"),
                  it->durability.c_str());
     return true;
 }

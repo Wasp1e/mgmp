@@ -10,6 +10,7 @@
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
 #include "mgmp_ui.h"         // ui_window -- where a synthetic Escape is posted
+#include "mgmp_lang.h"
 
 #include <windows.h>
 
@@ -454,10 +455,12 @@ void leave_loading_start() {
 bool leave_loading(const char** step) {
     if (!g_load.up) return false;
     if (step) {
-        if (g.pending) *step = u8"\u0412\u044b\u0445\u043e\u0434\u0438\u043c \u0438\u0437 \u0437\u0430\u0431\u0435\u0433\u0430 \u0445\u043e\u0441\u0442\u0430\u2026";
+        if (g.pending) *step = tr(u8"\u0412\u044b\u0445\u043e\u0434\u0438\u043c \u0438\u0437 \u0437\u0430\u0431\u0435\u0433\u0430 \u0445\u043e\u0441\u0442\u0430\u2026",
+                                  u8"Leaving the host's run\u2026");
         else if (g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) != 0)
-            *step = u8"\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u0435\u043c \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430\u2026";
-        else *step = u8"\u041f\u043e\u0447\u0442\u0438 \u0433\u043e\u0442\u043e\u0432\u043e\u2026";
+            *step = tr(u8"\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u0435\u043c \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430\u2026",
+                       u8"Loading the host's game\u2026");
+        else *step = tr(u8"\u041f\u043e\u0447\u0442\u0438 \u0433\u043e\u0442\u043e\u0432\u043e\u2026", u8"Almost there\u2026");
     }
     return true;
 }

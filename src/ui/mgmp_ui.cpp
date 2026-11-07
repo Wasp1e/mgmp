@@ -1,4 +1,5 @@
 #include "mgmp_ui.h"
+#include "mgmp_lang.h"
 
 #include <windows.h>
 #include <cmath>
@@ -437,7 +438,7 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
             }
         }
         ImGui::Dummy(ImVec2(0, 10));
-        const char* ok = u8"\u041e\u041a";
+        const char* ok = tr(u8"\u041e\u041a", "OK");
         const ImVec2 okw = ImGui::CalcTextSize(ok);
         ImGui::SetCursorPosX(left + (right - left - okw.x - 24) * 0.5f);
         g.paper_w = g_widest + 2.0f * kPadX + 4.0f;
@@ -535,7 +536,8 @@ void draw_loading(const char* step) {
             dl->AddText(ImVec2(c.x - sz.x * 0.5f, y), ImGui::GetColorU32(col), text);
         };
         centred(c.y + r + 28, ImVec4(0.96f, 0.90f, 0.80f, 1.0f), step ? step : "");
-        centred(c.y + r + 54, ImVec4(0.55f, 0.50f, 0.45f, 1.0f), u8"\u041c\u043e\u0434 \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0442\u0435\u0431\u044f \u0432 \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430, \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0430\u0436\u0438\u043c\u0430\u0442\u044c \u043d\u0435 \u043d\u0443\u0436\u043d\u043e");
+        centred(c.y + r + 54, ImVec4(0.55f, 0.50f, 0.45f, 1.0f), tr(u8"\u041c\u043e\u0434 \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442 \u0442\u0435\u0431\u044f \u0432 \u0438\u0433\u0440\u0443 \u0445\u043e\u0441\u0442\u0430, \u043d\u0438\u0447\u0435\u0433\u043e \u043d\u0430\u0436\u0438\u043c\u0430\u0442\u044c \u043d\u0435 \u043d\u0443\u0436\u043d\u043e",
+                    "The mod is taking you back into the host's game -- no need to press anything"));
 
         // The mod's last lines, small and dim along the bottom.
         const float line = ImGui::GetTextLineHeight();
@@ -735,13 +737,15 @@ void draw_connect() {
     // node hash mismatch. See mgmp_peerlog.h.
     ImGui::BeginDisabled(!live);
     const bool host_side = net_role() == NetRole::Host;
-    if (ImGui::Button(host_side ? u8"\u041b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430"
-                                : u8"\u041b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443"))
+    if (ImGui::Button(host_side ? tr(u8"\u041b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430", "Friend's log")
+                                : tr(u8"\u041b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443", "Log to host")))
         peerlog_ask("asked from the panel");
     ImGui::EndDisabled();
     ImGui::SetItemTooltip(host_side
-        ? u8"\u0417\u0430\u0431\u0440\u0430\u0442\u044c \u043b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430 \u0432 logs\\friend"
-        : u8"\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0441\u0432\u043e\u0439 \u043b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443");
+        ? tr(u8"\u0417\u0430\u0431\u0440\u0430\u0442\u044c \u043b\u043e\u0433 \u0434\u0440\u0443\u0433\u0430 \u0432 logs\\friend",
+             "Fetch the friend's log into logs\\friend")
+        : tr(u8"\u041e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u0441\u0432\u043e\u0439 \u043b\u043e\u0433 \u0445\u043e\u0441\u0442\u0443",
+             "Send your log to the host"));
     if (host_side && peerlog_last_saved()[0]) {
         ImGui::SameLine();
         ImGui::TextDisabled("%s", peerlog_last_saved());
@@ -883,14 +887,16 @@ void draw_session() {
     draw_connect();
     draw_nodes();
 
-    ImGui::SeparatorText(u8"\u0437\u0432\u0443\u043a");
+    ImGui::SeparatorText(tr(u8"\u0437\u0432\u0443\u043a", "sound"));
     {
         // The map's meows, the other player's clicks and this one's.
         int pct = (int)(meow_volume() * 100.0f + 0.5f);
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::SliderInt(u8"\u041c\u044f\u0443\u043a\u0430\u043d\u044c\u0435 \u043d\u0430 \u043a\u0430\u0440\u0442\u0435", &pct, 0, 100, "%d%%"))
+        if (ImGui::SliderInt(tr(u8"\u041c\u044f\u0443\u043a\u0430\u043d\u044c\u0435 \u043d\u0430 \u043a\u0430\u0440\u0442\u0435", "Map meows"),
+                             &pct, 0, 100, "%d%%"))
             meow_set_volume(pct / 100.0f);
-        ImGui::SetItemTooltip(u8"\u0413\u0440\u043e\u043c\u043a\u043e\u0441\u0442\u044c \u043c\u044f\u0443\u043a\u0430\u043d\u044c\u044f, \u043a\u043e\u0433\u0434\u0430 \u043a\u0442\u043e-\u0442\u043e \u0432\u044b\u0431\u0438\u0440\u0430\u0435\u0442 \u0443\u0437\u0435\u043b \u043a\u0430\u0440\u0442\u044b. 0%% -- \u0431\u0435\u0437 \u0437\u0432\u0443\u043a\u0430.");
+        ImGui::SetItemTooltip(lang_ru() ? u8"\u0413\u0440\u043e\u043c\u043a\u043e\u0441\u0442\u044c \u043c\u044f\u0443\u043a\u0430\u043d\u044c\u044f, \u043a\u043e\u0433\u0434\u0430 \u043a\u0442\u043e-\u0442\u043e \u0432\u044b\u0431\u0438\u0440\u0430\u0435\u0442 \u0443\u0437\u0435\u043b \u043a\u0430\u0440\u0442\u044b. 0%% -- \u0431\u0435\u0437 \u0437\u0432\u0443\u043a\u0430."
+                                         : "How loud the meow is when someone picks a map node. 0%% -- silent.");
     }
 
     ImGui::SeparatorText("panel");
@@ -1177,11 +1183,13 @@ void ui_on_swap(void* window) {
     // cat whose turn it is theirs (its bar greyed) -- a note at the top.
     const char* note = nullptr;
     if (refused)
-        note = u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442";
+        note = tr(u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442",
+                  "The host ends the day");
     else if (lockstep_in_battle() && lockstep_barrier_holding())
-        note = u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e";
+        note = tr(u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e",
+                  u8"Waiting for your friend \u2014 not in the fight yet");
     else if (lockstep_in_battle() && combatlock_engaged())
-        note = u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433";
+        note = tr(u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433", "Your friend's turn");
     g.forced = loading || night || note;
     if (!g.visible && !g.forced) return;
 

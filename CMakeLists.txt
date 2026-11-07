@@ -44,6 +44,7 @@ add_library(mgmp SHARED
     src/core/mgmp_crash.cpp
     src/core/mgmp_gpak.cpp
     src/core/mgmp_gametext.cpp
+    src/core/mgmp_lang.cpp
     src/core/mgmp_sigscan.cpp
     src/core/mgmp_resolve.cpp
     src/determinism/mgmp_turnaction.cpp

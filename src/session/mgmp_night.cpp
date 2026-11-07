@@ -4,6 +4,7 @@
 #include "mgmp_log.h"
 #include "mgmp_resolve.h"
 #include "mgmp_leave.h"
+#include "mgmp_lang.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -131,11 +132,11 @@ void replace_all(std::wstring& s, const std::wstring& from, const std::wstring& 
 // The game's markup, [m:happy] and [s:.7]...[/s], means nothing in the window --
 // except a stat's icon ("+1 [...str...]" from a fight), which becomes its name.
 const wchar_t* stat_word(const std::wstring& tag) {
-    static const struct { const wchar_t* id; const wchar_t* ru; } k[] = {
-        { L"str", L"\u0421\u0418\u041b" }, { L"dex", L"\u041b\u041e\u0412" },
-        { L"con", L"\u0422\u0415\u041b" }, { L"int", L"\u0418\u041d\u0422" },
-        { L"spd", L"\u0421\u041a\u0420" }, { L"cha", L"\u0425\u0410\u0420" },
-        { L"lck", L"\u0423\u0414\u0427" }, { L"luck", L"\u0423\u0414\u0427" },
+    static const struct { const wchar_t* id; const wchar_t* ru; const wchar_t* en; } k[] = {
+        { L"str", L"\u0421\u0418\u041b", L"STR" }, { L"dex", L"\u041b\u041e\u0412", L"DEX" },
+        { L"con", L"\u0422\u0415\u041b", L"CON" }, { L"int", L"\u0418\u041d\u0422", L"INT" },
+        { L"spd", L"\u0421\u041a\u0420", L"SPD" }, { L"cha", L"\u0425\u0410\u0420", L"CHA" },
+        { L"lck", L"\u0423\u0414\u0427", L"LCK" }, { L"luck", L"\u0423\u0414\u0427", L"LCK" },
     };
     std::wstring t = tag;
     for (wchar_t& c : t) c = (wchar_t)towlower(c);
@@ -145,7 +146,7 @@ const wchar_t* stat_word(const std::wstring& tag) {
         const size_t len = wcslen(e.id);
         const bool left  = at == 0 || !iswalpha(t[at - 1]);
         const bool right = at + len >= t.size() || !iswalpha(t[at + len]);
-        if (left && right) return e.ru;
+        if (left && right) return lang_ru() ? e.ru : e.en;
     }
     return nullptr;
 }

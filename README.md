@@ -90,8 +90,8 @@ build tools) and **CMake 3.21+**.
 
 Download the archive from [Releases](https://github.com/Wasp1e/mgmp/releases),
 unpack it anywhere **outside** the game's folder and run `mgmp_loader.exe`.
-Do not run it from inside the archive. `ПРОЧТИ.txt` in the archive is a short
-guide for the joining player, in Russian.
+Do not run it from inside the archive. `README.txt` and `README_RU.txt` in the
+archive are a short guide, in English and in Russian.
 
 Windows Defender may complain: the loader puts a DLL into the game, which is
 how mods work. If `mgmp_loader.exe` disappears, restore it from Defender's

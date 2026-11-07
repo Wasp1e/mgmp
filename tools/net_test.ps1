@@ -15,6 +15,14 @@
 #   .\tools\net_test.ps1 -HostCats 19,20 -ClientCats 21,22   (manual override)
 #   .\tools\net_test.ps1 -Summary                   read the newest log pair
 #   .\tools\net_test.ps1 -Stop                      kill both instances
+#   .\tools\net_test.ps1 -Players 3                 host + two clients (4: three)
+#
+# MORE THAN TWO. -Players 3 or 4 adds client2 (build_client2) and client3
+# (build_client3), each dialling the same host. All the instances share this
+# machine's one saves folder, so each extra client writes the host's campaign
+# into its own file (debug.coop_save: mgmp_coop2.sav, mgmp_coop3.sav) -- with
+# one shared mgmp_coop.sav the second client's write met the first one's
+# load. Every instance is a whole game: four of them want a lot of memory.
 #
 # THE CAT SPLIT IS AUTOMATIC by default (net_control = auto): each peer finds
 # the human-brained cats in the battle's own roster and takes half, host first.
@@ -74,6 +82,9 @@ param(
     # Empty = auto: derive the split from the roster. See the header.
     [int[]] $HostCats   = @(),
     [int[]] $ClientCats = @(),
+    # How many games: the host and Players-1 clients, 2 to 4.
+    [ValidateRange(2, 4)]
+    [int]   $Players    = 2,
     [int]   $Port       = 27600,
     [string]$Addr       = '127.0.0.1',
     # Seconds to let the host bind and start listening before the client dials.
@@ -87,7 +98,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent      # ...\mod
-$peers = @{ host = 'build_host'; client = 'build_client' }
+$peers = [ordered]@{ host = 'build_host'; client = 'build_client' }
+if ($Players -ge 3) { $peers['client2'] = 'build_client2' }
+if ($Players -ge 4) { $peers['client3'] = 'build_client3' }
+$clients = @($peers.Keys | Where-Object { $_ -ne 'host' })
 
 # CMake's default generator here is multi-config (Visual Studio), which puts
 # binaries under build\<Config>\; a single-config generator (Ninja, NMake)
@@ -115,7 +129,7 @@ function Get-PeerLog([string]$peer) {
 }
 
 function Show-Summary {
-    foreach ($peer in 'host', 'client') {
+    foreach ($peer in $peers.Keys) {
         $log = Get-PeerLog $peer
         Write-Host "`n=== $peer ===" -ForegroundColor Cyan
         if (-not $log) { Write-Host '  (no timestamped log yet)' -ForegroundColor DarkGray; continue }
@@ -144,8 +158,11 @@ function Show-Summary {
         if ($trans) { $trans | ForEach-Object { Write-Host "  $($_.Line.Trim())" -ForegroundColor Yellow } }
     }
 
-    # The check that matters: same turn count, same hashes, nothing outstanding.
-    $hl = Get-PeerLog 'host'; $cl = Get-PeerLog 'client'
+    # The check that matters: same turn count, same hashes, nothing outstanding --
+    # the host against each client in turn.
+    $hl = Get-PeerLog 'host'
+    foreach ($cpeer in $clients) {
+    $cl = Get-PeerLog $cpeer
     if ($hl -and $cl) {
         # BOTH halves, and they are counted separately on purpose. This used to
         # read only rng=, which means the desync class this whole tool exists to
@@ -170,8 +187,8 @@ function Show-Summary {
             if ($s) { $badState++ }
             if (($r -or $s) -and $firstBad -lt 0) { $firstBad = $i }
         }
-        Write-Host "`n=== verdict ===" -ForegroundColor Cyan
-        Write-Host "  turns hashed: host $($hh.Count), client $($ch.Count), compared $common"
+        Write-Host "`n=== verdict: host vs $cpeer ===" -ForegroundColor Cyan
+        Write-Host "  turns hashed: host $($hh.Count), $cpeer $($ch.Count), compared $common"
         if ($badRng -eq 0 -and $badState -eq 0 -and $common -gt 0) {
             Write-Host "  all $common turn hashes IDENTICAL (rng and state)" -ForegroundColor Green
         } elseif ($common -eq 0) {
@@ -189,11 +206,12 @@ function Show-Summary {
         # direction of the transport -- easy to celebrate by mistake.
         $hs = ([regex]::Matches((Get-Content $hl.FullName -Raw), 'LOCKSTEP\s+->')).Count
         $cs = ([regex]::Matches((Get-Content $cl.FullName -Raw), 'LOCKSTEP\s+->')).Count
-        Write-Host "  actions sent: host $hs, client $cs"
+        Write-Host "  actions sent: host $hs, $cpeer $cs"
         if ($hs -eq 0 -or $cs -eq 0) {
             Write-Host '  [!] only one direction was exercised -- act with BOTH peers'  -ForegroundColor Yellow
             Write-Host '      cats to cover the client->host path too.'                 -ForegroundColor Yellow
         }
+    }
     }
 }
 
@@ -229,7 +247,7 @@ $outDir = Get-CmakeOutDir
 # that does not exist cannot be replaced. Against an object none of that is
 # needed: a key that is absent is simply assigned.
 $baseConfig = Get-Content (Join-Path $outDir 'mgmp.json') -Raw
-foreach ($peer in 'host', 'client') {
+foreach ($peer in $peers.Keys) {
     $dir = Join-Path $root $peers[$peer]
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Copy-Item (Join-Path $outDir 'mgmp.dll'), (Join-Path $outDir 'mgmp_loader.exe') $dir -Force
@@ -237,7 +255,8 @@ foreach ($peer in 'host', 'client') {
     $icons = Join-Path $outDir 'icons'
     if (Test-Path $icons) { Copy-Item $icons $dir -Recurse -Force }
 
-    $list = if ($peer -eq 'host') { $HostCats } else { $ClientCats }
+    $list = if ($peer -eq 'host') { $HostCats } elseif ($peer -eq 'client') { $ClientCats } else { @() }
+    if ($Players -gt 2) { $list = @() }   # an explicit split is for two players only
     $cats = if ($list.Count -eq 0) { 'auto' } else { $list -join ',' }
 
     # Parsed fresh per peer: ConvertFrom-Json returns a mutable object graph and
@@ -246,7 +265,7 @@ foreach ($peer in 'host', 'client') {
 
     $cfg.log = "mgmp_$peer.log"
 
-    $cfg.net.role = $peer
+    $cfg.net.role = if ($peer -eq 'host') { 'host' } else { 'client' }
     # Loopback, whatever the base config plays over: a host set up for the Steam
     # relay would have both instances dialling one Steam account.
     $cfg.net.transport = 'tcp'
@@ -279,6 +298,10 @@ foreach ($peer in 'host', 'client') {
     # two injectors on one buffer, and lockstep wins -- so the replay would
     # silently never advance.
     $cfg.debug.replay          = ''
+    # One coop save per client: they all write into this machine's one saves
+    # folder (see the header). The first keeps the real name.
+    $coop = switch ($peer) { 'client2' { 'mgmp_coop2.sav' } 'client3' { 'mgmp_coop3.sav' } default { 'mgmp_coop.sav' } }
+    $cfg.debug | Add-Member -NotePropertyName coop_save -NotePropertyValue $coop -Force
 
     # Save sharing is not optional and has no knob any more -- it is how the
     # client acquires the run. It used to be gated by a switch that defaulted
@@ -312,16 +335,18 @@ $hd = Join-Path $root $peers['host']
 Start-Process -FilePath (Join-Path $hd 'mgmp_loader.exe') -WorkingDirectory $hd
 Start-Sleep -Seconds $HostLead
 
-Write-Host "==> launching client (dialling ${Addr}:${Port})" -ForegroundColor Cyan
-$cd = Join-Path $root $peers['client']
-Start-Process -FilePath (Join-Path $cd 'mgmp_loader.exe') -WorkingDirectory $cd
-Start-Sleep -Seconds 10
+foreach ($cpeer in $clients) {
+    Write-Host "==> launching $cpeer (dialling ${Addr}:${Port})" -ForegroundColor Cyan
+    $cd = Join-Path $root $peers[$cpeer]
+    Start-Process -FilePath (Join-Path $cd 'mgmp_loader.exe') -WorkingDirectory $cd
+    Start-Sleep -Seconds 10
+}
 
 Write-Host ''
 Get-Process Mewgenics -ErrorAction SilentlyContinue |
     Format-Table Id, StartTime, Responding -AutoSize
 
-foreach ($peer in 'host', 'client') {
+foreach ($peer in $peers.Keys) {
     $log = Get-PeerLog $peer
     Write-Host "=== $peer handshake ===" -ForegroundColor Cyan
     if ($log) {
@@ -332,7 +357,7 @@ foreach ($peer in 'host', 'client') {
 
 Write-Host @"
 
-Both instances are up. Now:
+All $Players instances are up. Now:
   1. $(if ($NoFollow) { 'Drive BOTH windows to the same battle by hand (net_follow = 0).' } else { 'Drive the HOST only. The client follows it into every map node it enters,' })
      $(if ($NoFollow) { '' } else { 'and its own map clicks are swallowed -- the host owns the run.' })
   2. Cat split: host [$(if ($HostCats.Count) { $HostCats -join ',' } else { 'auto: first half' })];

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <cwchar>
 #include <fstream>
 #include <string>
@@ -353,6 +354,15 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*d, "desync_halt",     g_cfg.net_desync_halt);
         read_bool(*d, "record",          g_cfg.record);
         read_str (*d, "record_note",     g_cfg.record_note, sizeof(g_cfg.record_note));
+        {
+            char name[64] = {};
+            read_str(*d, "coop_save", name, sizeof(name));
+            const size_t n = strlen(name);
+            bool ok = n > 4 && n <= 15 && _stricmp(name + n - 4, ".sav") == 0;
+            for (size_t i = 0; ok && i < n; ++i)
+                ok = isalnum((unsigned char)name[i]) || name[i] == '_' || name[i] == '-' || name[i] == '.';
+            if (ok) strcpy_s(g_cfg.coop_save, name);
+        }
         read_path(*d, "replay", dll_dir, g_cfg.replay_path, 512);
         // Capped rather than trusted: a stray extra digit here would look
         // exactly like the mod having hung.

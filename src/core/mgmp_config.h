@@ -78,6 +78,11 @@ struct Config {
     bool     record            = false;
     wchar_t  record_path[512]  = {};   // derived from the log name
     char     record_note[256]  = {};   // stored in EV_META
+    // debug.coop_save: the file a client writes the host's campaign into, in the
+    // game's saves folder. Several clients on ONE machine (the local three- and
+    // four-player test) share that folder, so each needs its own; a real player
+    // never sets it. Up to 15 characters, ending in ".sav".
+    char     coop_save[16]     = "mgmp_coop.sav";
 
     // debug.replay = "<file>" injects that capture's decisions instead of
     // polling the brain. Empty means no replay. Meant to be used WITH record:

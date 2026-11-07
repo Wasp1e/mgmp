@@ -238,8 +238,10 @@ bool back_up(const wchar_t* dir, const wchar_t* name) {
 // inline text, no heap pointer, nothing for the game's allocator to own or
 // free. A longer name would need a heap buffer, and a callee that move-assigned
 // from it would then try to free our memory with its allocator.
-const char kCoopSaveName[] = "mgmp_coop.sav";
-static_assert(sizeof(kCoopSaveName) <= 16, "must fit std::string's SSO buffer");
+// The client's coop save, mgmp_coop.sav unless debug.coop_save names another
+// (several clients on one machine). Always 15 characters or fewer, so it fits
+// std::string's SSO buffer in the redirect below.
+#define kCoopSaveName (config().coop_save)
 
 // MSVC std::string, the 32-byte layout already confirmed as the stride of
 // SaveSelection's name vector: { union { char buf[16]; char* ptr; }, size, cap }.
@@ -1139,8 +1141,8 @@ int savefile_autoselect(void* ss) {
     // names[slot], which is the player's real save and has nothing to do with
     // the host's run.
     memset(&g.redirect_name, 0, sizeof(g.redirect_name));
-    memcpy(g.redirect_name.buf, kCoopSaveName, sizeof(kCoopSaveName));
-    g.redirect_name.size = sizeof(kCoopSaveName) - 1;
+    memcpy(g.redirect_name.buf, kCoopSaveName, strlen(kCoopSaveName) + 1);
+    g.redirect_name.size = strlen(kCoopSaveName);
     g.redirect_name.cap  = 15;                 // SSO: the text is inline, no heap
     g.redirect_armed     = true;
 

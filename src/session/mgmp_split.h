@@ -100,6 +100,39 @@ inline void split_assign(OwnerTable& t, const uint64_t* ids, uint32_t humans,
             ++t.count;
         }
     }
+
+    // A player the table has never given a cat -- one who joined after the
+    // split, like the third of three in a run the first two started -- takes
+    // one from whoever holds the most. On 2026-11-08 the remembered two-player
+    // split left the third player with nothing at all. A player who has a cat
+    // in the table, alive or not, keeps the run-long rule: nothing moves.
+    for (uint32_t p = 0; p < peers; ++p) {
+        if (load[p]) continue;
+        bool known = false;
+        for (uint32_t r = 0; r < t.count && !known; ++r) known = t.pos[r] == p;
+        if (known) continue;
+        uint32_t most = 0;
+        for (uint32_t q = 1; q < peers; ++q)
+            if (load[q] >= load[most]) most = q;   // a tie: not the host, who keeps the odd cat
+        if (load[most] < 2) break;           // nobody can spare one
+        // The last cat in roster order of that player.
+        for (uint32_t k = humans; k-- > 0;) {
+            if (out[k] != most) continue;
+            out[k] = (uint8_t)p;
+            --load[most];
+            ++load[p];
+            if (remember && ids[k]) {
+                const int row = t.find(ids[k]);
+                if (row >= 0) t.pos[row] = (uint8_t)p;
+                else if (t.count < kMaxOwners) {
+                    t.id[t.count]  = ids[k];
+                    t.pos[t.count] = (uint8_t)p;
+                    ++t.count;
+                }
+            }
+            break;
+        }
+    }
 }
 
 // THE TABLE ON DISK. Reloading a run starts the table over, and the roster it is

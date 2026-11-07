@@ -50,8 +50,8 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
 - Lockstep: only the players' clicks travel, both games roll the same dice and
   reach the same result. The other player's cat has its action bar greyed out.
 - You see your partner's cursor and what they are aiming at before they commit.
-- Notes on screen: "Your friend's turn", "Waiting for your friend — not in the
-  fight yet".
+- Notes on screen: "Another player's turn", "Waiting for another player — not in
+  the fight yet".
 - A friend who drops can rejoin in the middle of a fight. A fight loaded from a
   save waits for both players before the first move.
 - Every turn both games compare a fingerprint of the fight. A small difference

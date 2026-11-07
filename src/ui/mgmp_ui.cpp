@@ -1186,10 +1186,10 @@ void ui_on_swap(void* window) {
         note = tr(u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442",
                   "The host ends the day");
     else if (lockstep_in_battle() && lockstep_barrier_holding())
-        note = tr(u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e",
-                  u8"Waiting for your friend \u2014 not in the fight yet");
-    else if (lockstep_in_battle() && combatlock_engaged())
-        note = tr(u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433", "Your friend's turn");
+        note = tr(u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u043e\u0433\u043e \u0438\u0433\u0440\u043e\u043a\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e",
+                  u8"Waiting for another player \u2014 not in the fight yet");
+    else if (lockstep_in_battle() && combatlock_menu_live() && combatlock_engaged())
+        note = tr(u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433\u043e\u0439 \u0438\u0433\u0440\u043e\u043a", "Another player's turn");
     g.forced = loading || night || note;
     if (!g.visible && !g.forced) return;
 

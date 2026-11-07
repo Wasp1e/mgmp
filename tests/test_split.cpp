@@ -21,6 +21,30 @@ static void check(bool cond, const char* what) {
 }
 
 int main() {
+    // --- a player who joins after the split --------------------------------
+    {
+        OwnerTable t; uint8_t o[4];
+        const uint64_t ids[4] = { 1, 2, 3, 4 };
+        split_assign(t, ids, 4, 2, true, o);           // two players: 0 1 0 1
+        split_assign(t, ids, 4, 3, true, o);           // a third joins
+        int load[3] = {};
+        for (int i = 0; i < 4; ++i) ++load[o[i]];
+        check(load[0] == 2 && load[1] == 1 && load[2] == 1,
+              "a third player who joins a remembered split gets a cat");
+        uint8_t again[4];
+        split_assign(t, ids, 4, 3, true, again);
+        check(memcmp(o, again, 4) == 0, "and keeps it on the next look");
+    }
+    {
+        OwnerTable t; uint8_t o[4];
+        const uint64_t ids[4] = { 1, 2, 3, 4 };
+        split_assign(t, ids, 4, 2, true, o);           // 0 1 0 1
+        const uint64_t left[2] = { 1, 3 };             // both of player 1's cats gone
+        uint8_t l[2];
+        split_assign(t, left, 2, 2, true, l);
+        check(l[0] == 0 && l[1] == 0, "a player whose cats died does not take the host's");
+    }
+
     // --- shares ------------------------------------------------------------
     {
         OwnerTable t; uint8_t o[4];

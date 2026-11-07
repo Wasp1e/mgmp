@@ -115,6 +115,9 @@ bool lockstep_cat_theirs(uint64_t id);
 // True when the owner table has cat `id` at all (a cat of this run's party).
 bool lockstep_cat_known(uint64_t id);
 
+// Character::BeginTurn has run for this character (from its hook).
+void lockstep_on_begin_turn(const void* character);
+
 // The owner table's rows, up to `cap`; and one row set (the client, from the host).
 uint32_t lockstep_owners_copy(uint64_t* ids, uint8_t* pos, uint32_t cap);
 void     lockstep_owner_put(uint64_t id, uint8_t pos);

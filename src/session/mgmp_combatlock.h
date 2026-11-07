@@ -70,4 +70,7 @@ void combatlock_on_button(void* button);
 bool     combatlock_engaged();
 uint32_t combatlock_buttons();
 
+// A battle is on screen: its combat menu updated in the last second.
+bool combatlock_menu_live();
+
 } // namespace mgmp

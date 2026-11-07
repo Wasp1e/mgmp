@@ -10,6 +10,7 @@
 #include "mgmp_startrun.h"
 #include "mgmp_leave.h"
 #include "mgmp_savefile.h"
+#include "mgmp_combatlock.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -532,7 +533,17 @@ bool client_watches(uintptr_t ret) {
 bool in_a_run() { return leave_in_run() || savefile_adventure_is_loaded(); }
 
 bool run_gear() {
-    return net_active() && net_peer_count() >= 2 && in_a_run() && !lockstep_in_battle() &&
+    // Not lockstep_in_battle() alone: its battle stays "current" on the map
+    // until the next one, so after the first fight the backpack went back to the
+    // whole-bag sync, crosses and all (2026-11-07). A fight is not on the Map
+    // scene.
+    // Read a few times a second, not on each of the slot checks of a frame.
+    static uint64_t at = 0;
+    static bool     on_map = false;
+    const uint64_t  now = GetTickCount64();
+    if (now - at > 200) { at = now; on_map = leave_scene_up("Map"); }
+    const bool fighting = combatlock_menu_live() || (lockstep_in_battle() && !on_map);
+    return net_active() && net_peer_count() >= 2 && in_a_run() && !fighting &&
            (net_role() == NetRole::Host ? g.phase != 2 : !(g.active && g.view.phase == 2));
 }
 
@@ -1404,8 +1415,11 @@ void host_pump() {
     uint8_t phase = 0;
     // Not the backpack on the map, nor anything in a fight: those are the run's
     // own inventory, which the cat sync already carries.
-    if (!chooser_up() && !g.cats && inv_up() && !follow_on_map() && !lockstep_in_battle() &&
-        now - g.run_tried_at > kScanMs) {
+    // Not the backpack opened on the run's map either: the map stops ticking
+    // under it, and taken for the House defense's gear screen it locked the
+    // friend's backpack shut (its confirm is this screen's close; 2026-11-07).
+    if (!chooser_up() && !g.cats && inv_up() && !follow_on_map() && !combatlock_menu_live() &&
+        !leave_scene_up("Map") && now - g.run_tried_at > kScanMs) {
         g.run_tried_at = now;
         if (claim_run()) g.chooser_gone_at = now;
     }

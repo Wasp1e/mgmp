@@ -1880,11 +1880,27 @@ void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
     }
 }
 
+// A state hash of 0 is one this peer could not take -- after a reconnect in
+// the middle of a fight the client's was 0 for good, and on 2026-11-07 that 0
+// against the host's real one halted a guillotine fight whose streams were in
+// step. Not a disagreement: that half is left out, and the stream still counts.
+bool state_agrees(const HashMsg& mine, const HashMsg& theirs) {
+    if (mine.state_hash == theirs.state_hash) return true;
+    if (mine.state_hash && theirs.state_hash) return false;
+    static uint32_t said_turn = 0xFFFFFFFF;
+    if (said_turn != mine.turn && (said_turn == 0xFFFFFFFF || mine.turn > said_turn + 50)) {
+        said_turn = mine.turn;
+        log_line("LOCKSTEP", "turn %u: %s state hash was not taken -- comparing the stream and"
+                             " queue only", mine.turn, mine.state_hash ? "the peer's" : "this peer's");
+    }
+    return true;
+}
+
 void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
     if (mine.turn != theirs.turn) return;
     if (mine.rng_hash == theirs.rng_hash &&
         mine.queue_depth == theirs.queue_depth &&
-        mine.state_hash == theirs.state_hash)
+        state_agrees(mine, theirs))
         return;
 
     // Say which half disagreed, because the two mean different things. RNG or
@@ -1968,7 +1984,7 @@ void report_pair(const HashMsg& mine, const HashMsg& theirs, uint8_t peer) {
     }
     if (mine.rng_hash == theirs.rng_hash &&
         mine.queue_depth == theirs.queue_depth &&
-        mine.state_hash == theirs.state_hash) {
+        state_agrees(mine, theirs)) {
         ++g.agreements;
         // Trace, not Info: this is one line per turn per peer, and in a healthy
         // session it is the single loudest thing in the panel -- 59 of them in
@@ -2008,7 +2024,46 @@ void report_pair(const HashMsg& mine, const HashMsg& theirs, uint8_t peer) {
 
 // ---------------------------------------------------------------------------
 
+// THE BATTLE'S TurnControl, every frame (its update, vtable 0x11212B0 slot 10,
+// sub_1408E2A30). A fight loaded from a save -- the House defense resumed --
+// opens on a human cat's turn with no NextTurn before it, so the roster was
+// first taken at the END of that turn: the host played it unsent and the
+// friend's game had that cat under its own mouse (2026-11-07, the guillotine).
+// With the TurnControl in hand the first decision asked takes the roster.
+constexpr uintptr_t kRva_TcSlot   = 0x11212B0 + 10 * 8;
+constexpr uintptr_t kRva_TcUpdate = 0x8E2A30;
+using fn_tc_update = void* (__fastcall*)(void*, void*, void*, void*);
+fn_tc_update g_o_tc  = nullptr;
+void*        g_tc    = nullptr;
+uint64_t     g_tc_at = 0;
+// The character whose turn began last (Character::BeginTurn, after it ran):
+// BeginTurn draws from the stream, so the roster of a fight opened mid-turn is
+// taken only once the asked cat's turn has begun -- on 2026-11-07 the client's
+// was taken a second before its BeginTurn and the host's just after, and the
+// enemy's first move went two ways.
+const void* g_begun = nullptr;
+
+void* __fastcall tc_update(void* a, void* b, void* c, void* d) {
+    g_tc    = a;
+    g_tc_at = GetTickCount64();
+    return g_o_tc(a, b, c, d);
+}
+
 void lockstep_set_base(uintptr_t base) {
+    if (!g_o_tc) {
+        void** slot = (void**)(base + kRva_TcSlot);
+        void*  have = nullptr;
+        DWORD  prot = 0;
+        if (mem_read(slot, &have, sizeof(have)) && (uintptr_t)have == base + kRva_TcUpdate &&
+            VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+            g_o_tc = (fn_tc_update)have;
+            *slot  = (void*)&tc_update;
+            VirtualProtect(slot, sizeof(void*), prot, &prot);
+        } else {
+            log_line("LOCKSTEP", "!! the TurnControl update moved -- a fight loaded from a save"
+                                 " plays its first turn unsynced");
+        }
+    }
     g.affecting_elements = nullptr;
 
     const uintptr_t addr = addr_of_call(C_AffectingElements);
@@ -2597,6 +2652,18 @@ bool lockstep_fill_choice(void* brain, void* out) {
         return true;
     }
 
+    const void* asked = nullptr;
+    mem_read((const uint8_t*)brain + kBrain_Owner, &asked, sizeof(asked));
+    if (g_tc && GetTickCount64() - g_tc_at < 1000 && net_peer_count() >= 2 &&
+        asked && asked == g_begun &&
+        (!g.snapped || resolve_char_list(g_tc) != g.snapped_list)) {
+        // A decision asked before this fight's first turn boundary: one that
+        // opened in the middle of a turn. Its boundary now, on both peers at
+        // the same point -- the roster, the split and the barrier with it.
+        log_line("LOCKSTEP", "a decision before this fight's first turn boundary -- it opened"
+                             " mid-turn (loaded from a save); taking the roster now");
+        lockstep_turn_boundary(g_tc);
+    }
     if (!g.snapped) return false;
 
     const void* actor = nullptr;
@@ -3297,6 +3364,8 @@ void lockstep_owner_put(uint64_t id, uint8_t pos) {
     g.owners.pos[g.owners.count] = pos;
     ++g.owners.count;
 }
+
+void lockstep_on_begin_turn(const void* character) { g_begun = character; }
 
 bool lockstep_cat_known(uint64_t id) {
     Guard guard;

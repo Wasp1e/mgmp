@@ -7,6 +7,7 @@
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_tuning.h"
+#include <windows.h>
 
 namespace mgmp {
 namespace {
@@ -86,7 +87,15 @@ bool is_ours(const void* button) {
 
 } // namespace
 
+// When the battle's combat menu last updated: a fight is on screen. The
+// lockstep's "in battle" stays set on the map and in the House until the next
+// fight, so it cannot say this (2026-11-07: the House defense's gear screen and
+// the run's backpack both took a finished fight for a live one).
+static uint64_t g_menu_at = 0;
+bool combatlock_menu_live() { return g_menu_at && GetTickCount64() - g_menu_at < 1000; }
+
 void combatlock_enter(void* combat_menu) {
+    g_menu_at = GetTickCount64();
     g.engaged = false;
     g.held    = false;
     g.buttons = 0;

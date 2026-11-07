@@ -174,6 +174,13 @@ struct State {
     PeerPick picks[kMaxPicks];
     uint32_t pick_count = 0;
     uint64_t released_cat = 0;    // a pick that could not apply; the host decides
+    // CLIENT: the cat whose level-up the host's pick was just put on, and when.
+    // A passive that replaces one opens the replace panel here too, and that
+    // panel's choice is not the host's to send: on 2026-11-07 the friend's
+    // screen came back to its options after the host's EternalHealth and sat
+    // there, its clicks suppressed. So it comes back to this player.
+    uint64_t lvl_applied_cat = 0;
+    uint64_t lvl_applied_at  = 0;
     void*    said_screen  = nullptr;
     void*    said_event   = nullptr;
 
@@ -543,6 +550,10 @@ void apply_pending(uint8_t kind, void* screen) {
     g.pending_warned[kind] = false;
     if (ok) {
         ++g.applied;
+        if (kind == kChoiceLevelUp && g.is_client) {
+            g.lvl_applied_cat = g.pending_cat;
+            g.lvl_applied_at  = GetTickCount64();
+        }
         log_line("CHOICE", "applied the host's %s choice: option %u/%u ('%s')",
                  kind_name(kind), want, count, mine);
     } else {
@@ -813,6 +824,8 @@ bool choice_on_level_select(void* screen, void* opt) {
                            " the other player", (unsigned long long)cat);
         return false;
     }
+    // The host's cat, given back to finish here: the host has its pick already.
+    if (g.is_client && !mine) return true;
 
     // The option arrives as a COPY (the button callback copy-constructs it
     // through sub_14037BBB0), so the index cannot come from pointer arithmetic
@@ -897,6 +910,14 @@ void choice_on_level_update(void* level_screen) {
     } else if (g.said_screen != level_screen) {
         g.said_screen = level_screen;
         g.screen_at   = GetTickCount64();
+        if (g.is_client && !mine && cat && cat == g.lvl_applied_cat &&
+            g.screen_at - g.lvl_applied_at < 120000) {
+            g.released_cat    = cat;
+            g.lvl_applied_cat = 0;
+            log_line("CHOICE", "the host's pick for cat %016llx came back to its options here (a"
+                               " passive's replace panel) -- this screen is this player's to finish",
+                     (unsigned long long)cat);
+        }
         char opts[192] = {};
         {
             uint8_t* begin = nullptr;

@@ -142,7 +142,7 @@ struct State {
     // client: the last cutscene its own game started, and the host's not played
     char      own_name[48] = {};
     uint64_t  own_at       = 0;
-    struct Start { char name[48]; uint32_t flags; uint64_t at; };
+    struct Start { char name[48]; uint32_t flags; uint64_t at; uint64_t first; bool held; };
     Start     starts[4] = {};
     uint32_t  nstarts   = 0;
     char      host_name[48] = {};   // the host's last start, kept for the skip
@@ -269,10 +269,13 @@ void* __fastcall drawer_update(void* a, void* b, void* c, void* d) {
     return r;
 }
 
+void send_quest_items(bool only_changed = false);
+
 void* __fastcall office_update(void* a, void* b, void* c, void* d) {
     g.office    = a;
     g.office_at = GetTickCount64();
     void* r = g.o_office(a, b, c, d);
+    if (net_role() == NetRole::Host && net_active()) send_quest_items(true);
     if (g.exit_wanted && net_role() != NetRole::Host) {
         g.exit_wanted = false;
         const bool ok = safe_exit_office(a);
@@ -285,8 +288,153 @@ void* __fastcall office_update(void* a, void* b, void* c, void* d) {
 struct GameStr;
 bool set_game_str(void* s, const char* text);
 
+// THE QUEST ITEMS. MewDirector+0x5A8 is the GlobalProgressionData, and its
+// +0x6C0 a std::vector<std::string> of quest items (begin, end, capacity end):
+// an NPC office's "gather_questitem_info newest" (sub_1408EEA60) takes the last
+// one, end - 0x20, unchecked. The friend's list was empty where the host's was
+// not, and its game read before the list's start (2026-11-07, at 0x8F0B35).
+constexpr uintptr_t kDir_Progress  = 0x5A8;
+constexpr uintptr_t kProg_Quests   = 0x6C0;
+constexpr uint32_t  kMaxQuests     = 32;
+constexpr size_t    kStrSize       = 0x20;
+
+uint8_t* quest_vector() {
+    void* const* slot = (void* const*)addr_of_data(D_MewDirectorPtr);
+    void* dir  = nullptr;
+    void* prog = nullptr;
+    if (!slot || !mem_read(slot, &dir, sizeof(dir)) || !dir ||
+        !mem_read((const uint8_t*)dir + kDir_Progress, &prog, sizeof(prog)) || !prog)
+        return nullptr;
+    return (uint8_t*)prog + kProg_Quests;
+}
+
+// THE NPC'S REWARD FLAG. The talk picker (sub_1401C4410) and "get npc_reward"
+// (CacheInReward, sub_1401C18E0) both read GlobalProgressionData + npc * 0x78
+// + 0x90: a reward is due. The host's was set by what it did in its House since
+// the save the client loaded; the client's was not, so its office had nothing
+// to say, and forced into the host's talk its "get npc_reward" handed out no
+// quest item and "gather_questitem_info newest" went down (2026-11-07,
+// Beanies). So each talk carries the host's flag, set here before this game
+// picks: its own picker and its own reward then do what the host's did.
+constexpr uintptr_t kProg_NpcStride = 0x78;
+constexpr uintptr_t kProg_NpcReward = 0x90;
+constexpr int       kMaxNpc         = 16;
+
+uint8_t* npc_reward_flag(int npc) {
+    if (npc < 0 || npc >= kMaxNpc) return nullptr;
+    uint8_t* v = quest_vector();
+    return v ? v - kProg_Quests + kProg_NpcReward + (uintptr_t)npc * kProg_NpcStride : nullptr;
+}
+uint32_t host_reward_aux(int npc) {
+    uint8_t* f = npc_reward_flag(npc);
+    uint8_t  b = 0;
+    return f && mem_read(f, &b, 1) ? 0x100u | b : 0;
+}
+
+// HOST: its quest items, for the client's office to read the same. The list
+// also grows in the middle of a talk (Beanies hands out the quest, then reads
+// it back a few lines on), so the office's update sends it again whenever it
+// changed (`only_changed`).
+uint64_t g_quest_sent = 0;
+void send_quest_items(bool only_changed) {
+    if (net_role() != NetRole::Host || net_peer_count() < 2) return;
+    uint8_t* v = quest_vector();
+    uint8_t* q[3] = {};
+    if (!v || !mem_read(v, q, sizeof(q))) return;
+    uint32_t n = (q[0] && q[1] >= q[0]) ? (uint32_t)((q[1] - q[0]) / kStrSize) : 0;
+    if (n > kMaxQuests) n = kMaxQuests;
+    static char names[kMaxQuests][48];
+    uint64_t h = 0xCBF29CE484222325ull ^ n;
+    for (uint32_t i = 0; i < n; ++i) {
+        names[i][0] = 0;
+        mem_read_std_string(q[0] + i * kStrSize, names[i], sizeof(names[i]));
+        for (const char* s = names[i]; *s; ++s) h = (h ^ (uint8_t)*s) * 0x100000001B3ull;
+        h = (h ^ 0xFF) * 0x100000001B3ull;
+    }
+    if (only_changed && h == g_quest_sent) return;
+    g_quest_sent = h;
+    if (!n) {
+        ChoiceMsg c{};
+        c.kind = kChoiceQuestItem;
+        net_send_choice(c);
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        ChoiceMsg c{};
+        c.kind  = kChoiceQuestItem;
+        c.index = i;
+        c.count = n;
+        strncpy_s(c.name, names[i], _TRUNCATE);
+        net_send_choice(c);
+    }
+    log_line("CUTSCENE", "-> the quest items (%u)%s%s", n, n ? ", newest " : "", n ? names[n - 1] : "");
+}
+
+bool make_name(GameStr& s, const char* text);
+bool safe_alloc(size_t n, void** out);
+
+// CLIENT: the host's quest items, written over this game's list.
+char     g_quest[kMaxQuests][48];
+uint32_t g_quest_n = 0;
+
+void apply_quest_items(uint32_t n) {
+    uint8_t* v = quest_vector();
+    uint8_t* q[3] = {};
+    if (!v || !mem_read(v, q, sizeof(q))) return;
+    const uint32_t have = (q[0] && q[1] >= q[0]) ? (uint32_t)((q[1] - q[0]) / kStrSize) : 0;
+    const uint32_t room = (q[0] && q[2] >= q[0]) ? (uint32_t)((q[2] - q[0]) / kStrSize) : 0;
+    bool same = have == n;
+    for (uint32_t i = 0; same && i < n; ++i) {
+        char k[48] = {};
+        mem_read_std_string(q[0] + i * kStrSize, k, sizeof(k));
+        same = strcmp(k, g_quest[i]) == 0;
+    }
+    if (same) {
+        log_line("CUTSCENE", "<- the host's quest items (%u) -- this game has the same", n);
+        return;
+    }
+    uint8_t* base = q[0];
+    uint32_t live = have;   // constructed strings at base
+    if (n > room) {
+        // A bigger buffer from the game's own new; the strings move bitwise
+        // (MSVC's hold no pointer into themselves). The old buffer is left.
+        void* p = nullptr;
+        if (!safe_alloc((size_t)n * kStrSize, &p) || !p) {
+            log_line("CUTSCENE", "!! could not make room for the host's %u quest item(s)", n);
+            return;
+        }
+        if (have) memcpy(p, q[0], (size_t)have * kStrSize);
+        base = (uint8_t*)p;
+        q[2] = base + (size_t)n * kStrSize;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t* s = base + i * kStrSize;
+        if (i < live) set_game_str(s, g_quest[i]);
+        else {
+            GameStr fresh;
+            if (!make_name(fresh, g_quest[i])) { n = i; break; }
+            memcpy(s, &fresh, sizeof(fresh));
+        }
+    }
+    // Strings past the new end are left as they are (a few bytes).
+    q[0] = base;
+    q[1] = base + (size_t)n * kStrSize;
+    if (!mem_write(v, q, sizeof(q))) return;
+    log_line("CUTSCENE", "<- the host's quest items (%u, this game had %u)%s%s", n, have,
+             n ? ", newest " : "", n ? g_quest[n - 1] : "");
+}
+
 // See kRva_NextTalk.
+uint32_t g_talk_aux[16] = {};
+
 void* __fastcall next_talk(void* prog, void* out, int npc) {
+    if (net_role() != NetRole::Host && net_active() && g.talks_used < g.talks_have &&
+        g.talks_used < 16 && (g_talk_aux[g.talks_used] & 0x100)) {
+        uint8_t* f = npc_reward_flag(npc);
+        uint8_t  want = (uint8_t)(g_talk_aux[g.talks_used] & 0xFF), have = 0;
+        if (f && mem_read(f, &have, 1) && have != want && mem_write(f, &want, 1))
+            log_line("CUTSCENE", "<- NPC %d's reward flag %u, as the host's (this game had %u)",
+                     npc, want, have);
+    }
     void* r = g.o_talk(prog, out, npc);
     g.prog = prog;
     const uintptr_t ret = (uintptr_t)_ReturnAddress();
@@ -301,9 +449,11 @@ void* __fastcall next_talk(void* prog, void* out, int npc) {
         if (!key[0] && g.talk_none) return r;
         g.talk_none = !key[0];
         if (net_peer_count() >= 2) {
+            send_quest_items();
             ChoiceMsg c{};
             c.kind  = kChoiceOfficeTalk;
             c.index = g.talks_sent++;
+            c.aux   = host_reward_aux(npc);
             strncpy_s(c.name, key, _TRUNCATE);
             net_send_choice(c);
             log_line("CUTSCENE", "-> the NPC office's talk %u is '%s'", c.index, key);
@@ -350,6 +500,7 @@ void send_first_talk(int npc) {
     ChoiceMsg c{};
     c.kind  = kChoiceOfficeTalk;
     c.index = 0;
+    c.aux   = host_reward_aux(npc);
     strncpy_s(c.name, key, _TRUNCATE);
     net_send_choice(c);
     log_line("CUTSCENE", "-> the NPC office's talk 0 is '%s' (asked at the opening)", key);
@@ -368,6 +519,7 @@ uint64_t __fastcall go_office(void* drawer, int npc) {
                 strncpy_s(c.name, n, _TRUNCATE);
                 net_send_choice(c);
                 log_line("CUTSCENE", "-> NPC office %d opened here, sent", npc);
+                send_quest_items();
                 send_first_talk(npc);
             }
         } else {
@@ -599,9 +751,22 @@ void start_pump(bool up) {
     for (uint32_t i = 0; i < g.nstarts; ++i) {
         State::Start& s = g.starts[i];
         const bool own = g.own_at && strcmp(g.own_name, s.name) == 0 &&
-                         (g.own_at + kOwnWindowMs >= s.at);
+                         (g.own_at + kOwnWindowMs >= s.first);
         if (own) {
             log_line("CUTSCENE", "the host's cutscene '%s' started here by itself", s.name);
+            continue;
+        }
+        // Still loading the House the host's night sent (2026-11-07: the
+        // guillotine's cutscene came 10 s into the friend's reload and never
+        // played): it waits, and its time counts from the load's end -- which
+        // also gives this game's own start of it its chance first.
+        const bool office0 = strncmp(s.name, kOfficePrefix, sizeof(kOfficePrefix) - 1) == 0;
+        if (!office0 && (leave_loading(nullptr) || leave_busy())) {
+            if (!s.held)
+                log_line("CUTSCENE", "the host's cutscene '%s' waits for this game's loading", s.name);
+            s.held = true;
+            s.at   = now;
+            g.starts[kept++] = s;
             continue;
         }
         if (now - s.at > kStartStaleMs) {
@@ -746,9 +911,23 @@ void cutscene_pump() {
 }
 
 bool cutscene_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceQuestItem) {
+        if (net_role() == NetRole::Host) return true;
+        if (m.count == 0) { g_quest_n = 0; return true; }
+        if (m.count > kMaxQuests || m.index >= m.count) return true;
+        if (m.index == 0) g_quest_n = 0;
+        if (m.index != g_quest_n) return true;   // one went missing: wait for the next list
+        strncpy_s(g_quest[m.index], m.name, _TRUNCATE);
+        g_quest_n = m.index + 1;
+        if (g_quest_n == m.count)
+            log_line("CUTSCENE", "<- the host has %u quest item(s), newest %s", m.count,
+                     g_quest[m.count - 1]);
+        return true;
+    }
     if (m.kind == kChoiceOfficeTalk) {
         if (net_role() == NetRole::Host) return true;
         if (m.index < kMaxTalks) {
+            if (m.index < 16) g_talk_aux[m.index] = m.aux;
             strncpy_s(g.talks[m.index], m.name, _TRUNCATE);
             if (m.index + 1 > g.talks_have) g.talks_have = m.index + 1;
         }
@@ -771,6 +950,8 @@ bool cutscene_on_message(const ChoiceMsg& m) {
             strncpy_s(s.name, m.name, _TRUNCATE);
             s.flags = m.aux;
             s.at    = GetTickCount64();
+            s.first = s.at;
+            s.held  = false;
         }
         strncpy_s(g.host_name, m.name, _TRUNCATE);
         g.host_at = GetTickCount64();

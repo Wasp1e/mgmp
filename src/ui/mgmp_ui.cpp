@@ -352,7 +352,7 @@ float tear(uint32_t i, uint32_t salt) {
     return (float)(h & 0xFFFF) / 65535.0f;
 }
 
-void paper(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false) {
     std::vector<ImVec2> pts;
     const float step = 26.0f;
     // top, left to right
@@ -375,8 +375,23 @@ void paper(ImDrawList* dl, ImVec2 a, ImVec2 b) {
     const ImU32 fill    = IM_COL32(222, 222, 218, 250);
     const ImU32 outline = IM_COL32(40, 38, 36, 255);
     std::vector<ImVec2> sh(pts);
-    for (ImVec2& p : sh) { p.x += 5; p.y += 6; }
-    dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), shade);
+    if (inked) {
+        // The game's own outline: the shape in black a few pixels all round,
+        // and once more a little down and right.
+        constexpr float kInk = 4.0f;
+        const ImU32 ink = IM_COL32(18, 16, 16, 255);
+        for (int pass = 0; pass < 2; ++pass)
+            for (int i = 0; i < 12; ++i) {
+                const float t = i * 6.2831853f / 12;
+                const float dx = cosf(t) * kInk + (pass ? 3.0f : 0.0f);
+                const float dy = sinf(t) * kInk + (pass ? 4.0f : 0.0f);
+                for (size_t j = 0; j < pts.size(); ++j) sh[j] = ImVec2(pts[j].x + dx, pts[j].y + dy);
+                dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), ink);
+            }
+    } else {
+        for (ImVec2& p : sh) { p.x += 5; p.y += 6; }
+        dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), shade);
+    }
     dl->AddConcavePolyFilled(pts.data(), (int)pts.size(), fill);
     dl->AddPolyline(pts.data(), (int)pts.size(), outline, ImDrawFlags_Closed, 3.0f);
 }
@@ -433,14 +448,13 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
         for (int o = 0; o < 4; ++o)
             dl->AddText(ImVec2(r0.x + 12 + (o & 1) * 1.1f, r0.y + 3 + (o >> 1) * 1.0f),
                         hot ? IM_COL32(150, 40, 30, 255) : IM_COL32(26, 23, 20, 255), ok);
-        if (hot) dl->AddLine(ImVec2(r0.x + 10, r1.y), ImVec2(r1.x - 10, r1.y), IM_COL32(150, 40, 30, 255), 2.0f);
         if (g.paper_font) ImGui::PopFont();
         dl->ChannelsSetCurrent(0);
         // The tears and the shadow go past the window's edges; the window
         // clips to itself, and on 2026-11-05 that cut the paper off square.
         dl->PushClipRectFullScreen();
         const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 14));
+        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 14), true);
         dl->PopClipRect();
         dl->ChannelsMerge();
     }
@@ -483,7 +497,7 @@ void draw_paper_note(const char* text, bool beside_round = false) {
         dl->ChannelsSetCurrent(0);
         dl->PushClipRectFullScreen();
         const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12));
+        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12), true);
         dl->PopClipRect();
         dl->ChannelsMerge();
     }

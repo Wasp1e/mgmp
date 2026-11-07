@@ -273,6 +273,7 @@ void __fastcall h_BeginTurn(void* self, int arg) {
     Who w(self, "char");
     log_line("BEGINTURN", "%s arg=%d", w.text, arg);
     o_BeginTurn(self, arg);
+    lockstep_on_begin_turn(self);
 }
 
 void __fastcall h_EndTurn(void* self) {

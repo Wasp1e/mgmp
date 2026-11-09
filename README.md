@@ -4,7 +4,7 @@ An unofficial mod that lets two people play one Mewgenics campaign together:
 the same House, the same runs, the same cats and the same fights, each player
 in charge of their own half of the cats.
 
-Version **0.22** (network protocol 77), for Mewgenics **1.1.21239**.
+Version **0.23** (network protocol 78), for Mewgenics **1.1.21239**.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the
@@ -44,7 +44,8 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
 - The backpack works move by move, with either backpack open: each player
   dresses their own cats.
 - Events, level-ups and shop level-ups offer the same options on both screens,
-  and each player picks for their own cats.
+  and each player picks for their own cats. A level-up reroll (the d6) is the
+  cat owner's and plays on both screens.
 
 **Fights**
 - Lockstep: only the players' clicks travel, both games roll the same dice and
@@ -64,7 +65,9 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
   Russian, English otherwise.
 
 **Still rough**
-- Two players. The code has room for more, but only two have ever played.
+- Two players is what has been played the most. Three and four connect, split
+  the cats and share the backpack and gear screens, but have only been tried
+  locally so far.
 - It is pinned to one version of the game (see
   [When the game updates](#when-the-game-updates)).
 - Expect bugs. Report them with the logs of **both** players.

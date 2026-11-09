@@ -11,6 +11,7 @@
 #include "mgmp_proto.h"
 #include "mgmp_invsync.h"    // invsync_screen_open
 #include "mgmp_lockstep.h"   // lockstep_in_battle
+#include "mgmp_leave.h"      // leave_scene_up
 
 #include <windows.h>
 #include <cstdio>
@@ -570,11 +571,16 @@ static void apply_now(const CatDataMsg& m, const char* when) {
         return;
     }
 
+    // The run's cat list when there is a run; in the House there is none, but
+    // the registry it looks cats up in is there all the same.
     RunCats rc{};
     if (!run_cats(rc)) {
-        // Before a save is loaded there is no run to write into. Not an error:
-        // the host may publish while this peer is still on the menu.
-        return;
+        const void* dir = nullptr;
+        rc = RunCats{};
+        if (!g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir ||
+            !mem_read((const uint8_t*)dir + kDir_CatRegistry, &rc.registry, sizeof(rc.registry)) ||
+            !rc.registry)
+            return;   // before a save is loaded: nothing to write into
     }
 
     void* cat = nullptr;
@@ -726,7 +732,11 @@ void catsync_on_message(const CatDataMsg& m) {
     //
     // An open inventory holds the same way: a push now lands on the map too, and
     // the screen is showing these cats' slots. follow_edit_pump drains it.
-    const bool hold = lockstep_in_battle() || invsync_screen_open();
+    // In a fight, that is: the lockstep's "in battle" stays set on the map and
+    // in the House until the next fight, and a push for the House (the cats of
+    // a run about to start) held there would never land.
+    const bool hold = invsync_screen_open() ||
+                      (lockstep_in_battle() && !leave_scene_up("Map") && !leave_scene_up("House"));
     if (!hold) {
         g.declined_in_battle = false;   // re-arms the line for the next battle
     } else if (defer_applies()) {
@@ -762,6 +772,40 @@ void catsync_on_message(const CatDataMsg& m) {
 }
 
 uint32_t catsync_serialize(void* cat, uint8_t** out) { return serialize_cat(cat, out); }
+
+// HOST: these cats, whole, by their registry keys -- the party of a run or a
+// House defense, sent before the start so the client's chooser opens on the
+// host's cats. In the House the client's cats drift from the host's (a
+// reward, a trade, an NPC: each game does its own), and the class chooser and
+// gear screen showed other passives and abilities until a reload (2026-11-08).
+void catsync_push_keys(const uint64_t* keys, uint32_t n, const char* why) {
+    ensure_state();
+    if (!g.on || g.is_client || !net_active() || !g.director_slot) return;
+    const void* dir = nullptr;
+    const void* reg = nullptr;
+    if (!mem_read(g.director_slot, &dir, sizeof(dir)) || !dir ||
+        !mem_read((const uint8_t*)dir + kDir_CatRegistry, &reg, sizeof(reg)) || !reg)
+        return;
+    uint32_t sent = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        void* cat = nullptr;
+        if (!keys[i] || !safe_by_id((void*)reg, keys[i], &cat) || !cat) continue;
+        uint8_t* bytes = nullptr;
+        const uint32_t sz = serialize_cat(cat, &bytes);
+        if (!sz) continue;
+        CatDataMsg m{};
+        m.id   = keys[i];
+        m.size = sz;
+        m.hash = fnv1a(bytes, sz);
+        m.data = bytes;
+        if (net_send_catdata(m)) {
+            ++sent;
+            if (uint64_t* prev = remembered(keys[i])) *prev = m.hash;
+        }
+        free(bytes);
+    }
+    log_line("CATSYNC", "-> %u of %u cat(s) sent whole (%s)", sent, n, why);
+}
 
 // One cat as a push carries it: the run list's key (CatData+0xC48, what
 // apply_now looks up), the game's bytes, their fnv1a. The caller frees m.data.

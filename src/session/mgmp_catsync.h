@@ -109,6 +109,8 @@ uint32_t catsync_serialize(void* cat, uint8_t** out);
 bool     catsync_snapshot(void* cat, CatDataMsg& m);
 // That serialization written back into this peer's cat of the same id, now.
 void     catsync_apply_now(const CatDataMsg& m, const char* why);
+// HOST: the cats with these registry keys, sent whole now (a run's party).
+void     catsync_push_keys(const uint64_t* keys, uint32_t n, const char* why);
 
 // The CatData+0 of every cat in the run. 0 if any of them cannot be read.
 uint32_t catsync_run_uids(uint64_t* out, uint32_t max);

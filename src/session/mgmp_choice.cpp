@@ -22,6 +22,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 namespace mgmp {
 namespace {
@@ -215,6 +216,21 @@ struct State {
     uint64_t pre_id   = 0;
     uint64_t pre_hash = 0;
     void*    o_lvl_init = nullptr;
+    void*    o_reroll   = nullptr;
+
+    // The other player's rerolls of a level-up screen, played here in order
+    // once that cat's screen is up, each from the stream the owner rolled from.
+    struct Reroll {
+        uint64_t cat = 0;
+        uint64_t s[4] = {};
+        uint32_t seq = 0;
+        uint8_t  have = 0;   // halves arrived, bit per half
+        uint64_t at = 0;
+    };
+    static constexpr uint32_t kMaxRerolls = 8;
+    Reroll   rerolls[kMaxRerolls];
+    uint32_t reroll_count = 0;
+    uint32_t reroll_seq   = 0;
     uint64_t shop_cat    = 0;
     uint64_t shop_seed   = 0;
     uint64_t shop_at     = 0;
@@ -512,17 +528,29 @@ void apply_pending(uint8_t kind, void* screen) {
 
     // Count first: if the two lists are different lengths the index means
     // nothing, and saying so beats picking the wrong option.
+    // A level-up the host's pick cannot land on is this player's to finish:
+    // the host has its pick, and with the clicks still suppressed the screen
+    // could not be closed (2026-11-08: the host's d6 made eight options, the
+    // friend's screen had four and sat there until a trip to the menu).
+    auto release = [&]() {
+        if (kind != kChoiceLevelUp || !g.is_client || !g.pending_cat) return;
+        g.released_cat = g.pending_cat;
+        log_line("CHOICE", "the level-up screen for cat %016llx is this player's to finish",
+                 (unsigned long long)g.pending_cat);
+    };
     if (their && their != count) {
         log_line("CHOICE", "!! host offered %u %s option(s), this peer built %u --"
                            " refusing to choose; the two screens are not the same screen",
                  their, kind_name(kind), count);
         g.pending[kind] = false;
+        release();
         return;
     }
     if (want >= count) {
         log_line("CHOICE", "!! host chose %s option %u but this peer has only %u --"
                            " refusing", kind_name(kind), want, count);
         g.pending[kind] = false;
+        release();
         return;
     }
 
@@ -621,6 +649,97 @@ void* __fastcall lvl_init(void* screen, void* cat, void* fn) {
     return ((fn_lvl_init)g.o_lvl_init)(screen, cat, fn);
 }
 
+// THE REROLL. LevelUpScreen::Reroll (sub_140383FE0, this), the reroll button's
+// lambda (init's lambda_3, vtable 0xF13E58, _Do_call 0x387450) and nothing
+// else: it takes one of +0xE4's rerolls and rolls the options again from the
+// global stream. The cat's owner rolls; the other screen rolls with it, from
+// the stream the owner rolled from, and its own button does nothing
+// (2026-11-09: the d6 rerolled each screen on its own).
+constexpr uintptr_t kRva_LevelReroll = 0x383FE0;
+const uint8_t kRerollPrologue[10] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18 };
+constexpr uintptr_t kLvl_Rerolls = 0xE4;
+using fn_reroll = void (__fastcall*)(void*);
+
+void __fastcall lvl_reroll(void* screen) {
+    if (!g.on || !net_active() || g.injecting || !screen)
+        return ((fn_reroll)g.o_reroll)(screen);
+    const uint64_t cat  = screen_cat(screen, kLvl_Cat);
+    const bool     mine = lockstep_cat_mine(cat);
+    int32_t left = 0;
+    mem_read((const uint8_t*)screen + kLvl_Rerolls, &left, sizeof(left));
+    {
+        Guard guard;
+        const bool nobody_there = !g.is_client && cat != g.client_open_cat &&
+                                  GetTickCount64() - g.screen_at >= State::kOpenWaitMs;
+        if (!mine && !nobody_there && cat != g.released_cat) {
+            ++g.swallowed;
+            log_line("CHOICE", "suppressed a local reroll -- cat %016llx belongs to the other"
+                               " player, whose roll plays here", (unsigned long long)cat);
+            return;
+        }
+    }
+    uint64_t* s = rng_global_stream();
+    // A host's cat given back to this client to finish: the host's screen is
+    // gone, there is nobody to roll with.
+    if (s && cat && left > 0 && !(g.is_client && !mine)) {
+        const uint32_t seq = ++g.reroll_seq;
+        for (uint32_t h = 0; h < 2; ++h) {
+            ChoiceMsg m{};
+            m.kind      = kChoiceReroll;
+            m.index     = h;
+            m.count     = seq;
+            m.node_seed = s[h * 2];
+            m.cat       = s[h * 2 + 1];
+            _snprintf_s(m.name, sizeof(m.name), _TRUNCATE, "%016llx", (unsigned long long)cat);
+            net_send_choice(m);
+        }
+        log_line("CHOICE", "-> reroll #%u of the level-up for cat %016llx (%d left before it)",
+                 seq, (unsigned long long)cat, left);
+    }
+    ((fn_reroll)g.o_reroll)(screen);
+}
+
+namespace {
+// The other player's reroll for this screen's cat, if one is due. Guard held.
+void apply_rerolls(void* screen, uint64_t cat) {
+    const uint64_t now = GetTickCount64();
+    while (g.reroll_count) {
+        State::Reroll& r = g.rerolls[0];
+        if (r.have != 3 && now - r.at < 5000) return;       // its other half is on the way
+        if (r.have == 3 && r.cat != cat && now - r.at < 120000) return;   // another cat's screen
+        if (r.have == 3 && r.cat == cat && g.o_reroll) {
+            uint64_t* s = rng_global_stream();
+            if (s) {
+                const bool same = memcmp(s, r.s, sizeof(r.s)) == 0;
+                memcpy(s, r.s, sizeof(r.s));
+                g.injecting = true;
+                ((fn_reroll)g.o_reroll)(screen);
+                g.injecting = false;
+                ++g.applied;
+                char opts[192] = {};
+                uint8_t* begin = nullptr;
+                uint32_t count = 0;
+                size_t at = 0;
+                if (read_options(screen, kLvl_OptBegin, kLvl_OptEnd, begin, count))
+                    for (uint32_t i = 0; i < count; ++i) {
+                        char nm[48] = {};
+                        option_name(kChoiceLevelUp, begin + (uintptr_t)i * kOptStride, nm, sizeof(nm));
+                        at += _snprintf_s(opts + at, sizeof(opts) - at, _TRUNCATE, "%s%s", i ? ", " : "", nm);
+                    }
+                log_line("CHOICE", "<- the other player's reroll #%u for cat %016llx played here%s (%s)",
+                         r.seq, (unsigned long long)cat,
+                         same ? "" : ", from their stream", opts);
+            }
+        } else {
+            log_line("CHOICE", "!! a reroll for cat %016llx never found its screen -- dropped",
+                     (unsigned long long)r.cat);
+        }
+        memmove(&g.rerolls[0], &g.rerolls[1], sizeof(g.rerolls[0]) * (g.reroll_count - 1));
+        --g.reroll_count;
+    }
+}
+} // namespace
+
 void choice_on_catpre(const CatDataMsg& m) {
     if (!g.is_client || !m.data || !m.size) return;
     free(g.pre_data);
@@ -642,6 +761,16 @@ void choice_set_base(uintptr_t base) {
             g.o_lvl_init = nullptr;
             log_line("CHOICE", "!! the level-up screen's init moved -- a shop level-up may offer"
                                " different options on the two screens");
+        }
+    }
+    if (!g.o_reroll) {
+        void* rr = (void*)(base + kRva_LevelReroll);
+        if (memcmp(rr, kRerollPrologue, sizeof(kRerollPrologue)) != 0 ||
+            MH_CreateHook(rr, (void*)&lvl_reroll, &g.o_reroll) != MH_OK ||
+            MH_EnableHook(rr) != MH_OK) {
+            g.o_reroll = nullptr;
+            log_line("CHOICE", "!! the level-up reroll moved -- each player's reroll stays on"
+                               " their own screen");
         }
     }
     g.resolved = false;
@@ -948,6 +1077,8 @@ void choice_on_level_update(void* level_screen) {
         }
     }
 
+    if (!mine && !committed) apply_rerolls(level_screen, cat);
+
     if (!g.is_client) {
         if (!mine && !committed) apply_peer_pick(kChoiceLevelUp, level_screen, cat);
         return;
@@ -1032,6 +1163,32 @@ void choice_on_message(const ChoiceMsg& m) {
 
     if (m.kind == kChoiceOpen) {
         if (!g.is_client) g.client_open_cat = m.cat;
+        return;
+    }
+    if (m.kind == kChoiceReroll) {
+        const uint64_t cat = strtoull(m.name, nullptr, 16);
+        if (!cat || m.index > 1) return;
+        State::Reroll* r = nullptr;
+        for (uint32_t i = 0; i < g.reroll_count; ++i)
+            if (g.rerolls[i].cat == cat && g.rerolls[i].seq == m.count) r = &g.rerolls[i];
+        if (!r) {
+            if (g.reroll_count >= State::kMaxRerolls) {
+                log_line("CHOICE", "!! %u rerolls already held -- dropping one for cat %016llx",
+                         g.reroll_count, (unsigned long long)cat);
+                return;
+            }
+            r = &g.rerolls[g.reroll_count++];
+            *r = State::Reroll{};
+            r->cat = cat;
+            r->seq = m.count;
+            r->at  = GetTickCount64();
+        }
+        r->s[m.index * 2]     = m.node_seed;
+        r->s[m.index * 2 + 1] = m.cat;
+        r->have |= (uint8_t)(1u << m.index);
+        if (r->have == 3)
+            log_line("CHOICE", "<- the other player rerolled the level-up for cat %016llx (#%u)",
+                     (unsigned long long)cat, m.count);
         return;
     }
     if (m.kind == kChoiceShopRng) {

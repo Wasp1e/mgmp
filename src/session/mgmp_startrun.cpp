@@ -4,6 +4,7 @@
 #include "mgmp_log.h"
 #include "mgmp_resolve.h"
 #include "mgmp_leave.h"
+#include "mgmp_catsync.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -120,6 +121,12 @@ void send_party(void* cats) {
     uint32_t nk = 0;
     if (cats && mem_read(cats, &kv, sizeof(kv)) && kv.data) nk = kv.count;
     if (nk > kMaxParty) nk = kMaxParty;
+    // The cats themselves first: the client's chooser copies them as it opens.
+    {
+        uint64_t keys[kMaxParty] = {};
+        for (uint32_t i = 0; i < nk; ++i) mem_read(&kv.data[i], &keys[i], sizeof(keys[i]));
+        catsync_push_keys(keys, nk, "the party, before the start");
+    }
     for (uint32_t i = 0; i < nk; ++i) {
         uint64_t k = 0;
         mem_read(&kv.data[i], &k, sizeof(k));

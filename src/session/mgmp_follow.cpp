@@ -379,6 +379,25 @@ static void unstick_marker(void* map_screen);
 static void show_pick(int32_t index);
 static void blink_pick(void* map_screen);
 
+static uint64_t g_entered_at = 0;   // the host's last EnterNode, by the clock
+
+bool follow_entered_within(uint64_t ms) {
+    return g_entered_at && GetTickCount64() - g_entered_at < ms;
+}
+
+// Whether a player other than this one owns a cat of the run. With none, there
+// is nobody to wait for at the map (2026-11-12: one cat, the host's, and the
+// host's clicks sat waiting on a friend who had nothing to play).
+static bool others_own_cats() {
+    uint64_t ids[64];
+    uint8_t  pos[64];
+    const uint32_t n = lockstep_owners_copy(ids, pos, 64);
+    if (!n) return true;                 // not known: wait, as before
+    for (uint32_t i = 0; i < n; ++i)
+        if (pos[i] != 0) return true;
+    return false;
+}
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !net_active() || !map_screen || !node) return true;
@@ -430,6 +449,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     g.host_clicks = 0;
     g.vote_go     = false;
     show_pick(-1);
+    g_entered_at  = GetTickCount64();
 
     uint32_t count = 0; void* data = nullptr;
     read_nodes(map_screen, count, data);
@@ -724,6 +744,11 @@ static bool vote_click(void* node) {
         return false;
     }
     if (g.vote_bypass || net_peer_count() < 2) return true;
+    if (!others_own_cats()) {
+        log_line("FOLLOW", "the host picked node %u -- the other player has no cats in this"
+                           " run, so nobody to wait for", index);
+        return true;
+    }
 
     // Going alone takes kAloneClicks clicks in a row on the one node, not two:
     // two came too easily, a double click by habit walked off without the friend.

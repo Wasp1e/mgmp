@@ -4,7 +4,7 @@ An unofficial mod that lets two people play one Mewgenics campaign together:
 the same House, the same runs, the same cats and the same fights, each player
 in charge of their own half of the cats.
 
-Version **0.23** (network protocol 78), for Mewgenics **1.1.21239**.
+Version **0.25** (network protocol 83), for Mewgenics **1.1.21239**.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the
@@ -31,6 +31,11 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
 - Only the host ends the day.
 
 **Setting off**
+- Every player picks cats for the run by dragging them into the House's box;
+  the box is the same on every screen, and the cats a player put in are that
+  player's for the run. A friend puts in up to two cats with two players, one
+  each with three or four (the host two with three); the note in the top right
+  corner counts them.
 - The game's own screens, on both sides: the class chooser, then the gear
   screen. The cats are split evenly; each player puts collars and gear on
   their own cats, the other player's cats are dimmed, and every move shows up
@@ -51,6 +56,8 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
 - Lockstep: only the players' clicks travel, both games roll the same dice and
   reach the same result. The other player's cat has its action bar greyed out.
 - You see your partner's cursor and what they are aiming at before they commit.
+- In a fight, double-click a tile during another player's turn to ping it: it
+  flashes in your colour on every screen for four seconds, with a sound.
 - Notes on screen: "Another player's turn", "Waiting for another player — not in
   the fight yet".
 - A friend who drops can rejoin in the middle of a fight. A fight loaded from a

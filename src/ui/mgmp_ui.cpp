@@ -29,6 +29,7 @@
 #include "mgmp_peerlog.h"
 #include "mgmp_night.h"
 #include "mgmp_meow.h"
+#include "mgmp_startrun.h"
 
 // Declared by imgui_impl_win32.h's owner rather than the header itself.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -1183,13 +1184,23 @@ void ui_on_swap(void* window) {
     // cat whose turn it is theirs (its bar greyed) -- a note at the top.
     const char* note = nullptr;
     if (refused)
-        note = tr(u8"\u0414\u0435\u043d\u044c \u0437\u0430\u043a\u0430\u043d\u0447\u0438\u0432\u0430\u0435\u0442 \u0445\u043e\u0441\u0442",
-                  "The host ends the day");
+        // The same button sets off and ends the day.
+        note = tr(u8"\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u0445\u043e\u0441\u0442\u0443",
+                  "Only the host can do this");
     else if (lockstep_in_battle() && lockstep_barrier_holding())
         note = tr(u8"\u0416\u0434\u0451\u043c \u0434\u0440\u0443\u0433\u043e\u0433\u043e \u0438\u0433\u0440\u043e\u043a\u0430 \u2014 \u043e\u043d \u0435\u0449\u0451 \u043d\u0435 \u0432 \u0431\u043e\u044e",
                   u8"Waiting for another player \u2014 not in the fight yet");
     else if (lockstep_in_battle() && combatlock_menu_live() && combatlock_engaged())
         note = tr(u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433\u043e\u0439 \u0438\u0433\u0440\u043e\u043a", "Another player's turn");
+    // The friend's share of the House's box before a run.
+    static char box_note[96];
+    uint32_t box_mine = 0, box_most = 0;
+    if (!note && !lockstep_in_battle() && startrun_box_note(box_mine, box_most)) {
+        snprintf(box_note, sizeof(box_note), "%s %u/%u",
+                 tr(u8"\u0422\u0432\u043e\u0438 \u043a\u043e\u0442\u044b \u0432 \u043a\u043e\u0440\u043e\u0431\u043a\u0435:", "Your cats in the box:"),
+                 box_mine, box_most);
+        note = box_note;
+    }
     g.forced = loading || night || note;
     if (!g.visible && !g.forced) return;
 
@@ -1212,7 +1223,7 @@ void ui_on_swap(void* window) {
     }
     if (loading) draw_loading(step);
     if (night) draw_night(night, nights, loading);
-    else if (note && !loading) draw_paper_note(note, !refused);
+    else if (note && !loading) draw_paper_note(note, true);   // all in the top right corner
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

@@ -169,6 +169,7 @@ struct State {
         uint8_t  kind = 0;
         uint64_t cat = 0;
         uint32_t index = 0, count = 0;
+        uint32_t aux = 0;
         char     name[48] = {};
     };
     static constexpr uint32_t kMaxPicks = 8;
@@ -217,6 +218,13 @@ struct State {
     uint64_t pre_hash = 0;
     void*    o_lvl_init = nullptr;
     void*    o_reroll   = nullptr;
+    // A passive's replace panel: the owner's choice of slot rides on its pick
+    // (aux >> 16, slot + 1), and the other screen takes that slot without the
+    // panel (2026-11-10: the panel opened on both, each could pick its own).
+    void*    o_repl_panel = nullptr;
+    void*    o_repl_call  = nullptr;
+    int32_t  repl_want    = -1;      // set across inject_level
+    bool     repl_due     = false;   // the panel was asked for and not built
 
     // The other player's rerolls of a level-up screen, played here in order
     // once that cat's screen is up, each from the stream the owner rolled from.
@@ -231,6 +239,7 @@ struct State {
     Reroll   rerolls[kMaxRerolls];
     uint32_t reroll_count = 0;
     uint32_t reroll_seq   = 0;
+    uint64_t level_seen_at = 0;   // the last level-up screen update
     uint64_t shop_cat    = 0;
     uint64_t shop_seed   = 0;
     uint64_t shop_at     = 0;
@@ -359,7 +368,26 @@ bool inject_event(uint32_t index) {
     return true;
 }
 
-bool inject_level(uint32_t index) {
+// THE PASSIVE REPLACE PANEL. select_option, for a passive the cat has no room
+// for, builds it through sub_140386900 and hands it a std::function whose
+// _Do_call is sub_140387D10: capture {vftable, LevelUpScreen*, LevelUpOption},
+// argument int* -- -1 is a cancel (+792 cleared), anything else puts the
+// passive in slot (n - 100) and finishes the screen (sub_140383E90).
+constexpr uintptr_t kRva_ReplPanel = 0x386900;
+constexpr uintptr_t kRva_ReplCall  = 0x387D10;
+constexpr uintptr_t kRva_ReplVtbl  = 0xF13B38;
+const uint8_t kReplPanelPrologue[10] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18 };
+const uint8_t kReplCallPrologue[10]  = { 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20 };
+using fn_repl_call  = void  (__fastcall*)(void*, int32_t*);
+using fn_repl_panel = void* (__fastcall*)(void*, void*, void*, void*, void*, void*, void*, void*);
+
+bool safe_repl_call(void* impl, int32_t* slot) {
+    __try { ((fn_repl_call)g.o_repl_call)(impl, slot); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// `aux` is the pick's: a replace slot in its top half, if the owner had one.
+bool inject_level(uint32_t index, uint32_t aux = 0) {
     uint8_t* begin = nullptr; uint32_t count = 0;
     if (!read_options(g.level_screen, kLvl_OptBegin, kLvl_OptEnd, begin, count)) return false;
     if (index >= count) return false;
@@ -369,9 +397,41 @@ bool inject_level(uint32_t index) {
     struct Cap { void* vt; void* screen; int32_t index; int32_t pad; };
     Cap cap = { nullptr, g.level_screen, (int32_t)index, 0 };
     if (!g.lvl_click) return false;
+    const uint32_t r = aux >> 16;
+    // No slot from the owner: on the owner the passive had room. Here it may
+    // not -- the owner's cat can arrive first with the passive already in it --
+    // and the panel then sat on this screen with nothing to answer it. It takes
+    // the first slot instead; the owner's cat, pushed after, puts it right.
+    const int32_t kReplFallback = 100;
+    const bool fallback = !r;
+    const int32_t want = r ? (int32_t)r - 1 : kReplFallback;
+    g.repl_want = g.o_repl_call ? want : -1;
+    g.repl_due  = false;
     g.injecting = true;
     g.lvl_click(&cap);
     g.injecting = false;
+    g.repl_want = -1;
+    if (g.repl_due) {
+        // The panel was not built: its callback runs here with the owner's
+        // slot, from a capture made of this screen's own option.
+        g.repl_due = false;
+        alignas(16) uint8_t impl[16 + kOptStride] = {};
+        *(uintptr_t*)impl = g.base + kRva_ReplVtbl;
+        *(void**)(impl + 8) = g.level_screen;
+        memcpy(impl + 16, begin + (uintptr_t)index * kOptStride, kOptStride);
+        int32_t slot = want;
+        g.injecting = true;
+        const bool ok = safe_repl_call(impl, &slot);
+        g.injecting = false;
+        if (!ok)
+            log_line("CHOICE", "!! the passive's replace into slot %d failed", slot - 100);
+        else if (fallback)
+            log_line("CHOICE", "the passive had no room here and did on the owner's screen -- it"
+                               " took slot 0 here, no replace panel; the owner's cat follows");
+        else
+            log_line("CHOICE", "the passive took slot %d, as on the owner's screen -- no replace"
+                               " panel here", slot - 100);
+    }
     return true;
 }
 
@@ -437,7 +497,7 @@ void apply_peer_pick(uint8_t kind, void* screen, uint64_t cat) {
                      kind_name(kind), p.index, mine, p.name, p.name, all, p.index);
         }
     }
-    const bool ok = (kind == kChoiceLevelUp) ? inject_level(pick) : inject_event(pick);
+    const bool ok = (kind == kChoiceLevelUp) ? inject_level(pick, p.aux) : inject_event(pick);
     if (ok) {
         ++g.applied;
         log_line("CHOICE", "applied the client's %s choice: option %u/%u ('%s')",
@@ -567,13 +627,14 @@ void apply_pending(uint8_t kind, void* screen) {
 
     if (kind == kChoiceLevelUp) {
         const uint32_t mine_type = option_type(begin + (uintptr_t)want * kOptStride);
-        if (g.pending_aux[kind] && mine_type != g.pending_aux[kind])
+        if ((g.pending_aux[kind] & 0xFFFF) && mine_type != (g.pending_aux[kind] & 0xFFFF))
             log_line("CHOICE", "!! level-up option %u is type %u here but %u on the"
                                " host -- taking it anyway",
-                     want, mine_type, g.pending_aux[kind]);
+                     want, mine_type, g.pending_aux[kind] & 0xFFFF);
     }
 
-    const bool ok = (kind == kChoiceLevelUp) ? inject_level(want) : inject_event(want);
+    const bool ok = (kind == kChoiceLevelUp) ? inject_level(want, g.pending_aux[kind])
+                                             : inject_event(want);
     g.pending[kind] = false;
     g.pending_warned[kind] = false;
     if (ok) {
@@ -699,6 +760,30 @@ void __fastcall lvl_reroll(void* screen) {
     ((fn_reroll)g.o_reroll)(screen);
 }
 
+// The owner's slot, onto the pick that is sent when the screen closes.
+void __fastcall repl_call(void* impl, int32_t* slot) {
+    if (g.on && !g.injecting && impl && slot && *slot >= 0 && *slot < 0xFFFF) {
+        void* screen = nullptr;
+        mem_read((const uint8_t*)impl + 8, &screen, sizeof(screen));
+        Guard guard;
+        if (g.lvl_pick_have && g.lvl_pick_screen == screen) {
+            g.lvl_pick.aux = (g.lvl_pick.aux & 0xFFFF) | ((uint32_t)(*slot + 1) << 16);
+            log_line("CHOICE", "level-up passive '%s' replaces slot %d -- the other screen"
+                               " replaces the same", g.lvl_pick.name, *slot - 100);
+        }
+    }
+    ((fn_repl_call)g.o_repl_call)(impl, slot);
+}
+
+// Not built for a pick that carries its slot: inject_level runs its callback.
+void* __fastcall repl_panel(void* a, void* b, void* c, void* d, void* e, void* f, void* h, void* i) {
+    if (g.injecting && g.repl_want >= 0) {
+        g.repl_due = true;
+        return nullptr;
+    }
+    return ((fn_repl_panel)g.o_repl_panel)(a, b, c, d, e, f, h, i);
+}
+
 namespace {
 // The other player's reroll for this screen's cat, if one is due. Guard held.
 void apply_rerolls(void* screen, uint64_t cat) {
@@ -771,6 +856,19 @@ void choice_set_base(uintptr_t base) {
             g.o_reroll = nullptr;
             log_line("CHOICE", "!! the level-up reroll moved -- each player's reroll stays on"
                                " their own screen");
+        }
+    }
+    if (!g.o_repl_call) {
+        void* rc = (void*)(base + kRva_ReplCall);
+        void* rp = (void*)(base + kRva_ReplPanel);
+        if (memcmp(rc, kReplCallPrologue, sizeof(kReplCallPrologue)) != 0 ||
+            memcmp(rp, kReplPanelPrologue, sizeof(kReplPanelPrologue)) != 0 ||
+            MH_CreateHook(rc, (void*)&repl_call, &g.o_repl_call) != MH_OK ||
+            MH_CreateHook(rp, (void*)&repl_panel, &g.o_repl_panel) != MH_OK ||
+            MH_EnableHook(rc) != MH_OK || MH_EnableHook(rp) != MH_OK) {
+            g.o_repl_call = nullptr;
+            log_line("CHOICE", "!! the passive replace panel moved -- it opens on both screens"
+                               " and the other player picks their own slot");
         }
     }
     g.resolved = false;
@@ -926,8 +1024,8 @@ void send_level_pick(const char* why) {
     const ChoiceMsg& m = g.lvl_pick;
     if (net_send_choice(m)) {
         ++g.sent;
-        log_line("CHOICE", "-> level-up option %u/%u (type %u '%s'), %s",
-                 m.index, m.count, m.aux, m.name, why);
+        log_line("CHOICE", "-> level-up option %u/%u (type %u '%s', replace %d), %s",
+                 m.index, m.count, m.aux & 0xFFFF, m.name, (int)(m.aux >> 16) - 1, why);
     }
 }
 
@@ -1006,8 +1104,13 @@ bool choice_on_level_select(void* screen, void* opt) {
     return true;
 }
 
+bool choice_level_screen_up() {
+    return g.level_seen_at && GetTickCount64() - g.level_seen_at < 500;
+}
+
 void choice_on_level_update(void* level_screen) {
     if (!g.on || !level_screen) return;
+    g.level_seen_at = GetTickCount64();
 
     const uint64_t cat  = screen_cat(level_screen, kLvl_Cat);
     const bool     mine = lockstep_cat_mine(cat);
@@ -1230,6 +1333,7 @@ void choice_on_message(const ChoiceMsg& m) {
         p.cat   = m.cat;
         p.index = m.index;
         p.count = m.count;
+        p.aux   = m.aux;
         memcpy(p.name, m.name, sizeof(p.name));
         p.name[sizeof(p.name) - 1] = '\0';
         log_line("CHOICE", "<- the client chose %s option %u/%u ('%s') for cat %016llx",

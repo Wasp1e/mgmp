@@ -11,6 +11,7 @@
 #include "mgmp_follow.h"   // follow_on_map
 #include "mgmp_leave.h"    // leave_on_house, leave_request_reload
 #include "mgmp_lockstep.h" // lockstep_in_battle
+#include "mgmp_combatlock.h" // combatlock_menu_live
 // A slot click starts a run, which makes the three per-run dedupe caches stale.
 // See the block in savefile_on_slot_click.
 #include "mgmp_catsync.h"
@@ -277,6 +278,7 @@ struct State {
     const void** director_slot = nullptr;
     bool     said_no_flush = false;
     bool     said_mid_node = false;
+    bool     entry_flush   = false;   // leaving the House: flush inside EnterNode on purpose
 
     // The House has no node pushes, so its sync is the save itself: the file's
     // mtime is watched while the host stands there. See house_tick.
@@ -457,6 +459,12 @@ bool flush_live_run() {
     // Freshness loses to safety here, and it is not a close call: a joiner that
     // gets the last checkpoint is still caught up by CATDATA, INVENTORY and the
     // replayed ACTIONs, whereas a host whose run is wedged has lost the run.
+    // The map still ticks for a moment after a node is clicked, with the run
+    // already inside it: on 2026-11-12 a flush landed there and the save came
+    // back with the cat standing on the miniboss, unable to go in or move on.
+    // Leaving the House is the one entry that flushes on purpose (the client
+    // needs the run's start) -- it says so with g.entry_flush.
+    if (!g.entry_flush && follow_entered_within(8000)) return false;
     if (!follow_on_map()) {
         if (!g.said_mid_node) {
             g.said_mid_node = true;
@@ -511,6 +519,11 @@ uint64_t day_signature(const uint8_t* d, uint32_t n) {
 bool publish(uint8_t to, uint8_t fresh) {
     ensure_dir();
     if (!g.have_dir) return false;
+    // Nobody to send to: no flush, no read. On 2026-11-11 the friend dropped at
+    // the gear screen and the host flushed the live run and read 200 KB off disk
+    // 4601 times in half an hour, every second, for a peer that was not there --
+    // and the game stuttered. A peer that comes back gets the catch-up copy.
+    if (to == kNoPeer && net_peer_count() < 2) return false;
 
     const bool flushed = flush_live_run();
     if (!flushed && !g.said_no_flush) {
@@ -649,7 +662,12 @@ void house_tick() {
     // The game saves as the fight starts; that file takes the client into the
     // same battle, measured the same night when the friend reconnected, and the
     // barrier holds the host until it is there.
-    if (g.in_house && !house && run && lockstep_in_battle()) {
+    // A fight with its combat menu up, not the lockstep's "in battle" alone: that
+    // stays set from the last fight of the last run, and on 2026-11-10 the host
+    // leaving the class chooser for the gear screen took it for a House fight --
+    // the client was sent a fresh save, reloaded off the gear screen and rolled
+    // a map of its own.
+    if (g.in_house && !house && run && lockstep_in_battle() && combatlock_menu_live()) {
         const uint64_t mtime = save_mtime();
         const bool settled   = mtime && mtime == g.seen_mtime;
         g.seen_mtime = mtime;
@@ -707,7 +725,9 @@ void savefile_on_leaving_house() {
     g.in_house = false;
     g.in_run   = true;
     log_line("SAVEFILE", "the run left the House -- sending it to the client first");
+    g.entry_flush = true;
     publish(kNoPeer, /*fresh=*/true);
+    g.entry_flush = false;
 }
 
 // A SECOND, INDEPENDENT ANSWER TO "IS THIS PEER IN A RUN", exported because

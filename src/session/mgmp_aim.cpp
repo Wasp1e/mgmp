@@ -12,6 +12,7 @@
 #include "mgmp_net.h"
 #include "mgmp_rng.h"
 #include "mgmp_tuning.h"
+#include "MinHook.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -457,6 +458,59 @@ void draw_held(void* brain, uint8_t cat) {
     }
 }
 
+// THE PLAYER'S OWN PREVIEW, PINNED TOO. The game draws the aim of the cat
+// being played every frame -- DrawAbilityAOE and the highlight, from
+// Brain::UpdateDecision -- and for some abilities that draws from the
+// simulation stream: on 2026-11-11 the friend aimed wp_MoneyBag_Medium, their
+// own preview moved their stream by however many frames it was up, and the shot
+// after it crit there (hp 31 -> 9) and not here (31 -> 18). The peer's copy of
+// the preview was already pinned (draw_fenced); now every call is, on both
+// machines alike, so no preview reaches a roll.
+fn_draw_aoe  o_pin_draw = nullptr;
+fn_highlight o_pin_hi   = nullptr;
+uint32_t     g_pin_moves = 0;
+
+uint64_t* pin_stream() {
+    return (net_active() && lockstep_in_battle()) ? rng_global_stream() : nullptr;
+}
+
+void pin_said(const char* what) {
+    if (++g_pin_moves <= 3)
+        log_line("AIM", "the aim preview (%s) drew from the simulation stream -- put back,"
+                        " so no preview reaches a roll", what);
+}
+
+void __fastcall pin_draw(void* brain, void* ability, iVec2D t, iVec2D d, int layer) {
+    uint64_t* s = pin_stream();
+    uint64_t keep[4] = {};
+    if (s) memcpy(keep, s, sizeof(keep));
+    o_pin_draw(brain, ability, t, d, layer);
+    if (s && memcmp(keep, s, sizeof(keep)) != 0) { memcpy(s, keep, sizeof(keep)); pin_said("the AOE"); }
+}
+
+void __fastcall pin_hi(void* brain, void* ability, int mode) {
+    uint64_t* s = pin_stream();
+    uint64_t keep[4] = {};
+    if (s) memcpy(keep, s, sizeof(keep));
+    o_pin_hi(brain, ability, mode);
+    if (s && memcmp(keep, s, sizeof(keep)) != 0) { memcpy(s, keep, sizeof(keep)); pin_said("the highlight"); }
+}
+
+void pin_previews(uintptr_t draw, uintptr_t hi) {
+    if (draw && !o_pin_draw &&
+        (MH_CreateHook((void*)draw, (void*)&pin_draw, (void**)&o_pin_draw) != MH_OK ||
+         MH_EnableHook((void*)draw) != MH_OK)) {
+        o_pin_draw = nullptr;
+        log_line("AIM", "!! could not pin DrawAbilityAOE -- an aim preview may move the stream");
+    }
+    if (hi && !o_pin_hi &&
+        (MH_CreateHook((void*)hi, (void*)&pin_hi, (void**)&o_pin_hi) != MH_OK ||
+         MH_EnableHook((void*)hi) != MH_OK)) {
+        o_pin_hi = nullptr;
+        log_line("AIM", "!! could not pin the ability highlight -- an aim preview may move the stream");
+    }
+}
+
 } // namespace
 
 void aim_set_base(uintptr_t base) {
@@ -470,6 +524,7 @@ void aim_set_base(uintptr_t base) {
     }
     g.draw = (fn_draw_aoe)addr;
     g.resolved = true;
+    pin_previews(addr, 0);
 
     // Graded softer than the aim itself: without it the peer sees the shape
     // under the cursor but not the tiles the cat can reach, which is a smaller
@@ -482,6 +537,7 @@ void aim_set_base(uintptr_t base) {
         return;
     }
     g.highlight = (fn_highlight)hi;
+    pin_previews(addr, hi);
 
     // Softer again, and BOTH OR NEITHER: half of a displacement is a cat left
     // standing somewhere it never walked to.

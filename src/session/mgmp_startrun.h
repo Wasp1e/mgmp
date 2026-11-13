@@ -24,6 +24,15 @@ void startrun_house_tick();
 // cutscene is played here (sub_1403C0210).
 void startrun_scene_tick();
 
+// HOST: the position of the player who put the cat with this run-list key
+// (CatData+0xC48) in the House's box, or -1. Such a cat is theirs for the run.
+int startrun_box_picker(uint64_t key);
+
+// The box up with a cat in it, and this player has a share to count (anyone
+// but the host of two): how many of the cats in it this player put there, and
+// the most they may.
+bool startrun_box_note(uint32_t& mine, uint32_t& most);
+
 // kChoiceRun*: true when the message was one of these.
 bool startrun_on_message(const ChoiceMsg& m);
 

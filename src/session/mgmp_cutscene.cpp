@@ -224,7 +224,12 @@ void maybe_skip(void* swf) {
 }
 
 void* __fastcall swf_update(void* a, void* b, void* c, void* d) {
-    g.swf_at = GetTickCount64();
+    const uint64_t now = GetTickCount64();
+    // A cutscene that stopped updating is over, and the next one can be built
+    // at the same address: on 2026-11-09 'king_intro' took the place of the
+    // 'game_intro' skipped 40 minutes before and was skipped with it, silently.
+    if (g.swf_at && now - g.swf_at > 1000) g.skip_seen = nullptr;
+    g.swf_at = now;
     if (is_second_player()) maybe_skip(a);
     return g.o_swf(a, b, c, d);
 }

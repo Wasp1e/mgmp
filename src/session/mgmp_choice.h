@@ -128,6 +128,8 @@ bool choice_on_level_select(void* screen, void* opt);
 // Per-frame ticks. Both cache the screen pointer and apply a held choice.
 void choice_on_event_update(void* world_event);
 void choice_on_level_update(void* level_screen);
+// A level-up screen updated within the last half second on this peer.
+bool choice_level_screen_up();
 
 // HOST: a level-up is being bought in the shop, so the screen that opens next is
 // sent to the client. CLIENT: choice_pump opens that screen, once a frame until

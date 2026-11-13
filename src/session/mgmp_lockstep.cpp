@@ -30,6 +30,7 @@
 #include "mgmp_rtti.h"
 #include "mgmp_rng.h"
 #include "mgmp_log.h"
+#include "MinHook.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -185,6 +186,8 @@ struct State {
     bool        local_cat[kMaxCats] = {};   // this peer's input decides for it
     OwnerTable  owners;                     // which player has which cat this run
     bool        human_cat[kMaxCats] = {};   // a human brain drives it at all
+    uint32_t    snap_count     = 0;         // the cats of the battle's start; familiars follow
+    uint8_t     last_human     = 0xFF;      // the human cat whose action applied last
     bool        snapped        = false;
     const void* snapped_list   = nullptr;   // the vector object we snapshotted
 
@@ -216,6 +219,7 @@ struct State {
 
     bool     correcting = false;  // a state-only mismatch waits on the peer's dump
     char     correcting_why[192] = {};
+    uint32_t rng_turn = 0xFFFFFFFF;   // the turn hashed_rng is from
     uint64_t hashed_rng[4] = {};  // the stream the hash at hashed_turn was taken over
     uint64_t host_hash_battle = 0;  // the last hash of the host's that was compared
     uint32_t host_hash_turn   = 0;
@@ -239,6 +243,18 @@ struct State {
         uint8_t cat  = 0;
         int32_t fx = 0, fy = 0;
     } pend_face;
+
+    // The stream the decision was made from, the same way: set on both peers as
+    // the action is applied. On 2026-11-11 the two streams came apart inside a
+    // turn with the same counted draws on both screens -- the game draws from it
+    // in dozens of places the hooks do not see -- and the friend's shot crit and
+    // ended the fight there and not on the host.
+    struct {
+        bool     have = false;
+        uint8_t  cat  = 0;
+        uint64_t s[4] = {};
+    } pend_rng;
+    uint32_t rng_set = 0;   // actions whose stream had to be set
 
     // The facing an end of turn committed to, held for the turn boundary -- see
     // pin_end_of_turn_facing.
@@ -800,6 +816,48 @@ uint8_t cat_index_of(const void* character) {
     return kNoCat;
 }
 
+// A FAMILIAR: a summon with a human brain. It is not in the roster the battle
+// started with, so both screens let their own player drive it, and on
+// 2026-11-12 the friend could move the host's familiar and the fight halted.
+// It joins the roster at its first decision, which both peers reach at the same
+// point of the same turn, so it gets the same index on both. Its owner is the
+// owner of the human cat that acted last -- the one that summoned it -- except
+// that with two players a host's familiar goes to a friend with no cats of
+// their own. Called only from the two decision polls, never from a lookup
+// that runs on one screen and not the other.
+static uint8_t adopt_familiar(const void* actor) {
+    if (!g.snapped || !actor || g.cat_count >= kMaxCats) return kNoCat;
+    const void* brain = nullptr;
+    char cls[96] = "?";
+    if (!mem_read((const uint8_t*)actor + kChar_Brain, &brain, sizeof(brain)) || !brain)
+        return kNoCat;
+    rtti_class_name(brain, cls, sizeof(cls));
+    if (!strstr(cls, tune::kReplayBrains)) return kNoCat;   // an AI summon: both drive it
+
+    bool mine_have = false, others_have = false;
+    for (uint32_t i = 0; i < g.snap_count; ++i) {
+        if (!g.human_cat[i]) continue;
+        if (g.local_cat[i]) mine_have = true; else others_have = true;
+    }
+    const bool host = net_role() == NetRole::Host;
+    const bool summoner_local = g.last_human < g.cat_count ? g.local_cat[g.last_human] : host;
+    const bool summoner_host  = host ? summoner_local : !summoner_local;
+    bool local = summoner_local;
+    if (summoner_host && net_peer_count() == 2) {
+        const bool friend_has_none = host ? !others_have : !mine_have;
+        local = host ? !friend_has_none : friend_has_none;
+    }
+    const uint8_t i = (uint8_t)g.cat_count++;
+    g.cats[i]      = actor;
+    g.human_cat[i] = true;
+    g.local_cat[i] = local;
+    ++g.humans;
+    log_line("LOCKSTEP", "a familiar joins the roster as cat %u (summoned by cat %d) -- %s", i,
+             g.last_human == kNoCat ? -1 : (int)g.last_human,
+             local ? "this player drives it" : "the other player drives it");
+    return i;
+}
+
 // CatData+0x00, the id the save and every catsync message use. 0 when there is
 // no CatData to read it from.
 static uint64_t cat_persistent_id(const void* character) {
@@ -952,11 +1010,14 @@ void snapshot_cats(void* turn_control) {
     }
     g.snapped      = true;
     g.snapped_list = list;
+    g.snap_count   = g.cat_count;
+    g.last_human   = kNoCat;
 
     // A new roster invalidates the table the last hash was taken over, and
     // re-arms the one-shot desync dump for this battle.
     g.hashed_valid = false;
     g.hashed_count = 0;
+    g.rng_turn     = 0xFFFFFFFF;
     g.dump_sent    = false;
     g.dump_seen    = false;
     g.correcting   = false;
@@ -1350,6 +1411,15 @@ void aggregate_controls(bool& all_in, uint64_t& odd_battle) {
 }
 
 const char* barrier_blocking() {
+    // Nobody else has a cat in this fight: nothing they could miss. A peer
+    // that arrives later is caught up by the action replay (2026-11-12: one
+    // cat, the host's, and the host held for a friend still loading).
+    if (g.snapped) {
+        bool others = false;
+        for (uint32_t i = 0; i < g.cat_count; ++i)
+            if (g.human_cat[i] && !g.local_cat[i]) { others = true; break; }
+        if (!others) return nullptr;
+    }
     bool     all_in = false;
     uint64_t peer_battle = 0;
     aggregate_controls(all_in, peer_battle);
@@ -1518,6 +1588,7 @@ HashMsg build_hash(void* turn_control) {
     if (uint64_t* s = rng_global_stream()) {
         h.rng_hash = fnv1a(s, 32);
         memcpy(g.hashed_rng, s, sizeof(g.hashed_rng));
+        g.rng_turn = h.turn;
     }
 
     // The decision queue. Cheapest and earliest divergence signal there is:
@@ -1671,6 +1742,19 @@ void halt(const char* why) {
 void send_state_dump(uint32_t turn) {
     if (g.dump_sent) return;
 
+    if (!g.hashed_valid && !g.state_hash_on && g.rng_turn == turn) {
+        StateDumpMsg m{};
+        m.battle_id = g.battles.current;
+        m.turn      = turn;
+        m.count     = 0;
+        m.stride    = (uint32_t)sizeof(CatState);
+        m.size      = 0;
+        memcpy(m.rng, g.hashed_rng, sizeof(m.rng));
+        g.dump_sent = net_send_statedump(m);
+        log_line("LOCKSTEP", "   (the state hash is off: this peer's turn-%u stream alone"
+                             " goes to the peer)", turn);
+        return;
+    }
     if (!g.hashed_valid) {
         log_line("LOCKSTEP", "   (no state dump: the state hash is off, so there "
                              "is no per-cat table to send -- only rng and queue "
@@ -1726,6 +1810,34 @@ static void correct_cat(uint32_t i, const CatState& mine, const CatState& host) 
 
 void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
     if (g.dump_seen) return;
+
+    // The stream alone (see send_state_dump).
+    if (m.count == 0) {
+        g.dump_seen = true;
+        const bool rng_differs = memcmp(m.rng, g.hashed_rng, sizeof(m.rng)) != 0;
+        log_line("LOCKSTEP", "the peer's turn-%u stream arrived (no cat table): %s", m.turn,
+                 g.rng_turn != m.turn ? "ours is from another turn"
+                                      : rng_differs ? "it differs from ours" : "it is ours");
+        if (!g.correcting) return;
+        g.correcting = false;
+        if (g.rng_turn != m.turn || !rng_differs) { halt(g.correcting_why); return; }
+        g.diverged = false;
+        if (net_role() == NetRole::Host || from != 0) {
+            log_line("LOCKSTEP", "turn %u: only the stream differs -- the client takes the"
+                                 " host's and the battle goes on", m.turn);
+            return;
+        }
+        // Only if nothing has been drawn since the hash: a draw made cannot be
+        // made again from the host's numbers.
+        uint64_t* s = rng_global_stream();
+        if (!s || memcmp(s, g.hashed_rng, sizeof(g.hashed_rng)) != 0) {
+            halt(g.correcting_why);
+            return;
+        }
+        memcpy(s, m.rng, sizeof(m.rng));
+        log_line("LOCKSTEP", "corrected the stream to the host's at turn %u", m.turn);
+        return;
+    }
 
     if (m.stride != sizeof(CatState)) {
         log_line_lvl(LogLevel::Error, "LOCKSTEP",
@@ -1928,8 +2040,13 @@ void compare_hash(const HashMsg& mine, const HashMsg& theirs) {
     // the client, and a turn left every cat equal with the streams apart. A halt
     // threw away both. The dumps decide: health and the stream are corrected to
     // the host's, anything else halts as before.
-    if (config().net_desync_halt && queue_ok &&
-        g.hashed_valid && g.hashed_turn == mine.turn && !g.correcting) {
+    // A battle with its state hash off (an entity this build cannot read) has
+    // no table, and halted on any stream miss: on 2026-11-11 the streams came
+    // apart at turn 24 with the same eleven draws on both screens. The stream
+    // alone still crosses, and the client takes the host's.
+    const bool table_ok  = g.hashed_valid && g.hashed_turn == mine.turn;
+    const bool stream_ok = !g.state_hash_on && !rng_ok && g.rng_turn == mine.turn;
+    if (config().net_desync_halt && queue_ok && (table_ok || stream_ok) && !g.correcting) {
         strcpy_s(g.correcting_why, why);
         g.correcting = true;
         g.dump_sent  = false;
@@ -2049,7 +2166,59 @@ void* __fastcall tc_update(void* a, void* b, void* c, void* d) {
     return g_o_tc(a, b, c, d);
 }
 
+// RANDOM AOE TILES. sub_14002AA20 (targeting, bool, bool) rolls the tiles of
+// the two random area modes -- 0x12, and 0x13 "all_except_random_empty" -- for
+// an ability as it is loaded and as one is made in a fight (sub_14010E550),
+// from the SECOND TLS stream at +0x198 rather than the shared one at +0x178.
+// Nothing keeps that stream alike on two machines, and nothing hashes it: on
+// 2026-11-09 the Throbbing King's Roulette marked other tiles on each screen,
+// the hashes agreed until it went off, and then it hit other cats on each.
+// So in a fight the copy rolls from a stream seeded off the shared one --
+// read, not drawn from, so the shared stream does not move -- and +0x198 gets
+// its own state back after.
+namespace {
+constexpr uintptr_t kRva_AoeCopy   = 0x2AA20;
+const uint8_t kAoeCopyPrologue[10] = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54 };
+constexpr uintptr_t kTlsAoeStream  = 0x198;
+using fn_aoe_copy = uint64_t (__fastcall*)(void*, uint64_t, uint64_t);
+fn_aoe_copy g_o_aoe_copy = nullptr;
+uint64_t    g_aoe_seeded = 0;
+
+uint64_t __fastcall aoe_copy(void* self, uint64_t a, uint64_t b) {
+    uint64_t* shared = rng_global_stream();
+    if (!shared || !lockstep_in_battle() || !net_active())
+        return g_o_aoe_copy(self, a, b);
+    uint64_t* other = (uint64_t*)((uint8_t*)shared - 0x178 + kTlsAoeStream);
+    uint64_t keep[4];
+    memcpy(keep, other, sizeof(keep));
+    for (int i = 0; i < 4; ++i) {
+        // splitmix64 of each word: a different sequence than the shared
+        // stream's own, never all zero.
+        uint64_t z = shared[i] + 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        other[i] = z ^ (z >> 31);
+    }
+    const uint64_t r = g_o_aoe_copy(self, a, b);
+    memcpy(other, keep, sizeof(keep));
+    if (++g_aoe_seeded == 1)
+        log_line("LOCKSTEP", "an ability's random tiles rolled from the shared stream (the"
+                             " two screens mark the same ones)");
+    return r;
+}
+} // namespace
+
 void lockstep_set_base(uintptr_t base) {
+    if (!g_o_aoe_copy) {
+        void* f = (void*)(base + kRva_AoeCopy);
+        if (memcmp(f, kAoeCopyPrologue, sizeof(kAoeCopyPrologue)) != 0 ||
+            MH_CreateHook(f, (void*)&aoe_copy, (void**)&g_o_aoe_copy) != MH_OK ||
+            MH_EnableHook(f) != MH_OK) {
+            g_o_aoe_copy = nullptr;
+            log_line("LOCKSTEP", "!! the random area roll moved -- random area tiles"
+                                 " (the Throbbing King's Roulette) may differ between screens");
+        }
+    }
     if (!g_o_tc) {
         void** slot = (void**)(base + kRva_TcSlot);
         void*  have = nullptr;
@@ -2121,6 +2290,7 @@ void lockstep_init() {
     g.active  = true;
     g.halted  = false;
     g.pend_face.have = false;
+    g.pend_rng.have  = false;
     g.end_face.have  = false;
     if (!rejoin_in_battle) {
         g.snapped = false;
@@ -2671,6 +2841,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
         return false;
 
     uint8_t cat = cat_index_of(actor);
+    if (cat == kNoCat) cat = adopt_familiar(actor);
     // Recorded before the AI and barrier branches below, so it tracks every
     // turn rather than only the ones this function goes on to act upon. A
     // summon (kNoCat) is nobody's, same as an AI cat.
@@ -2787,6 +2958,10 @@ bool lockstep_fill_choice(void* brain, void* out) {
         mem_read((const uint8_t*)actor + kChar_FaceTarget + 4, &msg.fy, sizeof(msg.fy));
         msg.b30 = a.tail[0x30 - 0x28];
         msg.b31 = a.tail[0x31 - 0x28];
+        if (const uint64_t* s = rng_global_stream()) {
+            memcpy(msg.rng, s, sizeof(msg.rng));
+            msg.has_rng = 1;
+        }
 
         if (a.type == TA_Ability) {
             AbilitySlot slot = ability_slot_of(actor, a.ability);
@@ -2821,6 +2996,9 @@ bool lockstep_fill_choice(void* brain, void* out) {
             g.pend_face.cat  = cat;
             g.pend_face.fx   = msg.fx;
             g.pend_face.fy   = msg.fy;
+            g.pend_rng.have  = msg.has_rng != 0;
+            g.pend_rng.cat   = cat;
+            memcpy(g.pend_rng.s, msg.rng, sizeof(g.pend_rng.s));
             ++g.stats.sent;
             log_line("LOCKSTEP", "-> cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
                      (unsigned)cat, a.type == TA_EndTurn ? "endturn" : "ability",
@@ -2868,7 +3046,8 @@ bool lockstep_hold_poll(void* brain, void* out) {
     const void* actor = nullptr;
     if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
         return false;
-    const uint8_t cat = cat_index_of(actor);
+    uint8_t cat = cat_index_of(actor);
+    if (cat == kNoCat) cat = adopt_familiar(actor);
     if (cat == kNoCat || !g.human_cat[cat] || g.local_cat[cat]) return false;
 
     Guard guard;
@@ -2955,6 +3134,9 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
     g.pend_face.cat  = cat;
     g.pend_face.fx   = msg.fx;
     g.pend_face.fy   = msg.fy;
+    g.pend_rng.have  = msg.has_rng != 0;
+    g.pend_rng.cat   = cat;
+    memcpy(g.pend_rng.s, msg.rng, sizeof(g.pend_rng.s));
     ++g.stats.applied;
     log_line("LOCKSTEP", "<- cat %u %s slot=%u:%u target=(%d,%d) gon=%s",
              (unsigned)cat, msg.type == TA_EndTurn ? "endturn" : "ability",
@@ -3008,12 +3190,24 @@ void lockstep_on_applied(const void* action, const void* actor) {
     // cross-check would go once the state hash covers Character fields.
     uint8_t cat = cat_index_of(who);
     if (cat != kNoCat && g.local_cat[cat]) ++g.stats.applied;
+    if (cat != kNoCat && g.human_cat[cat]) g.last_human = cat;   // a familiar's summoner
 
     // Both peers write the facing the decision carried, before the action runs,
     // so whatever it does to facing itself lands on the same value everywhere.
     // Not via Character::Face: that is 89 call sites of animation and passives,
     // and the value is already final -- this only has to agree. (0,0) is a read
     // that failed on the owner, never a real direction.
+    if (cat != kNoCat && g.pend_rng.have && g.pend_rng.cat == cat) {
+        g.pend_rng.have = false;
+        if (uint64_t* s = rng_global_stream()) {
+            if (memcmp(s, g.pend_rng.s, sizeof(g.pend_rng.s)) != 0) {
+                memcpy(s, g.pend_rng.s, sizeof(g.pend_rng.s));
+                if (++g.rng_set <= 20)
+                    log_line("LOCKSTEP", "cat %u's action runs from the owner's stream (this"
+                                         " screen's had moved since the decision)", (unsigned)cat);
+            }
+        }
+    }
     if (cat != kNoCat && g.pend_face.have && g.pend_face.cat == cat) {
         g.pend_face.have = false;
         const int32_t fx = g.pend_face.fx, fy = g.pend_face.fy;
@@ -3413,6 +3607,14 @@ void lockstep_owners_read(const EnterNodeMsg& m) {
 void lockstep_catchup(uint8_t peer) {
     Guard guard;
     if (!g.active || g.battles.current == kNoBattle) return;
+    // This peer's split went out as the battle began, to whoever was there: a
+    // player who joins after it never had it, and both sat at the join barrier,
+    // each "waiting for the other's control split" (2026-11-10).
+    if (g.snapped && !g.split_deferred) {
+        publish_split();
+        log_line("LOCKSTEP", "-> this peer's control split again, for peer %u joining the battle",
+                 (unsigned)peer);
+    }
     if (g.sent_log_n == 0) {
         log_line("LOCKSTEP", "peer %u joined battle %016llx -- nothing to replay,"
                              " it can derive this battle from the node seed alone",

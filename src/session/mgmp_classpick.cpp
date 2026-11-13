@@ -274,6 +274,10 @@ void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
     if (net_role() != NetRole::Host) startrun_scene_tick();
     if (net_role() != NetRole::Host && g.gear_n && apply_gear() && !safe_rebuild(a))
         log_line("CLASSPICK", "!! rebuilding this game's gear screen faulted");
+    // NOT the host's cats here. Applied under this screen, they took the items
+    // its slots still pointed at, and the friend's game went down on its next
+    // update (2026-11-13, 0x140942DC1 from the slot-lock test). They are held
+    // through the gear screen and land on the map, before the first node.
     // The friend's gear, put on from inside the screen's own update.
     if (net_role() == NetRole::Host && (g.phase == 2 || run_gear()) && g.equipped) {
         apply_equips();
@@ -811,6 +815,18 @@ void hook_slot_locked(uintptr_t base) {
 
 // --- the host ----------------------------------------------------------------
 
+// The cats the friend put in the House's box are the friend's: pinned before the
+// split, which keeps a cat's row and deals the rest.
+void pin_friend_picks(const uint64_t* uid, uint32_t n) {
+    if (net_peer_count() < 2) return;
+    for (uint32_t i = 0; i < n; ++i) {
+        const int p = startrun_box_picker(g.key[i]);
+        if (p <= 0 || (uint32_t)p >= net_peer_count()) continue;   // the host's: the split deals them
+        lockstep_owner_put(uid[i], (uint8_t)p);
+        log_line("CLASSPICK", "  cat '%s' went in the box from player %d -- theirs", g.name[i], p);
+    }
+}
+
 void claim(void* ch) {
     uint8_t* begin = nullptr;
     uint8_t* end   = nullptr;
@@ -829,6 +845,7 @@ void claim(void* ch) {
     }
     g.cats = n;
     for (uint32_t i = 0; i < n; ++i) g.uid[i] = uid[i];
+    pin_friend_picks(uid, n);
     lockstep_claim_cats(uid, n, g.owner);
     g.claimed_for = ch;
     for (uint32_t i = 0; i < n; ++i)
@@ -852,6 +869,7 @@ bool claim_run() {
     }
     g.cats = n;
     for (uint32_t i = 0; i < n; ++i) g.uid[i] = uid[i];
+    pin_friend_picks(uid, n);
     lockstep_claim_cats(uid, n, g.owner);
     g.claimed_for = nullptr;
     log_line("CLASSPICK", "the gear screen came up with no collars before it -- %u cat(s) from"
@@ -862,13 +880,90 @@ bool claim_run() {
     return true;
 }
 
+// THE CAROUSEL. The chooser shows its cats one at a time through the object at
+// +0x48: items at +0x38..+0x40, the shown one at +0x78 (an int taken modulo the
+// count, read so at 0x140140762). The collar click animates the collar onto the
+// item shown there, and the cat on screen follows it -- so a collar put on
+// another player's cat turned this player's screen to that cat (2026-11-13).
+// For the length of the click it shows the cat being dressed, then the one it
+// showed before, as the gear screen leaves this player's cat alone.
+constexpr uintptr_t kCh_Carousel  = 0x48;
+constexpr uintptr_t kCar_Begin    = 0x38;
+constexpr uintptr_t kCar_End      = 0x40;
+constexpr uintptr_t kCar_Shown    = 0x78;
+constexpr uintptr_t kCopy_Stride  = 0xC58;
+constexpr uintptr_t kCopy_Key     = 0xC48;
+
+// THE NAME. The click ends in the carousel's refresh (sub_1400DF2E0, from
+// 0x140140B49 after the class goes in), and that refresh ends by selecting the
+// cat it shows: CatSelector::select (sub_1400E18B0, carousel, key) writes the key
+// at +0x88 and fills the card at +0x70 -- the cat's name, level, class. Shown
+// the dressed cat for the click, the card kept its name after the carousel was
+// put back, and the other player's screen named the wrong cat (2026-11-14). The
+// cat it showed before is selected again afterwards.
+constexpr uintptr_t kRva_CarSelect = 0xE18B0;
+constexpr uintptr_t kCar_Key       = 0x88;
+const uint8_t kCarSelectHead[8]    = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C };
+using fn_car_select = void (__fastcall*)(void*, uint64_t);
+
+bool safe_car_select(void* car, uint64_t key) {
+    static fn_car_select f = nullptr;
+    static bool checked = false;
+    if (!checked) {
+        checked = true;
+        const uintptr_t at = (uintptr_t)GetModuleHandleW(nullptr) + kRva_CarSelect;
+        if (!memcmp((const void*)at, kCarSelectHead, sizeof(kCarSelectHead))) f = (fn_car_select)at;
+        else log_line("CLASSPICK", "!! the carousel's select moved -- the name may follow the other player's collar");
+    }
+    if (!f) return false;
+    __try { f(car, key); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 void click_as(void* tag, uint64_t key) {
     const uint64_t cur = current_cat(g.chooser);
+    // Where the carousel is, and where the cat being dressed is in it.
+    uint8_t* car = nullptr;
+    int32_t  shown = 0, want = -1;
+    uint64_t named = 0;   // the cat the card names
+    if (mem_read((const uint8_t*)g.chooser + kCh_Carousel, &car, sizeof(car)) && car &&
+        mem_read(car + kCar_Shown, &shown, sizeof(shown)) &&
+        mem_read(car + kCar_Key, &named, sizeof(named))) {
+        uintptr_t cb = 0, ce = 0, ib = 0, ie = 0;
+        if (mem_read((const uint8_t*)g.chooser + kCh_CopyBegin, &cb, sizeof(cb)) &&
+            mem_read((const uint8_t*)g.chooser + kCh_CopyEnd, &ce, sizeof(ce)) &&
+            mem_read(car + kCar_Begin, &ib, sizeof(ib)) && mem_read(car + kCar_End, &ie, sizeof(ie)) &&
+            cb && ce > cb && ib && ie > ib) {
+            const int32_t n = (int32_t)((ce - cb) / kCopy_Stride);
+            if (n > 0 && n == (int32_t)((ie - ib) / 8)) {
+                for (int32_t i = 0; i < n; ++i) {
+                    uint64_t k = 0;
+                    if (mem_read((const void*)(cb + (uintptr_t)i * kCopy_Stride + kCopy_Key), &k, sizeof(k)) &&
+                        k == key) { want = i; break; }
+                }
+                if (want >= 0) {
+                    const int32_t at = ((shown % n) + n) % n;
+                    const int32_t to = shown + (want - at);
+                    mem_write(car + kCar_Shown, &to, sizeof(to));
+                }
+            }
+        }
+    } else {
+        car = nullptr;
+    }
     mem_write((uint8_t*)g.chooser + kCh_Current, &key, sizeof(key));
     g.applying = true;
     g.click(tag);
     g.applying = false;
     mem_write((uint8_t*)g.chooser + kCh_Current, &cur, sizeof(cur));
+    if (car) {
+        mem_write(car + kCar_Shown, &shown, sizeof(shown));
+        uint64_t now_named = 0;
+        if (want >= 0 && mem_read(car + kCar_Key, &now_named, sizeof(now_named)) &&
+            now_named != named && named && named != ~0ull &&
+            !safe_car_select(car, named))
+            log_line("CLASSPICK", "!! putting the name back on the carousel faulted");
+    }
     g.sent_hash = 0;
 }
 
@@ -933,12 +1028,7 @@ void apply(const Pick& p) {
     }
     // The click dresses the cat on screen; for the length of it, that is the
     // friend's cat.
-    const uint64_t cur = current_cat(g.chooser);
-    mem_write((uint8_t*)g.chooser + kCh_Current, &p.key, sizeof(p.key));
-    g.applying = true;
-    g.click(tags[p.tag]);
-    g.applying = false;
-    mem_write((uint8_t*)g.chooser + kCh_Current, &cur, sizeof(cur));
+    click_as(tags[p.tag], p.key);
     log_line("CLASSPICK", on == p.key ? "<- the other player took the '%s' collar off '%s'"
                                       : "<- the other player put the '%s' collar on '%s'",
              p.name, g.name[ci]);
@@ -1250,6 +1340,13 @@ void publish(uint8_t phase) {
     h = (h ^ phase) * 0x100000001B3ull;
     const uint64_t now = GetTickCount64();
     if (h == g.sent_hash && now - g.sent_at < kResendMs) return;
+    // A collar gives a cat its class's STARTER_PLACEHOLDER_ ability and passive
+    // (sub_1400BDC70), and each game turns those into class abilities of its
+    // own choosing: on 2026-11-11 the gear screens showed other ones. So the
+    // cats as this game has them on its gear screen go over whole, ahead of the
+    // screen's own messages; the client applies them past its chooser's embark.
+    if (phase == 2 && (!g.open_sent || g.phase != phase))
+        catsync_push_keys(g.key, g.cats, "the party with its class abilities, for the gear screen");
     for (uint32_t i = 0; i < g.cats; ++i)
         send(kChoiceClassCat, i, g.cats, g.owner[i], g.key[i], g.name[i]);
     for (uint32_t t = 0; t < n; ++t)
@@ -1571,12 +1668,7 @@ void mirror_host() {
             }
         }
         if (t < 0) continue;
-        const uint64_t cur = current_cat(g.chooser);
-        mem_write((uint8_t*)g.chooser + kCh_Current, &key, sizeof(key));
-        g.applying = true;
-        g.click(tags[t]);
-        g.applying = false;
-        mem_write((uint8_t*)g.chooser + kCh_Current, &cur, sizeof(cur));
+        click_as(tags[t], key);
         log_line("CLASSPICK", "<- the host's cat wears %s, as on the host's screen",
                  there[0] ? there : "no collar");
         return;   // one a look: the next look sees what it did
@@ -1754,6 +1846,13 @@ bool classpick_on_message(const ChoiceMsg& m) {
         b = ClassPickView{};
     }
     return true;
+}
+
+bool classpick_client_chooser_up() {
+    // The chooser, and the gear screen after it: the cats are on screen in both.
+    return client_chooser() ||
+           (net_role() != NetRole::Host && net_active() && g.active && g.view.phase == 2) ||
+           (net_role() != NetRole::Host && inv_up());
 }
 
 bool classpick_view(ClassPickView& out) {

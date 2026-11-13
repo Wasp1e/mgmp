@@ -108,6 +108,10 @@ void follow_on_run_restart();
 // reason to refuse a flush.
 bool follow_on_map();
 
+// HOST: this peer entered a node less than `ms` ago -- the map can still be
+// ticking while the run is already inside the node.
+bool follow_entered_within(uint64_t ms);
+
 // --- enumerating the map, for the debug panel --------------------------------
 
 // Number of nodes on the live map, or 0 if there is no map screen yet.

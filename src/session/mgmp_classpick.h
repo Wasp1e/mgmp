@@ -58,6 +58,11 @@ struct ClassPickView {
 // True while the host's chooser is up and this peer is the client.
 bool classpick_view(ClassPickView& out);
 
+// CLIENT: this game's own class chooser or the gear screen after it is up. The
+// chooser's embark writes its copies of the cats back over them, and the gear
+// screen holds their items -- a cat applied under either is lost or crashes.
+bool classpick_client_chooser_up();
+
 // The client puts collar `tag` on its cat `cat_key`.
 void classpick_pick(uint64_t cat_key, uint32_t tag);
 

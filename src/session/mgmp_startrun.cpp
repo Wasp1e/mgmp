@@ -116,6 +116,386 @@ bool host_with_peer() {
     return net_active() && net_role() == NetRole::Host && net_peer_count() >= 2;
 }
 
+// THE BOX OF CATS. glaiel::ButchBox (vtable 0xEFCCC0) holds the cats picked for
+// a run in four slots, a CustomVector<HouseCat*> at +0x100 (nulls for empty,
+// made by its init 0x1400AD740), and its confirm (0x1400ADBF0) reads each
+// slot's key at HouseCat+0x80. Slot 31 of the table puts a HouseCat in
+// (0x1400AED00, this, cat), slot 32 takes it out (0x1400AF960, this, cat),
+// slot 11 runs every frame (0x1400AE9D0). The House's cats are the scene's
+// component list 0x448: box+0x18 -> +8 the scene, +0x20 -> +0x4480 a list
+// {u32 cap?, u32 count at +0xC, HouseCat** at +0x10} (read so at 0x1400ADE0B).
+//
+// Each game's box is its own, so either player's picks go to the other by key
+// and the other's game puts the same cat in or takes it out with its own calls,
+// in the box's own update. The host's box is the one the run is started from.
+constexpr uintptr_t kRva_BoxVtbl   = 0xEFCCC0;
+constexpr uint32_t  kBoxTickSlot   = 11;
+constexpr uint32_t  kBoxAddSlot    = 31;
+constexpr uint32_t  kBoxRemoveSlot = 32;
+constexpr uintptr_t kRva_BoxTick   = 0xAE9D0;
+constexpr uintptr_t kRva_BoxAdd    = 0xAED00;
+constexpr uintptr_t kRva_BoxRemove = 0xAF960;
+constexpr uintptr_t kBox_Slots     = 0x100;
+constexpr uintptr_t kBox_Owner     = 0x18;
+constexpr uintptr_t kOwner_Scene   = 0x8;
+constexpr uintptr_t kScene_Comps   = 0x20;
+constexpr uintptr_t kComps_HouseCats = 0x4480;
+constexpr uintptr_t kHouseCat_Key  = 0x80;
+constexpr uint32_t  kBoxSlots      = 4;
+
+// THE CONTAINER A CAT IS IN. Slot 31 alone moved the other player's cat's model
+// into the box and left the cat walking the House in it (2026-11-14): the cat
+// keeps its holder at HouseCat+0xE8, and only the container's own add writes
+// it. The drop (0x1401FF140) clears +0xE8, finds the container under the
+// cursor -- a ButchBox, a CatPlacementArea (a room) or a HousePipe -- and calls
+// 0x1402E88D0 (container, cat): slot 31, then out of its old container through
+// 0x1402E89C0 (container, cat: slot 32 and off the list at +0x6C/+0x70), then
+// onto this one's list and +0xE8 = container. The other player's picks go the
+// same way here, and a cat taken out goes back to the room it came from.
+constexpr uintptr_t kRva_ContAdd    = 0x2E88D0;
+constexpr uintptr_t kRva_ContRemove = 0x2E89C0;
+constexpr uintptr_t kRva_RoomVtbl   = 0xEFCF10;   // CatPlacementArea
+constexpr uintptr_t kRva_PipeVtbl   = 0xEFC9C0;   // HousePipe
+constexpr uintptr_t kHouseCat_Holder = 0xE8;
+const uint8_t kContAddHead[8]    = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74 };
+const uint8_t kContRemoveHead[8] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83 };
+
+// EACH PLAYER'S SHARE (the user's ask, 2026-11-14). The cats a player put in
+// the box are that player's for the run, and a player puts in at most:
+//   2 players  the friend 2, the host the rest
+//   3 players  the host 2, each friend 1
+//   4 players  1 each
+// Who put a cat in rides in the message's aux, as that player's position + 1
+// (0 from an older build: the friend's on the host, the host's on a friend).
+uint32_t box_cap(uint8_t pos, uint32_t players) {
+    if (players <= 2) return pos == 0 ? kBoxSlots : 2;
+    if (players == 3) return pos == 0 ? 2 : 1;
+    return 1;
+}
+
+using fn_box = void* (__fastcall*)(void*, void*, void*, void*);
+fn_box   o_box_tick = nullptr;
+fn_box   box_add    = nullptr;
+fn_box   box_remove = nullptr;
+uint64_t box_known[kBoxSlots] = {};   // the keys in the box as last told to the other player
+void*    box_seen   = nullptr;        // the box those were read off
+using fn_cont = void (__fastcall*)(void*, void*);
+fn_cont  cont_add    = nullptr;
+fn_cont  cont_remove = nullptr;
+fn_box   o_box_add   = nullptr;       // slot 31 as the game has it
+uintptr_t box_base   = 0;
+bool     box_applying = false;        // putting the other player's pick in: no limit
+struct Picker { uint64_t key; uint8_t pos; };
+Picker   pickers[kBoxSlots * 2] = {};   // who put each cat in the box
+struct Prev { uint64_t key; void* holder; };
+Prev     box_prev[8] = {};            // where the other player's picks were before the box
+uint32_t box_prev_at = 0;
+uint64_t box_out_key = 0, box_out_at = 0;   // this player's last cat out, against a stale resend
+volatile uint64_t box_tick_at = 0;
+volatile uint32_t box_note_mine = 0, box_note_any = 0;
+struct BoxOp { uint64_t key; bool add; uint8_t pos; };
+BoxOp    box_ops[16];
+uint32_t box_op_n = 0;
+CRITICAL_SECTION box_cs;
+bool     box_cs_ready = false;
+
+bool box_keys(void* box, void* cats[kBoxSlots], uint64_t keys[kBoxSlots]) {
+    void* slots = nullptr;
+    if (!mem_read((const uint8_t*)box + kBox_Slots, &slots, sizeof(slots)) || !slots) return false;
+    if (!mem_read(slots, cats, sizeof(void*) * kBoxSlots)) return false;
+    for (uint32_t i = 0; i < kBoxSlots; ++i) {
+        keys[i] = 0;
+        if (cats[i]) mem_read((const uint8_t*)cats[i] + kHouseCat_Key, &keys[i], sizeof(keys[i]));
+    }
+    return true;
+}
+
+bool key_in(const uint64_t keys[kBoxSlots], uint64_t k) {
+    for (uint32_t i = 0; i < kBoxSlots; ++i) if (keys[i] == k) return true;
+    return false;
+}
+
+// The House's cat with this key, off the scene's component list.
+void* house_cat(void* box, uint64_t key) {
+    void* owner = nullptr; void* scene = nullptr; void* comps = nullptr; void* list = nullptr;
+    if (!mem_read((const uint8_t*)box + kBox_Owner, &owner, sizeof(owner)) || !owner) return nullptr;
+    if (!mem_read((const uint8_t*)owner + kOwner_Scene, &scene, sizeof(scene)) || !scene) return nullptr;
+    if (!mem_read((const uint8_t*)scene + kScene_Comps, &comps, sizeof(comps)) || !comps) return nullptr;
+    if (!mem_read((const uint8_t*)comps + kComps_HouseCats, &list, sizeof(list)) || !list) return nullptr;
+    uint32_t n = 0; void** data = nullptr;
+    if (!mem_read((const uint8_t*)list + 0xC, &n, sizeof(n)) ||
+        !mem_read((const uint8_t*)list + 0x10, &data, sizeof(data)) || !data || n > 4096)
+        return nullptr;
+    for (uint32_t i = 0; i < n; ++i) {
+        void* c = nullptr; uint64_t k = 0;
+        if (mem_read(&data[i], &c, sizeof(c)) && c &&
+            mem_read((const uint8_t*)c + kHouseCat_Key, &k, sizeof(k)) && k == key)
+            return c;
+    }
+    return nullptr;
+}
+
+bool safe_cont_call(fn_cont f, void* cont, void* cat) {
+    __try { f(cont, cat); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+constexpr uint32_t kPickers = kBoxSlots * 2;
+
+int picker_of(uint64_t k) {
+    for (uint32_t i = 0; i < kPickers; ++i)
+        if (k && pickers[i].key == k) return pickers[i].pos;
+    return -1;
+}
+
+void mark_picker(uint64_t k, int pos) {   // pos < 0: nobody's now
+    for (uint32_t i = 0; i < kPickers; ++i)
+        if (pickers[i].key == k) {
+            if (pos < 0) pickers[i] = Picker{};
+            else pickers[i].pos = (uint8_t)pos;
+            return;
+        }
+    if (pos < 0 || !k) return;
+    for (uint32_t i = 0; i < kPickers; ++i)
+        if (!pickers[i].key) { pickers[i] = Picker{ k, (uint8_t)pos }; return; }
+}
+
+uint32_t picked_by(uint8_t pos, const uint64_t keys[kBoxSlots]) {
+    uint32_t n = 0;
+    for (uint32_t s = 0; s < kBoxSlots; ++s)
+        if (keys[s] && picker_of(keys[s]) == (int)pos) ++n;
+    return n;
+}
+
+void send_box(bool add, uint64_t key, int pos) {
+    ChoiceMsg m{};
+    m.kind  = kChoiceBoxCat;
+    m.index = add ? 1 : 0;
+    m.cat   = key;
+    m.aux   = pos >= 0 ? (uint32_t)pos + 1 : 0;
+    net_send_choice(m);
+}
+
+void remember_prev(uint64_t key, void* holder) {
+    for (uint32_t i = 0; i < 8; ++i)
+        if (box_prev[i].key == key) { box_prev[i].holder = holder; return; }
+    box_prev[box_prev_at++ % 8] = Prev{ key, holder };
+}
+
+// OUT OF THE BOX'S REACH. The box's slot 10 (0x1400AE7C0) takes, every frame,
+// any House cat with no holder and not in a hand whose point lies inside the
+// box's "bounds" clip -- slot 28 (0x1400AEB10, box, double out[4]: x min, x
+// max, y min, y max). The point is transform(+0x40)+0x80/+0x88 plus
+// transform+0x98/+0xA0 scaled by (cat+0x100)+0xC8/+0xD0, as it reads it. A cat
+// taken out of the box here stood where it sat, and the box had it back the
+// next frame (2026-11-14: every one of the friend's cats bounced back on the
+// host). So it is set down just left of the bounds, free to walk off.
+using fn_bounds = double* (__fastcall*)(void*, double*);
+constexpr uint32_t kBoxBoundsSlot = 28;
+constexpr double   kOutMargin     = 60.0;
+
+bool safe_bounds(void* box, double out[4]) {
+    __try {
+        void** vt = *(void***)box;
+        fn_bounds f = (fn_bounds)vt[kBoxBoundsSlot];
+        double* r = f(box, out);
+        if (r != out && r) memcpy(out, r, sizeof(double) * 4);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void set_outside(void* box, void* cat) {
+    double b[4] = {};
+    uint8_t* t = nullptr; uint8_t* s = nullptr;
+    if (!safe_bounds(box, b) || !(b[1] > b[0]) ||
+        !mem_read((const uint8_t*)cat + 0x40, &t, sizeof(t)) || !t ||
+        !mem_read((const uint8_t*)cat + 0x100, &s, sizeof(s)) || !s)
+        return;
+    double x = 0, ox = 0, sx = 0;
+    if (!mem_read(t + 0x80, &x, sizeof(x)) || !mem_read(t + 0x98, &ox, sizeof(ox)) ||
+        !mem_read(s + 0xC8, &sx, sizeof(sx)))
+        return;
+    const double pt = x + ox * sx;
+    if (pt < b[0] - 1.0) return;                     // already clear of it
+    const double nx = x + (b[0] - kOutMargin - pt);
+    mem_write(t + 0x80, &nx, sizeof(nx));
+}
+
+// A room or a pipe this House still has: its table is one of theirs.
+bool is_room(void* holder) {
+    uintptr_t vt = 0;
+    return holder && mem_read(holder, &vt, sizeof(vt)) &&
+           (vt == box_base + kRva_RoomVtbl || vt == box_base + kRva_PipeVtbl);
+}
+
+void* prev_of(uint64_t key) {
+    for (uint32_t i = 0; i < 8; ++i)
+        if (box_prev[i].key == key) return box_prev[i].holder;
+    return nullptr;
+}
+
+// Slot 31: a cat past this player's share is not taken. The drop has cleared
+// the cat's holder already, so it stays where it was let go, as off any room.
+void* __fastcall box_add_hook(void* box, void* cat, void* c, void* d) {
+    const uint32_t players = net_peer_count();
+    if (!box_applying && net_active() && players >= 2) {
+        const uint8_t me = net_peer_pos();
+        const uint32_t cap = box_cap(me, players);
+        void* cats[kBoxSlots]; uint64_t keys[kBoxSlots];
+        uint64_t k = 0;
+        if (cat) mem_read((const uint8_t*)cat + kHouseCat_Key, &k, sizeof(k));
+        if (box_keys(box, cats, keys) && !key_in(keys, k) && picked_by(me, keys) >= cap) {
+            static uint64_t said = 0;
+            if (GetTickCount64() - said > 3000) {
+                said = GetTickCount64();
+                log_line("STARTRUN", "one more cat of this player's not taken -- %u is the most"
+                                     " with %u players", cap, players);
+            }
+            // Let go over the box it is not in: out of its reach, or it is offered
+            // to the box again every frame.
+            void* held = nullptr;
+            mem_read((const uint8_t*)cat + kHouseCat_Holder, &held, sizeof(held));
+            if (!held) set_outside(box, cat);
+            return nullptr;
+        }
+    }
+    return o_box_add(box, cat, c, d);
+}
+
+void* __fastcall box_tick(void* box, void* b, void* c, void* d) {
+    void* r = o_box_tick(box, b, c, d);
+    if (!box || !net_active() || net_peer_count() < 2) return r;
+    if (box != box_seen) {
+        box_seen = box;
+        memset(box_known, 0, sizeof(box_known));
+        memset(pickers, 0, sizeof(pickers));
+        memset(box_prev, 0, sizeof(box_prev));
+    }
+    const bool host = net_role() == NetRole::Host;
+    const uint8_t me = net_peer_pos();
+    const uint64_t now = GetTickCount64();
+
+    // The other player's picks first, by this game's own calls.
+    BoxOp ops[16];
+    uint32_t n = 0;
+    if (box_cs_ready) EnterCriticalSection(&box_cs);
+    n = box_op_n;
+    memcpy(ops, box_ops, sizeof(BoxOp) * n);
+    box_op_n = 0;
+    if (box_cs_ready) LeaveCriticalSection(&box_cs);
+    for (uint32_t i = 0; i < n; ++i) {
+        void* cats[kBoxSlots]; uint64_t keys[kBoxSlots];
+        if (!box_keys(box, cats, keys)) break;
+        const bool in = key_in(keys, ops[i].key);
+        if (ops[i].add && in && ops[i].pos != me) mark_picker(ops[i].key, ops[i].pos);
+        if (ops[i].add == in) continue;               // already as the other player has it
+        // The host's every-3-s box, sent before it heard this player take the cat out.
+        if (ops[i].add && !host && ops[i].key == box_out_key && now - box_out_at < 2000) continue;
+        void* hc = nullptr;
+        if (ops[i].add) hc = house_cat(box, ops[i].key);
+        else for (uint32_t s = 0; s < kBoxSlots; ++s) if (keys[s] == ops[i].key) hc = cats[s];
+        if (!hc) {
+            log_line("STARTRUN", "!! the other player's cat %016llx is not in this House --"
+                                 " the box is left as it is", (unsigned long long)ops[i].key);
+            continue;
+        }
+        bool ok = true;
+        box_applying = true;
+        if (ops[i].add) {
+            void* was = nullptr;
+            mem_read((const uint8_t*)hc + kHouseCat_Holder, &was, sizeof(was));
+            if (was != box) remember_prev(ops[i].key, was);
+            ok = safe_cont_call(cont_add, box, hc);
+        } else {
+            void* room = prev_of(ops[i].key);
+            if (is_room(room)) {
+                ok = safe_cont_call(cont_add, room, hc);   // out of the box on the way
+            } else {
+                ok = safe_cont_call(cont_remove, box, hc);
+                void* none = nullptr;
+                if (ok) mem_write((uint8_t*)hc + kHouseCat_Holder, &none, sizeof(none));
+                if (ok) set_outside(box, hc);
+            }
+        }
+        box_applying = false;
+        box_keys(box, cats, keys);
+        mark_picker(ops[i].key, ops[i].add && key_in(keys, ops[i].key) ? ops[i].pos : -1);
+        log_line("STARTRUN", "<- the other player %s cat %016llx %s the box%s",
+                 ops[i].add ? "put" : "took", (unsigned long long)ops[i].key,
+                 ops[i].add ? "in" : "out of",
+                 !ok ? " -- the game faulted on it" :
+                 key_in(keys, ops[i].key) != ops[i].add ? " -- this game would not" : "");
+        // Taken as the other player's, not told back to them.
+        for (uint32_t s = 0; s < kBoxSlots; ++s) box_known[s] = keys[s];
+    }
+
+    // Then this player's: what changed since the other player was last told.
+    void* cats[kBoxSlots]; uint64_t keys[kBoxSlots];
+    if (!box_keys(box, cats, keys)) return r;
+    for (uint32_t s = 0; s < kBoxSlots; ++s) {
+        if (box_known[s] && !key_in(keys, box_known[s])) {
+            send_box(false, box_known[s], me);
+            log_line("STARTRUN", "-> took cat %016llx out of the box", (unsigned long long)box_known[s]);
+            mark_picker(box_known[s], -1);
+            box_out_key = box_known[s];
+            box_out_at  = now;
+        }
+    }
+    for (uint32_t s = 0; s < kBoxSlots; ++s) {
+        if (keys[s] && !key_in(box_known, keys[s])) {
+            send_box(true, keys[s], me);
+            log_line("STARTRUN", "-> put cat %016llx in the box", (unsigned long long)keys[s]);
+            mark_picker(keys[s], me);
+        }
+    }
+    memcpy(box_known, keys, sizeof(box_known));
+    // The host's box again every few seconds: a client whose House reloaded (a
+    // new day) has an empty box and no change here to hear about.
+    // For the note on the friend's screen.
+    uint32_t any = 0;
+    for (uint32_t s = 0; s < kBoxSlots; ++s) if (keys[s]) ++any;
+    box_note_mine = picked_by(me, keys);
+    box_note_any  = any;
+    box_tick_at   = now;
+    static uint64_t full_at = 0;
+    if (host && now - full_at > 3000) {
+        full_at = now;
+        for (uint32_t s = 0; s < kBoxSlots; ++s)
+            if (keys[s]) {
+                const int p = picker_of(keys[s]);
+                send_box(true, keys[s], p >= 0 ? p : 0);
+            }
+    }
+    return r;
+}
+
+void watch_box(uintptr_t base) {
+    void** slots = (void**)(base + kRva_BoxVtbl);
+    void* tick = nullptr; void* add = nullptr; void* rem = nullptr;
+    DWORD prot = 0;
+    if (!mem_read(&slots[kBoxTickSlot], &tick, sizeof(tick)) ||
+        !mem_read(&slots[kBoxAddSlot], &add, sizeof(add)) ||
+        !mem_read(&slots[kBoxRemoveSlot], &rem, sizeof(rem)) ||
+        (uintptr_t)tick != base + kRva_BoxTick || (uintptr_t)add != base + kRva_BoxAdd ||
+        (uintptr_t)rem != base + kRva_BoxRemove ||
+        memcmp((const void*)(base + kRva_ContAdd), kContAddHead, sizeof(kContAddHead)) ||
+        memcmp((const void*)(base + kRva_ContRemove), kContRemoveHead, sizeof(kContRemoveHead)) ||
+        !VirtualProtect(&slots[kBoxTickSlot], sizeof(void*) * (kBoxRemoveSlot - kBoxTickSlot + 1),
+                        PAGE_READWRITE, &prot)) {
+        log_line("STARTRUN", "!! the box of cats moved -- each player's box stays their own");
+        return;
+    }
+    if (!box_cs_ready) { InitializeCriticalSection(&box_cs); box_cs_ready = true; }
+    box_base    = base;
+    cont_add    = (fn_cont)(base + kRva_ContAdd);
+    cont_remove = (fn_cont)(base + kRva_ContRemove);
+    o_box_add   = (fn_box)add;
+    o_box_tick  = (fn_box)tick;
+    slots[kBoxTickSlot] = (void*)&box_tick;
+    slots[kBoxAddSlot]  = (void*)&box_add_hook;
+    VirtualProtect(&slots[kBoxTickSlot], sizeof(void*) * (kBoxRemoveSlot - kBoxTickSlot + 1), prot, &prot);
+}
+
 void send_party(void* cats) {
     KeyVec kv{};
     uint32_t nk = 0;
@@ -333,6 +713,7 @@ void startrun_scene_tick() {
 void startrun_set_base(uintptr_t base) {
     if (g.o_go) return;
     g.base_ = base;
+    watch_box(base);
     void* dh = (void*)(base + kRva_DefendHouse);
     if (memcmp(dh, kDefendPrologue, 8) != 0 ||
         MH_CreateHook(dh, (void*)&defend_house, (void**)&g.o_defend) != MH_OK ||
@@ -372,7 +753,31 @@ void startrun_house_tick() {
     go_after_host();
 }
 
+int startrun_box_picker(uint64_t key) {
+    return net_role() == NetRole::Host ? picker_of(key) : -1;
+}
+
+bool startrun_box_note(uint32_t& mine, uint32_t& most) {
+    const uint32_t players = net_peer_count();
+    if (!net_active() || players < 2) return false;
+    const uint8_t me = net_peer_pos();
+    if (me == 0 && players == 2) return false;    // the host of two has no share to count
+    if (GetTickCount64() - box_tick_at > 500 || !box_note_any) return false;
+    mine = box_note_mine;
+    most = box_cap(me, players);
+    return true;
+}
+
 bool startrun_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceBoxCat) {
+        if (!box_cs_ready || !m.cat) return true;
+        EnterCriticalSection(&box_cs);
+        const uint8_t pos = m.aux ? (uint8_t)(m.aux - 1)
+                                  : (uint8_t)(net_role() == NetRole::Host ? 1 : 0);
+        if (box_op_n < 16) box_ops[box_op_n++] = BoxOp{ m.cat, m.index == 1, pos };
+        LeaveCriticalSection(&box_cs);
+        return true;
+    }
     if (m.kind != kChoiceRunParty && m.kind != kChoiceRunStart && m.kind != kChoiceRunCollar &&
         m.kind != kChoiceRunCutscene && m.kind != kChoiceRunDefend)
         return false;

@@ -11,6 +11,7 @@
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
 #include "mgmp_overlay.h"
+#include "mgmp_meow.h"
 #include "mgmp_proto.h"
 
 #include <windows.h>
@@ -142,6 +143,24 @@ constexpr uint64_t kStaleMs = 3000;
 constexpr uint64_t kMinSendGapMs   = 50;
 constexpr uint64_t kHeartbeatMs    = 500;
 
+// A PING: a double click on a tile while another player's cat decides marks it
+// on every screen, in the pinger's colour, for this long. Drawn with the art the
+// game's own aim uses for its tiles (Brain::DrawAbilityAOE, layer 4, frame 0x13
+// at 0x14013ADD1), so it reads as a marked square.
+constexpr uint64_t kPingMs     = 4000;
+// Heard on every screen with the mark: the cat's whistle, ~1.2 s.
+const char*        kPingSound  = "audio/combat_sfx/cat_whistle.wav";
+const char*        kPingAnim   = "AreaIndicator";   // 13 chars
+constexpr int      kPingLayer  = 4;
+constexpr int      kPingFrame  = 0x13;
+
+struct Ping {
+    int32_t  x = 0, y = 0;
+    uint64_t at = 0;          // 0 = nothing to draw
+    uint64_t battle = 0;
+    uint8_t  seq = 0;         // the last seq seen from that peer
+};
+
 struct Peer {
     CursorMsg msg;
     uint64_t  at   = 0;       // GetTickCount64 when it arrived
@@ -157,6 +176,14 @@ struct State {
     fn_tile_piece tile_piece = nullptr;
 
     Peer peers[kMaxPeers];
+    Ping pings[kMaxPeers];    // the local player's own at net_self()
+
+    // The double click: the left button as last seen, and the first click.
+    bool     lb_down  = false;
+    uint64_t click_at = 0;
+    int32_t  click_x  = -1, click_y = -1;
+    uint8_t  ping_seq = 0;
+    int16_t  ping_x   = 0, ping_y = 0;
 
     // Outbound throttle.
     CursorMsg last_sent;
@@ -247,7 +274,8 @@ void set_local_pip_alpha(const void* sm, double a) {
 // submission rather than cached: handing the same image over twice would be a
 // double free the moment one of them is a heap string.
 void submit(void* ui, uint8_t peer, const char* id_prefix, const char* anim_name,
-            int layer, uint64_t tile, const PieceColour& rgba) {
+            int layer, uint64_t tile, const PieceColour& rgba, int frame = kFrame,
+            double size = 1.0) {
     char id_text[16] = {};
     size_t n = strlen(id_prefix);
     if (n > 14) return;
@@ -263,8 +291,8 @@ void submit(void* ui, uint8_t peer, const char* id_prefix, const char* anim_name
     // string by construction, so there is nothing to release.
     if (!make_str(anim, anim_name)) return;
 
-    const PieceScale scale = { { 1.0, 1.0, 1.0 } };   // native size
-    g.tile_piece(ui, &id, layer, &anim, tile, rgba.v, kFrame, scale.v);
+    const PieceScale scale = { { size, size, 1.0 } };   // 1.0 is native size
+    g.tile_piece(ui, &id, layer, &anim, tile, rgba.v, frame, scale.v);
 
 }
 
@@ -285,6 +313,36 @@ void draw_peer(void* ui, uint8_t peer, const CursorMsg& c) {
     // "MGMPCur0" -- the square the peer is over, and the only thing this file
     // draws. The pointer is mgmp_overlay's.
     submit(ui, peer, "MGMPCur", kAnimName, kLayer, tile, rgba);
+}
+
+// A ping in its player's colour until kPingMs is up: the tile lit solid, a
+// ripple growing out of it and fading, twice a second, and the target reticle
+// on top -- three pieces, so it is seen at a glance across the board.
+void draw_ping(void* ui, uint8_t peer, const Ping& p, uint64_t now) {
+    const float* rgb = kPeerRGB[peer % kMaxPeers];
+    const uint64_t age = now - p.at;
+    const float fade   = age > kPingMs - 500 ? (float)(kPingMs - age) / 500.0f : 1.0f;
+    const uint64_t tile = ((uint64_t)(uint32_t)p.y << 32) | (uint32_t)p.x;
+
+    const float phase = (float)(age % 500) / 500.0f;
+    const float pulse = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
+    const PieceColour core = { { rgb[0], rgb[1], rgb[2], (0.8f + 0.2f * pulse) * fade } };
+    submit(ui, peer, "MGMPPing", kPingAnim, kPingLayer, tile, core, kPingFrame);
+
+    const float ring = (float)(age % 700) / 700.0f;                  // 0 -> 1, again
+    const PieceColour wave = { { rgb[0], rgb[1], rgb[2], (1.0f - ring) * 0.9f * fade } };
+    submit(ui, peer, "MGMPPRng", kPingAnim, kPingLayer, tile, wave, kPingFrame,
+           1.0 + 1.6 * ring);
+
+    const PieceColour mark = { { rgb[0], rgb[1], rgb[2], fade } };
+    submit(ui, peer, "MGMPPRet", kAnimName, kLayer, tile, mark, kFrame, 1.2 + 0.2 * pulse);
+}
+
+// This game's window has the keyboard: a click elsewhere is not ours.
+bool window_active() {
+    DWORD pid = 0;
+    const HWND fg = GetForegroundWindow();
+    return fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
 }
 
 } // namespace
@@ -319,6 +377,9 @@ void cursor_set_base(uintptr_t base) {
 
 void cursor_init() {
     for (auto& p : g.peers) p = Peer{};
+    for (auto& p : g.pings) p = Ping{};
+    g.lb_down = false;
+    g.click_at = 0;
     g.have_sent    = false;
     g.last_send_at = 0;
     g.touched_pips = false;
@@ -344,6 +405,18 @@ void cursor_shutdown() {
 
 void cursor_on_message(uint8_t from, const CursorMsg& c) {
     if (from >= kMaxPeers) return;
+    Ping& pg = g.pings[from];
+    if (!g.peers[from].have) {
+        pg.seq = c.ping_seq;           // a ping from before this peer was heard is old
+    } else if (c.ping_seq && c.ping_seq != pg.seq) {
+        pg.seq    = c.ping_seq;
+        pg.x      = c.ping_x;
+        pg.y      = c.ping_y;
+        pg.battle = c.battle_id;
+        pg.at     = GetTickCount64();
+        log_line("CURSOR", "<- peer %u pinged tile (%d,%d)", (unsigned)from, c.ping_x, c.ping_y);
+        if (c.battle_id == lockstep_battle_id()) sound_play_file(kPingSound);
+    }
     g.peers[from].msg  = c;
     g.peers[from].at   = GetTickCount64();
     g.peers[from].have = true;
@@ -361,6 +434,9 @@ void cursor_off_board() {
     CursorMsg out;
     out.battle_id = lockstep_battle_id();
     out.owns_turn = 1;
+    out.ping_seq  = g.ping_seq;
+    out.ping_x    = g.ping_x;
+    out.ping_y    = g.ping_y;
     if (!overlay_local_pointer(out.nx, out.ny, out.mode)) return;
 
     const bool moved = !g.have_sent ||
@@ -421,6 +497,33 @@ void cursor_on_status_menu(void* sm) {
         out.on_board = 0;
     }
 
+    // A double click on a tile while another player's cat decides: a ping.
+    {
+        const bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 && window_active();
+        if (down && !g.lb_down && out.on_board && !mine) {
+            if (g.click_at && now - g.click_at <= GetDoubleClickTime() &&
+                g.click_x == out.x && g.click_y == out.y) {
+                if (++g.ping_seq == 0) g.ping_seq = 1;
+                g.ping_x = (int16_t)out.x;
+                g.ping_y = (int16_t)out.y;
+                Ping& own = g.pings[net_self() % kMaxPeers];
+                own.x = out.x; own.y = out.y; own.at = now; own.battle = battle;
+                own.seq = g.ping_seq;
+                g.click_at = 0;
+                log_line("CURSOR", "-> pinged tile (%d,%d)", out.x, out.y);
+                sound_play_file(kPingSound);
+            } else {
+                g.click_at = now;
+                g.click_x  = out.x;
+                g.click_y  = out.y;
+            }
+        }
+        g.lb_down = down;
+    }
+    out.ping_seq = g.ping_seq;
+    out.ping_x   = g.ping_x;
+    out.ping_y   = g.ping_y;
+
     // EVERY FIELD OF THE MESSAGE, and `mode` is the one that used to be left
     // out. This test decides whether the frame is worth a packet, so a field
     // missing from it is a field that only ever travels on the 500 ms
@@ -437,7 +540,8 @@ void cursor_on_status_menu(void* sm) {
                        out.face_cat != g.last_sent.face_cat ||
                        out.face_x != g.last_sent.face_x ||
                        out.face_y != g.last_sent.face_y ||
-                       out.battle_id != g.last_sent.battle_id;
+                       out.battle_id != g.last_sent.battle_id ||
+                       out.ping_seq != g.last_sent.ping_seq;
     const uint64_t since = now - g.last_send_at;
     if ((moved && since >= kMinSendGapMs) || since >= kHeartbeatMs) {
         if (net_send_cursor(out)) {
@@ -461,6 +565,14 @@ void cursor_on_status_menu(void* sm) {
     }
 
     const uint8_t self = net_self();
+    // Pings, everybody's own included, under the reticles.
+    for (uint8_t i = 0; i < kMaxPeers; ++i) {
+        Ping& p = g.pings[i];
+        if (!p.at) continue;
+        if (now - p.at >= kPingMs || p.battle != battle) { p.at = 0; continue; }
+        if (p.x < 0 || p.y < 0 || (uint32_t)p.x >= w || (uint32_t)p.y >= h) continue;
+        draw_ping(ui, i, p, now);
+    }
     for (uint8_t i = 0; i < kMaxPeers; ++i) {
         if (i == self) continue;                 // ours is the game's own pip
         const Peer& p = g.peers[i];

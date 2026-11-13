@@ -12,6 +12,8 @@
 #include "mgmp_invsync.h"    // invsync_screen_open
 #include "mgmp_lockstep.h"   // lockstep_in_battle
 #include "mgmp_leave.h"      // leave_scene_up
+#include "mgmp_choice.h"     // choice_level_screen_up
+#include "mgmp_classpick.h"  // classpick_client_chooser_up
 
 #include <windows.h>
 #include <cstdio>
@@ -735,7 +737,13 @@ void catsync_on_message(const CatDataMsg& m) {
     // In a fight, that is: the lockstep's "in battle" stays set on the map and
     // in the House until the next fight, and a push for the House (the cats of
     // a run about to start) held there would never land.
-    const bool hold = invsync_screen_open() ||
+    // And a level-up screen: the host's cat comes with its pick already in it,
+    // a moment before the pick, and the pick then took the passive a second
+    // time -- the replace panel opened here and not on the host (2026-11-09).
+    // And this game's own class chooser: its embark copies its cats back over
+    // them, and the host's party with its class abilities would be lost.
+    const bool hold = invsync_screen_open() || choice_level_screen_up() ||
+                      classpick_client_chooser_up() ||
                       (lockstep_in_battle() && !leave_scene_up("Map") && !leave_scene_up("House"));
     if (!hold) {
         g.declined_in_battle = false;   // re-arms the line for the next battle

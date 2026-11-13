@@ -22,7 +22,7 @@ constexpr int kTries    = 8;
 // The files are mastered for the game's mixer, which plays them under the
 // music; on their own through the system they stand out.
 constexpr double kGain = 0.6;
-float g_volume      = 1.0f;   // the panel's slider, on top of kGain
+float g_volume      = 0.4f;   // the panel's slider, on top of kGain; 40% until the player sets it
 bool  g_volume_read = false;
 
 CRITICAL_SECTION g_cs;
@@ -46,6 +46,7 @@ struct Job {
 
 bool find_meow(const Job& job, uint8_t** data, uint32_t* size, const char** name) {
     for (int t = 0; t < kTries; ++t) {
+        if (!job.name[t][0]) continue;
         if (gpak_read(job.name[t], data, size)) { *name = job.name[t]; return true; }
     }
     return false;
@@ -91,7 +92,7 @@ DWORD WINAPI meow_thread(LPVOID p) {
         LeaveCriticalSection(&g_cs);
         free(data);
     } else {
-        log_line("FOLLOW", "no meow found in %d tries", kTries);
+        log_line("FOLLOW", "no meow found in %d tries (%s)", kTries, job->name[0]);
     }
     delete job;
     return 0;
@@ -166,6 +167,20 @@ void meow_play(uint32_t seed) {
                     1 + (int)((r >> 8) % kMaxVoice), kMoods[(r >> 24) % 4],
                     1 + (int)((r >> 32) % 4));
     }
+    HANDLE t = CreateThread(nullptr, 0, &meow_thread, job, 0, nullptr);
+    if (t) CloseHandle(t);
+    else   delete job;
+}
+
+void sound_play_file(const char* gpak_name) {
+    ensure_meow();
+    read_volume();
+    if (g_volume <= 0.001f || !gpak_name) return;
+    Job* job = new Job{};
+    EnterCriticalSection(&g_cs);
+    job->seq = ++g_seq;
+    LeaveCriticalSection(&g_cs);
+    strncpy_s(job->name[0], gpak_name, _TRUNCATE);
     HANDLE t = CreateThread(nullptr, 0, &meow_thread, job, 0, nullptr);
     if (t) CloseHandle(t);
     else   delete job;

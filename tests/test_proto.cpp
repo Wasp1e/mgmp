@@ -528,9 +528,18 @@ int main() {
         check(!dec_statedump(rb, ob), "size != count * stride is refused");
         check(ob.data == nullptr, "and it allocated nothing");
 
-        StateDumpMsg empty{}; empty.data = body;
+        StateDumpMsg empty{}; empty.data = body; empty.count = 3;
         check(enc_statedump(big, sizeof(big), empty) == 0,
-              "an empty dump is refused rather than sent");
+              "a dump with cats and no bytes is refused rather than sent");
+
+        // The stream alone: no cats, no bytes, from a battle with the state hash off.
+        StateDumpMsg so{}; so.turn = 24; so.stride = 16; so.rng[2] = 0x1234;
+        uint32_t sn = enc_statedump(big, sizeof(big), so);
+        check(sn > 0, "a stream-only dump encodes");
+        Reader rs(big, sn); rs.u8v();
+        StateDumpMsg sd{};
+        check(dec_statedump(rs, sd) && sd.count == 0 && sd.data == nullptr &&
+              sd.rng[2] == 0x1234 && sd.turn == 24, "and decodes to its stream, no table");
     }
 
     printf("\n-- a truncated frame fails, it does not read past the end --\n");
@@ -561,6 +570,8 @@ int main() {
         w.i32v(0); w.i32v(0);           // facing
         char big[200]; memset(big, 'x', sizeof(big)); big[199] = 0;
         w.str(big);                     // Writer clamps to 255
+        w.u8v(1);                       // has_rng, then the stream
+        for (int i = 0; i < 4; ++i) w.u64v(0x1111 * (i + 1));
         w.u32v(0xFEEDFACE);             // a sentinel after the string
 
         Reader r(buf, w.len); r.u8v();

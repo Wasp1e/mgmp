@@ -45,6 +45,12 @@ param(
     # lockstep log so far can name the passive behind a proc. Turn this on when
     # the question is 'which RollChance fired', not 'did the peers agree'.
     [switch]$Record,
+    # Read-only samples of House cat positions, for movement investigation.
+    [switch]$HousePositions,
+    [switch]$HouseWalk,
+    [switch]$HouseActions,
+    [switch]$HouseDrag,
+    [switch]$HouseDragSync,
     # Stop the client following the host through the map screen, i.e. drive
     # both instances to the same battle by hand. That is how phase 4 was
     # tested, and it is still the way to tell a battle-layer problem from a
@@ -293,6 +299,11 @@ foreach ($peer in $peers.Keys) {
     # keep alive.
     $cfg.debug.desync_halt     = -not $NoHalt
     $cfg.debug.record          = [bool]$Record
+    $cfg.debug | Add-Member -NotePropertyName house_positions -NotePropertyValue ([bool]$HousePositions) -Force
+    $cfg.debug | Add-Member -NotePropertyName house_walk_sync -NotePropertyValue ([bool]$HouseWalk) -Force
+    $cfg.debug | Add-Member -NotePropertyName house_action_sync -NotePropertyValue ([bool]$HouseActions) -Force
+    $cfg.debug | Add-Member -NotePropertyName house_drag_trace -NotePropertyValue ([bool]$HouseDrag) -Force
+    $cfg.debug | Add-Member -NotePropertyName house_drag_sync -NotePropertyValue ([bool]$HouseDragSync) -Force
     $cfg.debug.record_note     = "lockstep $peer, cats [$cats]"
     # Lockstep owns Brain::GetChoice. Leaving a replay file configured would put
     # two injectors on one buffer, and lockstep wins -- so the replay would

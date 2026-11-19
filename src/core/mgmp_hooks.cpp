@@ -460,6 +460,10 @@ void __fastcall h_TimeDelay(void* self) {
 }
 
 void __fastcall h_SaveScum(void* run, int mode) {
+    if (config_steven()) {
+        o_SaveScum(run, mode);
+        return;
+    }
     static LONG volatile swallowed = 0;
     LONG n = InterlockedIncrement(&swallowed);
     uint32_t counter = 0;

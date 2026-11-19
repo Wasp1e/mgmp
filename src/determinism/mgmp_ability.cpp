@@ -1,6 +1,7 @@
 #include "mgmp_ability.h"
 
 #include "mgmp_mem.h"
+#include "mgmp_resolve.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -108,8 +109,7 @@ bool ability_gon_name(const void* ability, char* out, size_t out_size) {
 }
 
 namespace {
-// Character's list of every usable ability: rebuilds Character+0xE90 (a
-// CustomVector<Ability*>) and returns its address.
+// Character's list of tile-interaction abilities at Character+0xE90.
 constexpr uintptr_t kRva_AllAbilities = 0x117FC0;
 const uint8_t kAllAbilitiesPrologue[8] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48 };
 using fn_all_abilities = void* (__fastcall*)(void*);
@@ -126,6 +126,46 @@ void* all_abilities(void* character) {
     }
     if (!fn || !character) return nullptr;
     __try { return fn(character); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+// MoveAndUseAbilityEachTurnBeginIfPossible calls this resolver when setting up
+// its deferred action. It creates an ability owned by the character if needed
+// and puts it in the temporary vector at Character+0xEA0.
+using fn_find_or_create_ability = void* (__fastcall*)(void*, const void*);
+
+void* resolve_cannibalize(void* character) {
+    if (!resolve_is_pinned_build()) return nullptr;
+
+    // The factory's creations are outside both the spell slots and the tile
+    // interaction list. Reuse an existing instance before calling the factory.
+    constexpr size_t temporary_vector = 0xEA0;
+    const uint32_t count = read_u32(character, temporary_vector + 4);
+    const void* data = read_ptr(character, temporary_vector + 8);
+    if (count > kMaxSpellSlots || (count && !data)) return nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        const void* ability = read_ptr(data, i * sizeof(void*));
+        char name[64];
+        if (ability_gon_name(ability, name, sizeof(name)) && strcmp(name, "Cannibalize") == 0)
+            return const_cast<void*>(ability);
+    }
+
+    constexpr uintptr_t factory_rva = 0x1196C0;
+    constexpr uint8_t prologue[] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x20,
+                                    0x56, 0x57, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x40};
+    const auto* entry = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr)) + factory_rva;
+    uint8_t bytes[sizeof(prologue)];
+    if (!mem_read(entry, bytes, sizeof(bytes)) || memcmp(bytes, prologue, sizeof(bytes)) != 0)
+        return nullptr;
+
+    // Borrowed short MSVC string, read by the game and copied before any move.
+    struct {
+        char inline_chars[16];
+        uint64_t size;
+        uint64_t capacity;
+    } name{"Cannibalize", sizeof("Cannibalize") - 1, 15};
+    auto factory = reinterpret_cast<fn_find_or_create_ability>(entry);
+    __try { return factory(character, &name); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
 } // namespace
@@ -148,7 +188,6 @@ void* ability_find_by_name(void* character, const char* gon, char* seen, size_t 
         if (a && ability_gon_name(a, nm, sizeof(nm)) && strcmp(nm, gon) == 0) return a;
     }
     const void* list = all_abilities(character);
-    if (!list) return nullptr;
     uint32_t    n  = read_u32(list, 4);
     const void* el = read_ptr(list, 8);
     if (n > kMaxSpellSlots) n = kMaxSpellSlots;
@@ -161,7 +200,7 @@ void* ability_find_by_name(void* character, const char* gon, char* seen, size_t 
         if (seen && at + 1 < seen_size)
             at += _snprintf_s(seen + at, seen_size - at, _TRUNCATE, "%s%s", at ? ", " : "", nm);
     }
-    return nullptr;
+    return strcmp(gon, "Cannibalize") == 0 ? resolve_cannibalize(character) : nullptr;
 }
 
 void* current_actor(const void* turn_control) {

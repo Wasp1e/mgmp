@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include "mgmp_proto.h"
 
 // WHAT HAPPENED IN THE NIGHT. The day ends on the host: its House resolves the
@@ -12,6 +13,9 @@
 namespace mgmp {
 
 void night_set_base(uintptr_t base);
+
+// A House cat's name by its key, UTF-8; empty if this game has no such cat.
+std::string night_cat_name(uint64_t key);
 
 // Client: one line of the host's night arrived.
 void night_on_message(const LogFileMsg& m);

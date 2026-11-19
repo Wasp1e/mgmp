@@ -24,6 +24,10 @@ add_executable(test_split test_split.cpp)
 target_include_directories(test_split PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
 add_test(NAME test_split COMMAND test_split)
 
+add_executable(test_house_drag test_house_drag.cpp)
+target_include_directories(test_house_drag PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
+add_test(NAME test_house_drag COMMAND test_house_drag)
+
 add_executable(test_sigscan test_sigscan.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_sigscan.cpp)
 target_include_directories(test_sigscan PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
 add_test(NAME test_sigscan COMMAND test_sigscan)

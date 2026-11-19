@@ -4,7 +4,7 @@ An unofficial mod that lets two people play one Mewgenics campaign together:
 the same House, the same runs, the same cats and the same fights, each player
 in charge of their own half of the cats.
 
-Version **0.25** (network protocol 83), for Mewgenics **1.1.21239**.
+Version **0.25** (network protocol 92 in this development build), for Mewgenics **1.1.21239**.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the
@@ -142,7 +142,12 @@ the game, set `game` in `mgmp.json` (doubled backslashes in JSON paths).
 3. The host picks a save slot. The friend's game loads the same campaign on
    its own, into a separate `mgmp_coop.sav`.
 4. Play. On your cat's turn you move it; on your partner's you watch. Cats run
-   by the computer are handled by both games identically.
+    by the computer are handled by both games identically.
+
+**Steven / save scum:** F1 → **gameplay → Steven (save scum)** enables the
+game's normal reload penalties. Off by default. Both players must choose the
+same value before connecting. Changes are saved in `mgmp.json` and do not
+undo penalties already applied.
 
 The host owns the campaign: only the host's save is written. Before replacing
 the coop save the mod keeps the previous one in `saves\mgmp_backups`.
@@ -243,6 +248,12 @@ Run the tests with:
 ```powershell
 ctest --test-dir build --build-config Release
 ```
+
+For a local two-instance multiplayer test, `.\tools\restart_test.ps1`
+builds the mod, starts a host and client, and moves them to separate monitors
+when available. It asks before forcibly closing any running Mewgenics games;
+close them normally first if you need to save progress. Both instances use
+the game's real save directory, so back up saves before testing.
 
 ---
 

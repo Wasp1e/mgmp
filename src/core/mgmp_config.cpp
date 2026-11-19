@@ -12,6 +12,7 @@
 #include <cwchar>
 #include <fstream>
 #include <string>
+#include <atomic>
 
 namespace mgmp {
 namespace {
@@ -19,6 +20,8 @@ namespace {
 using nlohmann::json;
 
 Config g_cfg;
+std::atomic<bool> g_steven{false};
+std::wstring g_config_path;
 
 void warn(const char* fmt, ...) {
     char note[256];
@@ -171,8 +174,10 @@ void hook_defaults() {
     g_cfg.hook[T_Rand2]      = false;
     g_cfg.hook[T_RollChance] = false;
 
-    // The two that MODIFY the game -- see mgmp_tuning.h.
-    g_cfg.hook[T_SaveScumPenalty] = tune::kHookSaveScum;
+    // The two that MODIFY the game.
+    // Always installed: the F1 Steven flag chooses passthrough or suppression
+    // at call time. Installing/removing a hook from the UI is unnecessary.
+    g_cfg.hook[T_SaveScumPenalty] = true;
     g_cfg.hook[T_TimeDelayTick]   = tune::kHookTimeDelay;
 
     // The two MewSaveFile blob accessors exist only to serve mgmp_invsync, and
@@ -288,11 +293,13 @@ void config_load(const wchar_t* dll_dir) {
     // saw the previous load's values survive keys the new file did not mention,
     // and its warnings accumulate on top.
     g_cfg = Config{};
+    g_steven.store(false);
     hook_defaults();
     swprintf_s(g_cfg.log_path, L"%s\\mgmp_trace.log", dll_dir);
 
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\mgmp.json", dll_dir);
+    g_config_path = path;
 
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -319,6 +326,11 @@ void config_load(const wchar_t* dll_dir) {
     }
 
     read_path(j, "log", dll_dir, g_cfg.log_path, 512);
+    if (const json* gameplay = member(j, "gameplay")) {
+        bool steven = false;
+        read_bool(*gameplay, "steven", steven);
+        g_steven.store(steven);
+    }
 
     if (const json* net = member(j, "net")) {
         read_str (*net, "role", g_cfg.net_role, sizeof(g_cfg.net_role));
@@ -351,6 +363,11 @@ void config_load(const wchar_t* dll_dir) {
     if (const json* d = member(j, "debug")) {
         read_bool(*d, "follow",          g_cfg.net_follow);
         read_bool(*d, "join_barrier",    g_cfg.net_join_barrier);
+        read_bool(*d, "house_positions",  g_cfg.house_positions);
+        read_bool(*d, "house_walk_sync",  g_cfg.house_walk_sync);
+        read_bool(*d, "house_action_sync", g_cfg.house_action_sync);
+        read_bool(*d, "house_drag_trace",  g_cfg.house_drag_trace);
+        read_bool(*d, "house_drag_sync",   g_cfg.house_drag_sync);
         read_bool(*d, "desync_halt",     g_cfg.net_desync_halt);
         read_bool(*d, "record",          g_cfg.record);
         read_str (*d, "record_note",     g_cfg.record_note, sizeof(g_cfg.record_note));
@@ -395,6 +412,50 @@ bool config_steam() { return _stricmp(g_cfg.net_transport, "steam") == 0; }
 
 void config_set_steam(bool steam) {
     strncpy_s(g_cfg.net_transport, steam ? "steam" : "tcp", _TRUNCATE);
+}
+
+bool config_steven() { return g_steven.load(); }
+
+bool config_set_steven(bool enabled) {
+    g_steven.store(enabled);
+    if (g_config_path.empty()) return false;
+
+    // Read the actual file, not a serialization of Config: the loader's game
+    // path and any unknown/user fields must survive a checkbox change.
+    json j = json::object();
+    {
+        std::ifstream in(g_config_path.c_str(), std::ios::binary);
+        if (in) {
+            j = json::parse(in, nullptr, false, true);
+            if (j.is_discarded() || !j.is_object()) return false;
+        } else if (GetFileAttributesW(g_config_path.c_str()) != INVALID_FILE_ATTRIBUTES ||
+                   GetLastError() != ERROR_FILE_NOT_FOUND) {
+            return false;
+        }
+    }
+    if (j.contains("gameplay") && !j["gameplay"].is_null() &&
+        !j["gameplay"].is_object()) return false;
+    j["gameplay"]["steven"] = enabled;
+
+    // Write beside the file, then replace atomically. A failed write/rename
+    // leaves the original settings intact; never truncate a user's config.
+    const std::wstring dir = g_config_path.substr(0, g_config_path.find_last_of(L"\\/"));
+    wchar_t temp[MAX_PATH];
+    if (!GetTempFileNameW(dir.c_str(), L"mgc", 0, temp)) return false;
+    bool written = false;
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (out) {
+            out << j.dump(2) << '\n';
+            out.close();
+            written = !out.fail();
+        }
+    }
+    if (written && MoveFileExW(temp, g_config_path.c_str(),
+                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return true;
+    DeleteFileW(temp);
+    return false;
 }
 
 bool config_set_role(bool host) {

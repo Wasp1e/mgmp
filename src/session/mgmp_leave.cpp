@@ -415,8 +415,14 @@ struct Loading {
     bool     up      = false;
     uint64_t since   = 0;
     uint64_t settled = 0;
+    uint64_t elsewhere = 0;   // off the menus with the host's save in, neither House nor run
 } g_load;
 constexpr uint64_t kLoadSettleMs = 1500;
+// A new campaign opens on the professor's intro and the tutorial: the host's
+// save is in and the menus are gone, but there is no House and no run to call
+// home, and the loading screen covered the client's dialog for 90 s
+// (2026-11-14). Off the menus that long with the save in, it is home too.
+constexpr uint64_t kElsewhereMs  = 3000;
 constexpr uint64_t kLoadMaxMs    = 90000;
 
 void loading_tick() {
@@ -425,8 +431,14 @@ void loading_tick() {
     const bool     busy = g.pending || g.reload;
     if (busy && !g_load.up) leave_loading_start();
     if (!g_load.up) return;
-    const bool home = g.where == Where::InRun ||
-                      (g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) == 0);
+    bool home = g.where == Where::InRun ||
+                (g.where == Where::OutOfRun && strcmp(g.where_name, kScene_House) == 0);
+    if (!busy && !home && g.where == Where::Unknown && savefile_host_save_applied()) {
+        if (!g_load.elsewhere) g_load.elsewhere = now;
+        home = now - g_load.elsewhere > kElsewhereMs;
+    } else if (!home) {
+        g_load.elsewhere = 0;
+    }
     if (!busy && home) {
         if (!g_load.settled) g_load.settled = now;
         if (now - g_load.settled > kLoadSettleMs) {
@@ -450,6 +462,7 @@ void leave_loading_start() {
     g_load.up      = true;
     g_load.since   = GetTickCount64();
     g_load.settled = 0;
+    g_load.elsewhere = 0;
 }
 
 bool leave_loading(const char** step) {

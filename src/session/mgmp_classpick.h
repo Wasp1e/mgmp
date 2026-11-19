@@ -63,6 +63,9 @@ bool classpick_view(ClassPickView& out);
 // screen holds their items -- a cat applied under either is lost or crashes.
 bool classpick_client_chooser_up();
 
+// Another player has their backpack open in the run.
+bool classpick_peer_in_backpack();
+
 // The client puts collar `tag` on its cat `cat_key`.
 void classpick_pick(uint64_t cat_key, uint32_t tag);
 

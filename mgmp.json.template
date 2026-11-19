@@ -16,6 +16,10 @@
     "key": "F1"
   },
 
+  "gameplay": {
+    "steven": false
+  },
+
   "debug": {
     "follow": true,
     "follow_delay_ms": 0,

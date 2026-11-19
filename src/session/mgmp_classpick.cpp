@@ -8,6 +8,7 @@
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"
 #include "mgmp_startrun.h"
+#include "mgmp_rng.h"
 #include "mgmp_leave.h"
 #include "mgmp_savefile.h"
 #include "mgmp_combatlock.h"
@@ -193,6 +194,8 @@ struct State {
     uint64_t mut_key[kClassPickCats] = {};      // whose mutations muts[] holds
     char     muts[kClassPickCats][48] = {};
     uint64_t inv_at     = 0;     // the inventory screen's last update
+    bool     host_gear_closed = false;   // client: the host left its gear screen
+    uint64_t host_gear_closed_at = 0;
     uint8_t  phase      = 0;     // what was last sent: 0 none, 1 collars, 2 gear
     uint64_t chooser_gone_at = 0;
     bool     gear_seen  = false;
@@ -271,7 +274,7 @@ void dim_tag(void* tag);
 
 void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
     g.inv_at = GetTickCount64();
-    if (net_role() != NetRole::Host) startrun_scene_tick();
+    if (net_role() != NetRole::Host) startrun_scene_tick(a);
     if (net_role() != NetRole::Host && g.gear_n && apply_gear() && !safe_rebuild(a))
         log_line("CLASSPICK", "!! rebuilding this game's gear screen faulted");
     // NOT the host's cats here. Applied under this screen, they took the items
@@ -287,6 +290,12 @@ void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
     }
     void* r = g.o_inv(a, b, c, d);
     dim_slots(a);
+    if (g.host_gear_closed && net_role() != NetRole::Host) {
+        g.host_gear_closed = false;
+        // A late word is dropped: left waiting, it shut the friend's next
+        // backpack the moment it opened (2026-11-14).
+        if (GetTickCount64() - g.host_gear_closed_at < 3000) startrun_gear_closed(a);
+    }
     return r;
 }
 
@@ -298,7 +307,7 @@ void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
     }
     void* r = g.o_tick(a, b, c, d);
     dim_tag(a);
-    if (net_role() != NetRole::Host) startrun_scene_tick();
+    if (net_role() != NetRole::Host) startrun_scene_tick(nullptr);
     // From inside the chooser's own update: the embark may ask its popup (a cat
     // with no collar), and a popup outside a scene's update faults -- the
     // client did at 0x14077DD5F on 2026-11-05, called from the frame's end.
@@ -457,8 +466,27 @@ void* __fastcall embark(void* a, void* b, void* c, void* d) {
     // a list read now says no cat wears one, and the client took every host
     // cat's collar off by it (2026-11-05). So nothing more goes out of this one.
     if (vote_on() && chooser_up()) { g.embarking = g.chooser; g.embarking_at = GetTickCount64(); }
+    // THE CLASS ABILITIES. The confirm gives each cat its class's abilities, and
+    // draws them from the ability pool on the simulation stream (sub_1400B7320,
+    // TLS+0x178) -- the friend's own stream drew others, and the two screens
+    // showed the same cats with different abilities (2026-11-14). The host sends
+    // the stream it confirms from; the friend's confirm starts from it.
+    if (net_role() == NetRole::Host && net_active() && net_peer_count() >= 2) {
+        if (const uint64_t* s = rng_global_stream()) {
+            ChoiceMsg m{};
+            m.kind      = kChoiceEmbarkRng;
+            m.node_seed = s[0];
+            m.cat       = s[1];
+            snprintf(m.name, sizeof(m.name), "%016llx%016llx",
+                     (unsigned long long)s[2], (unsigned long long)s[3]);
+            net_send_choice(m);
+        }
+    }
     return g.o_embark(a, b, c, d);
 }
+
+uint64_t g_embark_rng[4] = {};
+uint64_t g_embark_rng_at = 0;
 
 bool patch(uintptr_t base, uintptr_t slot_rva, uintptr_t want, void* ours, fn_this& orig,
            const char* what) {
@@ -815,13 +843,16 @@ void hook_slot_locked(uintptr_t base) {
 
 // --- the host ----------------------------------------------------------------
 
-// The cats the friend put in the House's box are the friend's: pinned before the
-// split, which keeps a cat's row and deals the rest.
+// The cats each player put in the House's box are that player's: pinned before
+// the split, which keeps a cat's row and deals only cats nobody picked.
 void pin_friend_picks(const uint64_t* uid, uint32_t n) {
     if (net_peer_count() < 2) return;
     for (uint32_t i = 0; i < n; ++i) {
         const int p = startrun_box_picker(g.key[i]);
-        if (p <= 0 || (uint32_t)p >= net_peer_count()) continue;   // the host's: the split deals them
+        // The host's too: a row left in the owner table from an earlier run of
+        // the same cats gave the friend a third cat the host had put in
+        // (2026-11-14). Every cat in the box is its picker's, nothing is dealt.
+        if (p < 0 || (uint32_t)p >= net_peer_count()) continue;
         lockstep_owner_put(uid[i], (uint8_t)p);
         log_line("CLASSPICK", "  cat '%s' went in the box from player %d -- theirs", g.name[i], p);
     }
@@ -1565,7 +1596,72 @@ void host_pump() {
 
 // ---------------------------------------------------------------------------
 
+// THE CAT'S ICON. The cat card's icon picker (catinfo, "icon_selecter") gives
+// each icon a lambda, vftable 0xEDBFC0, holding the card at +8 and the icon's
+// index at +0x10; its _Do_call (0x1400EDA60) takes the card's cat (a HouseCat
+// at +0x78, checked against its generation at +0x80; its key at +0x80) and
+// writes the icon's name -- std::string #index of the card's +0xB8 list -- into
+// that cat's CatData+0x38 with std::string::assign (0x1400520D0). Each game
+// keeps its own House, so a friend's icon never reached the host's save and was
+// gone with the next reload (2026-11-14). Either player's pick goes to the other
+// by the cat's key and name, and is written the same way there.
+constexpr uintptr_t kRva_IconClickSlot = 0xEDBFC0 + 2 * 8;
+constexpr uintptr_t kRva_IconClick     = 0xEDA60;
+constexpr uintptr_t kRva_StrAssign     = 0x520D0;
+const uint8_t kStrAssignHead[8]        = { 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C };
+constexpr uintptr_t kCard_Cat     = 0x78;
+constexpr uintptr_t kCard_CatGen  = 0x80;
+constexpr uintptr_t kCard_Icons   = 0xB8;
+constexpr uintptr_t kHouseCat_Key = 0x80;
+constexpr uintptr_t kCatData_Icon = 0x38;
+using fn_assign = void* (__fastcall*)(void*, const char*, size_t);
+fn_this   o_icon_click = nullptr;
+fn_assign str_assign   = nullptr;
+
+void* __fastcall icon_click(void* closure, void* b, void* c, void* d) {
+    void* r = o_icon_click(closure, b, c, d);
+    if (!net_active() || net_peer_count() < 2) return r;
+    uint8_t* card = nullptr;
+    int32_t  idx  = -1;
+    uint8_t* hc   = nullptr;
+    uint64_t gen = 0, have = 1, key = 0;
+    uint8_t* icons = nullptr;
+    char     name[48] = {};
+    if (!mem_read((const uint8_t*)closure + 8, &card, sizeof(card)) || !card ||
+        !mem_read((const uint8_t*)closure + 0x10, &idx, sizeof(idx)) || idx < 0 ||
+        !mem_read(card + kCard_Cat, &hc, sizeof(hc)) || !hc ||
+        !mem_read(card + kCard_CatGen, &gen, sizeof(gen)) ||
+        !mem_read(hc - 8, &have, sizeof(have)) || have != gen ||
+        !mem_read(hc + kHouseCat_Key, &key, sizeof(key)) || !key ||
+        !mem_read(card + kCard_Icons, &icons, sizeof(icons)) || !icons ||
+        !mem_read_std_string(icons + (uintptr_t)idx * 0x20, name, sizeof(name)))
+        return r;
+    ChoiceMsg m{};
+    m.kind = kChoiceCatIcon;
+    m.cat  = key;
+    strncpy_s(m.name, name, _TRUNCATE);
+    net_send_choice(m);
+    log_line("CLASSPICK", "-> cat %016llx wears the icon '%s', for the other player's House",
+             (unsigned long long)key, name);
+    return r;
+}
+
+bool safe_assign(void* str, const char* text) {
+    __try { str_assign(str, text, strlen(text)); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void watch_icons(uintptr_t base) {
+    if (memcmp((const void*)(base + kRva_StrAssign), kStrAssignHead, 8) != 0) {
+        log_line("CLASSPICK", "!! the string assign moved -- cat icons stay on each screen");
+        return;
+    }
+    str_assign = (fn_assign)(base + kRva_StrAssign);
+    patch(base, kRva_IconClickSlot, kRva_IconClick, (void*)&icon_click, o_icon_click, "the cat icon picker");
+}
+
 void classpick_set_base(uintptr_t base) {
+    if (!o_icon_click) watch_icons(base);
     if (g.o_tick) return;
     if (memcmp((const void*)(base + kRva_TagClick), kTagClickPrologue,
                sizeof(kTagClickPrologue)) != 0) {
@@ -1694,11 +1790,38 @@ void follow_embark() {
     g.embark_closure[1] = dir;
     g.embark_closure[2] = g.chooser;
     g.embark_due = true;
+    if (g_embark_rng_at && GetTickCount64() - g_embark_rng_at < 120000) {
+        if (uint64_t* s = rng_global_stream()) {
+            memcpy(s, g_embark_rng, sizeof(g_embark_rng));
+            log_line("CLASSPICK", "this game's confirm draws the class abilities from the host's stream");
+        }
+        g_embark_rng_at = 0;
+    }
     g.o_embark(g.embark_closure, nullptr, nullptr, nullptr);
     log_line("CLASSPICK", "<- the host confirmed its collars -- this game's chooser confirms too");
 }
 
+// THE OTHER PLAYER'S BACKPACK. A player on the map waited on a partner who was
+// in the backpack with nothing on screen to say so (2026-11-14): each player
+// tells the other when theirs is open in a run, and the map shows a note.
+uint64_t g_peer_pack_at = 0;
+
+void say_backpack() {
+    static bool     was = false;
+    static uint64_t at  = 0;
+    const bool open = net_active() && net_peer_count() >= 2 && in_a_run() && inv_up();
+    const uint64_t now = GetTickCount64();
+    if (open == was && (!open || now - at < 1000)) return;
+    was = open;
+    at  = now;
+    ChoiceMsg m{};
+    m.kind  = kChoiceBackpack;
+    m.index = open ? 1 : 0;
+    net_send_choice(m);
+}
+
 void classpick_pump() {
+    say_backpack();
     if (!g.o_tick || !g.o_click) return;
     if (net_role() == NetRole::Host) { host_pump(); return; }
     if (g.gear_n && !inv_up() && run_gear()) apply_gear();
@@ -1709,7 +1832,48 @@ void classpick_pump() {
     }
 }
 
+bool classpick_peer_in_backpack() {
+    return g_peer_pack_at && GetTickCount64() - g_peer_pack_at < 2500;
+}
+
 bool classpick_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceEmbarkRng) {
+        unsigned long long w2 = 0, w3 = 0;
+        if (net_role() != NetRole::Host && sscanf_s(m.name, "%16llx%16llx", &w2, &w3) == 2) {
+            g_embark_rng[0] = m.node_seed;
+            g_embark_rng[1] = m.cat;
+            g_embark_rng[2] = w2;
+            g_embark_rng[3] = w3;
+            g_embark_rng_at = GetTickCount64();
+        }
+        return true;
+    }
+    if (m.kind == kChoiceGearDone) {
+        // The run's backpack is the same screen with the same way out: the
+        // host's closed backpack shut the friend's too (2026-11-14). Only the
+        // gear screen that mirrors the host's collar chooser follows.
+        if (net_role() != NetRole::Host && g.active && g.view.phase == 2) {
+            g.host_gear_closed    = true;
+            g.host_gear_closed_at = GetTickCount64();
+            if (GetTickCount64() - g.inv_at > 1000)
+                log_line("CLASSPICK", "!! the host left its gear screen, and no gear screen of this game's"
+                                      " has updated for %llu ms -- it cannot leave with the host's",
+                         (unsigned long long)(GetTickCount64() - g.inv_at));
+        }
+        return true;
+    }
+    if (m.kind == kChoiceCatIcon) {
+        void* cat = cat_by_key(m.cat);
+        const bool ok = cat && str_assign && safe_assign((uint8_t*)cat + kCatData_Icon, m.name);
+        log_line("CLASSPICK", ok ? "<- cat %016llx wears the icon '%s', as the other player put it"
+                                 : "!! cat %016llx's icon '%s' could not be put on here",
+                 (unsigned long long)m.cat, m.name);
+        return true;
+    }
+    if (m.kind == kChoiceBackpack) {
+        g_peer_pack_at = m.index ? GetTickCount64() : 0;
+        return true;
+    }
     if ((m.kind < kChoiceClassCat || m.kind > kChoiceClassEquip) &&
         m.kind != kChoiceClassStats && m.kind != kChoiceClassUnequip && m.kind != kChoiceClassMuts &&
         m.kind != kChoiceClassBonus && m.kind != kChoiceClassWear &&
@@ -1835,12 +1999,16 @@ bool classpick_on_message(const ChoiceMsg& m) {
                     ? "the host's class chooser is up -- pick your cats' collars in the panel"
                     : "the host's gear screen is up -- dress your cats in the panel");
             b.phase    = (uint8_t)m.aux;
+            g.host_gear_closed = false;
             g.view     = b;
             g.active   = true;
             g.last_end = GetTickCount64();
         } else {
             if (g.active) log_line("CLASSPICK", g.view.phase == 2 ? "the host's gear screen closed"
                                                                   : "the host embarked");
+            // Closed is not left: Esc closes it too, back to the collars, and the
+            // friend went on to ActSelection alone (2026-11-14). The host says
+            // when it really leaves (kChoiceGearDone).
             g.active = false;
         }
         b = ClassPickView{};

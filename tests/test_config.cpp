@@ -21,6 +21,9 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <iterator>
+#include <string>
+#include "json.hpp"
 
 using namespace mgmp;
 
@@ -64,6 +67,7 @@ int main() {
         check(c.net_control_auto,               "control defaults to auto");
         check(c.ui,                             "the panel defaults on");
         check(warned(),                         "and the absence is reported");
+        check(!config_steven(),                 "Steven defaults off");
     }
 
     printf("-- the ordinary case --\n");
@@ -165,8 +169,8 @@ int main() {
               "and the two blob accessors the inventory push needs");
         check(c.hook[T_EventChoice] && c.hook[T_EventUpdate],
               "and the choice screens");
-        check(c.hook[T_SaveScumPenalty] == tune::kHookSaveScum,
-              "while the game-modifying hooks follow mgmp_tuning.h alone");
+        check(c.hook[T_SaveScumPenalty],
+              "save-scum detour stays installed for the runtime Steven switch");
     }
     {
         const Config& c = load(R"({ "ui": { "enabled": true } })");
@@ -180,6 +184,66 @@ int main() {
         check(c.hook[T_RandInt] && c.hook[T_RandFloat] &&
               c.hook[T_Rand2]   && c.hook[T_RollChance],
               "debug.record implies all four RNG hooks");
+    }
+
+    printf("-- Steven is live, persisted, and does not replace other settings --\n");
+    {
+        load(R"({
+            "game": "C:\\Games\\Mewgenics.exe",
+            "net": { "role": "client", "addr": "127.0.0.1" },
+            "custom": { "keep": [1, 2, 3] },
+            "gameplay": { "other": 17, "steven": true }
+        })");
+        check(config_steven(), "Steven can be enabled from JSON");
+        check(config().hook[T_SaveScumPenalty], "hook installed even when Steven is enabled");
+        check(config_set_steven(false), "disable saved");
+        check(!config_steven(), "disable applies immediately");
+        config_load(g_dir);
+        check(!config_steven(), "disable survives reload");
+        check(config_set_steven(true), "enable saved");
+        check(config_steven(), "enable applies immediately");
+        config_load(g_dir);
+        check(config_steven(), "enable survives reload");
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"%s\\mgmp.json", g_dir);
+        std::ifstream in(path, std::ios::binary);
+        const auto j = nlohmann::json::parse(in, nullptr, false);
+        check(j.is_object() && j["game"] == "C:\\Games\\Mewgenics.exe" &&
+              j["net"]["role"] == "client" && j["net"]["addr"] == "127.0.0.1" &&
+              j["custom"]["keep"] == nlohmann::json::array({1, 2, 3}) &&
+              j["gameplay"]["other"] == 17,
+              "game path, connection, unknown fields and gameplay siblings preserved");
+    }
+    {
+        load(nullptr);
+        check(config_set_steven(true), "missing config is created");
+        config_load(g_dir);
+        check(config_steven(), "new config loads Steven");
+    }
+    {
+        const char* bad = "{ bad JSON -- do not overwrite";
+        load(bad);
+        check(!config_set_steven(true), "malformed config is not overwritten");
+        check(config_steven(), "runtime change still applies on save failure");
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"%s\\mgmp.json", g_dir);
+        std::ifstream in(path, std::ios::binary);
+        const std::string contents((std::istreambuf_iterator<char>(in)), {});
+        check(contents == bad, "malformed user file stays byte-for-byte intact");
+    }
+    {
+        load(R"({ "gameplay": { "steven": "yes" } })");
+        check(!config_steven() && warned(), "invalid Steven value keeps default and warns");
+        load(R"({ "gameplay": "preserve me" })");
+        check(!config_set_steven(true), "non-object gameplay section is not overwritten");
+        load("{}");
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"%s\\mgmp.json", g_dir);
+        check(SetFileAttributesW(path, FILE_ATTRIBUTE_READONLY) != 0, "make config read-only");
+        check(!config_set_steven(true), "read-only config reports persistence failure");
+        SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+        config_load(g_dir);
+        check(!config_steven(), "failed replace leaves original file intact");
     }
 
     printf(g_fail ? "\n%d FAILED\n" : "\nall good\n", g_fail);

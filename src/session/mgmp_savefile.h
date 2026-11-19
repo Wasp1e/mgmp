@@ -109,6 +109,9 @@ int  savefile_autoselect(void* save_selection);
 // Takes a copy of m.data; the caller keeps ownership of the frame.
 void savefile_on_message(const SaveFileMsg& m);
 
+// The .sav this game is playing now: the host's own slot, the client's coop save.
+bool savefile_live_path(wchar_t* out, size_t cap);
+
 // From h_MewDirectorInit. Returns a std::string to load INSTEAD of the one the
 // game chose, or nullptr to leave the call alone. Non-null exactly once per
 // injected slot click, so a load the client starts for any other reason is
@@ -125,6 +128,11 @@ const void* savefile_redirect_load();
 // screen. Assuming otherwise once overwrote a player's save file. Exported for
 // mgmp_leave, which wants an answer that does not depend on the scene walk.
 bool savefile_adventure_is_loaded();
+
+// CLIENT: the host's save has been loaded in this process (MewDirector::init ran
+// on it). Off the menus after that, this peer is in the host's game, whatever
+// screen it is on.
+bool savefile_host_save_applied();
 
 // From h_ButtonUpdate, at the tail: PRESS PLAY FOR A CLIENT THAT IS SITTING ON
 // THE MAIN MENU with the host's save already in hand.

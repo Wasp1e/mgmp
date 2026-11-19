@@ -76,6 +76,11 @@ struct Config {
     // a recording without them is a stream of actions and no draws, which is
     // silently useless and only noticed after playing a whole battle.
     bool     record            = false;
+    bool     house_positions   = false; // read-only House movement diagnostics
+    bool     house_walk_sync   = false; // experimental House movement sync
+    bool     house_action_sync = false; // experimental short idle animations
+    bool     house_drag_trace  = false; // send read-only House drag samples
+    bool     house_drag_sync   = false; // experimental visible remote dragging
     wchar_t  record_path[512]  = {};   // derived from the log name
     char     record_note[256]  = {};   // stored in EV_META
     // debug.coop_save: the file a client writes the host's campaign into, in the
@@ -138,5 +143,13 @@ bool        config_set_role(bool host);
 // the session never has to care which of the two chose it.
 bool        config_steam();
 void        config_set_steam(bool steam);
+
+// gameplay.steven: allow the game's future save-scum penalties, including
+// Steven. Default off. This never undoes penalties already in a save.
+// The hook reads an atomic value so UI/game threads can use it safely.
+bool        config_steven();
+// Applies immediately and saves only this key, preserving other JSON fields.
+// False means active in memory but not saved (e.g. invalid/read-only JSON).
+bool        config_set_steven(bool enabled);
 
 } // namespace mgmp

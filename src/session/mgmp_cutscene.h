@@ -15,6 +15,9 @@ void cutscene_set_base(uintptr_t base);
 // Once a frame: logs a cutscene starting and ending, posts the host's inputs.
 void cutscene_pump();
 
+// An NPC office was updated recently, including its closing transition.
+bool cutscene_office_active();
+
 // kChoiceCutInput.
 bool cutscene_on_message(const ChoiceMsg& m);
 

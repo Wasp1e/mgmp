@@ -5,6 +5,8 @@
 #include "mgmp_resolve.h"
 #include "mgmp_leave.h"
 #include "mgmp_lang.h"
+#include "mgmp_house.h"
+#include "mgmp_rng.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -212,6 +214,7 @@ std::string event_text(const void* inter) {
 }
 
 void* __fastcall inter_init(void* scene, void* inter, void* fn, void* str) {
+    house_on_scene(scene);
     if (inter && net_active() && net_role() == NetRole::Host && net_peer_count() >= 2 &&
         leave_on_house()) {
         const std::string text = event_text(inter);
@@ -234,7 +237,17 @@ void __fastcall end_day(void* closure) {
         log_line("NIGHT", "the end-day sign was pressed here -- the day ends on the host's side, so nothing");
         return;
     }
+    // Did the sign end the day (not set off a run)? The House at closure+8
+    // raises +0xB0 when its day ends (sub_1401EF470).
+    void* house = nullptr;
+    uint8_t before = 1, after = 0;
+    uint64_t stream[4] = {};
+    if (const uint64_t* s = rng_global_stream()) memcpy(stream, s, sizeof(stream));
+    if (mem_read((const uint8_t*)closure + 8, &house, sizeof(house)) && house)
+        mem_read((const uint8_t*)house + 0xB0, &before, 1);
     g.o_endday(closure);
+    if (house && mem_read((const uint8_t*)house + 0xB0, &after, 1) && !before && after)
+        house_night_starts(stream);
 }
 
 void patch_end_day(uintptr_t base) {
@@ -258,6 +271,7 @@ bool night_end_day_refused() { return g.denied_at && GetTickCount64() - g.denied
 void night_set_base(uintptr_t base) {
     if (g.o_init) return;
     g.base = base;
+    house_set_base(base);
     patch_end_day(base);
     if (memcmp((const void*)(base + kRva_CatLookup), "\x48\x89\x5C\x24\x08\x48\x89\x74", 8) == 0)
         g.lookup = (fn_lookup)(base + kRva_CatLookup);
@@ -270,7 +284,20 @@ void night_set_base(uintptr_t base) {
     }
 }
 
+std::string night_cat_name(uint64_t key) {
+    if (!cat_of(key)) return {};
+    return utf8(cat_name(key));
+}
+
 void night_on_message(const LogFileMsg& m) {
+    if (house_on_message(m)) return;
+    // This game resolves the same night itself, scenes and all.
+    if (net_role() != NetRole::Host && house_local_night()) {
+        std::string one((const char*)m.data, m.data ? m.size : 0);
+        for (char& c : one) if (c == '\n') c = '/';
+        log_line("NIGHT", "<- (the host's, shown here by this game's own night) %s", one.c_str());
+        return;
+    }
     if (net_role() == NetRole::Host || !m.data || !m.size) return;
     const uint64_t now = GetTickCount64();
     // Lines that come while the window is up join it: the host is still

@@ -1,5 +1,6 @@
 // mgmp_aim -- see mgmp_aim.h for why this is so small.
 #include "mgmp_aim.h"
+#include "mgmp_aim_wire.h"
 
 #include "mgmp_ability.h"
 #include "mgmp_addresses.h"
@@ -382,6 +383,7 @@ void publish(void* brain, uint8_t cat) {
         }
     }
 
+    aim_sanitize_for_wire(m);
     const uint32_t now = GetTickCount();
     const bool changed =
         (m.active != (g.sent_active ? 1 : 0)) ||

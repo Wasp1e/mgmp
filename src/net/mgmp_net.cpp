@@ -89,6 +89,8 @@ bool wsa_init() {
     return true;
 }
 
+volatile ChoiceTap g_choice_tap = nullptr;
+
 void queue_push(const NetMsg& m) {
     EnterCriticalSection(&g.cs);
     if (g.count >= kQueueCap) {
@@ -328,6 +330,10 @@ void recv_loop(Link& link) {
         m.from = from;
         g.stats.bytes_received += len + 4;
         if (m.type == MSG_PING) continue;   // its job ended when it crossed the relay
+        if (m.type == MSG_CHOICE) {
+            const ChoiceTap tap = g_choice_tap;
+            if (tap) tap(m.choice);
+        }
         queue_push(m);
     }
 
@@ -649,6 +655,7 @@ bool net_send_cursor (const CursorMsg& c)  { MGMP_SEND_WITH(enc_cursor,  c); }
 bool net_send_aim    (const AimMsg& m)     { MGMP_SEND_WITH(enc_aim,     m); }
 bool net_send_enter_node(const EnterNodeMsg& m) { MGMP_SEND_WITH(enc_enter_node, m); }
 bool net_send_choice(const ChoiceMsg& m) { MGMP_SEND_WITH(enc_choice, m); }
+void net_set_choice_tap(ChoiceTap fn) { g_choice_tap = fn; }
 bool net_send_nodehash(const NodeHashMsg& m) { MGMP_SEND_WITH(enc_nodehash, m); }
 // Not in relayed() above: host-authored, so net_send already reaches every
 // client and a relay would deliver it twice.

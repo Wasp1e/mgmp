@@ -14,6 +14,8 @@
 #include "backends/imgui_impl_opengl3.h"
 
 #include "mgmp_config.h"
+#include "mgmp_hooks.h"
+#include "mgmp_addresses.h"
 #include "mgmp_tuning.h"
 #include "mgmp_log.h"
 #include "mgmp_net.h"
@@ -30,6 +32,8 @@
 #include "mgmp_night.h"
 #include "mgmp_meow.h"
 #include "mgmp_startrun.h"
+#include "mgmp_classpick.h"
+#include "mgmp_house.h"
 
 // Declared by imgui_impl_win32.h's owner rather than the header itself.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
@@ -885,6 +889,41 @@ void draw_session() {
         ImGui::EndTable();
     }
 
+    ImGui::SeparatorText(tr(u8"\u0418\u0433\u0440\u0430", "gameplay"));
+    {
+        static bool save_failed = false;
+        const bool available = hooks_is_live(T_SaveScumPenalty);
+        const bool connected = net_active();
+        bool steven = config_steven();
+        ImGui::BeginDisabled(!available || connected);
+        if (ImGui::Checkbox(tr(u8"\u0421\u0442\u0438\u0432\u0435\u043d (save scum)", "Steven (save scum)"), &steven)) {
+            save_failed = !config_set_steven(steven);
+            log_line_lvl(save_failed ? LogLevel::Warn : LogLevel::Info, "SCUM",
+                         "Steven / future save-scum penalties %s from F1 (%s)",
+                         steven ? "enabled" : "disabled",
+                         save_failed ? "active this session; could not save mgmp.json" : "saved");
+        }
+        ImGui::EndDisabled();
+        // Also visible while disabled: why the checkbox cannot be clicked.
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", tr(
+                u8"\u0412\u043a\u043b. = \u043e\u0431\u044b\u0447\u043d\u044b\u0435 \u043d\u0430\u043a\u0430\u0437\u0430\u043d\u0438\u044f \u0437\u0430 save scum, \u0432\u043a\u043b\u044e\u0447\u0430\u044f \u0421\u0442\u0438\u0432\u0435\u043d\u0430.\n\u0412\u044b\u043a\u043b. = \u043d\u043e\u0432\u044b\u0435 \u043d\u0430\u043a\u0430\u0437\u0430\u043d\u0438\u044f \u043d\u0435 \u043f\u0440\u0438\u043c\u0435\u043d\u044f\u044e\u0442\u0441\u044f.\n\u041d\u0435 \u043e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 \u0443\u0436\u0435 \u043f\u043e\u043b\u0443\u0447\u0435\u043d\u043d\u044b\u0435 \u0448\u0442\u0440\u0430\u0444\u044b.\n\u041e\u0431\u0430 \u0438\u0433\u0440\u043e\u043a\u0430 \u0434\u043e\u043b\u0436\u043d\u044b \u0432\u044b\u0431\u0440\u0430\u0442\u044c \u043e\u0434\u0438\u043d\u0430\u043a\u043e\u0432\u043e\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 \u0434\u043e \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f.",
+                "On = normal save-scum penalties, including Steven.\n"
+                "Off = suppress future penalties. Does not undo existing ones.\n"
+                "Both players must choose the same value BEFORE connecting."));
+        }
+        if (connected)
+            ImGui::TextDisabled("%s", tr(
+                u8"\u0414\u043b\u044f \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u0438\u044f \u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u0435\u0441\u044c \u043e\u0442 \u0441\u0435\u0441\u0441\u0438\u0438.",
+                "Disconnect before changing this setting."));
+        if (!available)
+            ImGui::TextColored(level_colour(LogLevel::Warn), "%s",
+                               "Steven control unavailable: save-scum hook is not installed.");
+        if (save_failed)
+            ImGui::TextColored(level_colour(LogLevel::Warn), "%s",
+                               "Active this session only: could not save mgmp.json.");
+    }
+
     draw_connect();
     draw_nodes();
 
@@ -1192,6 +1231,13 @@ void ui_on_swap(void* window) {
                   u8"Waiting for another player \u2014 not in the fight yet");
     else if (lockstep_in_battle() && combatlock_menu_live() && combatlock_engaged())
         note = tr(u8"\u0425\u043e\u0434\u0438\u0442 \u0434\u0440\u0443\u0433\u043e\u0439 \u0438\u0433\u0440\u043e\u043a", "Another player's turn");
+    // Another player in the backpack, while this one waits on the map.
+    if (!note && !combatlock_menu_live() && follow_on_map() && classpick_peer_in_backpack())
+        note = tr(u8"\u0414\u0440\u0443\u0433\u043e\u0439 \u0438\u0433\u0440\u043e\u043a \u0432 \u0440\u044e\u043a\u0437\u0430\u043a\u0435",
+                  "Another player is in the backpack");
+    // A short-lived delivery note takes priority over the persistent box count,
+    // otherwise it can expire before the other player ever sees it.
+    if (!note && !lockstep_in_battle()) note = house_note();
     // The friend's share of the House's box before a run.
     static char box_note[96];
     uint32_t box_mine = 0, box_most = 0;

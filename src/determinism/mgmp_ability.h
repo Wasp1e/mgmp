@@ -114,13 +114,10 @@ void* ability_from_slot(const void* character, AbilitySlot slot);
 // signal in the same spirit as hashing the pending-queue population.
 bool ability_gon_name(const void* ability, char* out, size_t out_size);
 
-// The fallback for an ability in no slot (SLOT_UNKNOWN): one a status lends the
-// cat, like the Dybbuk's "stop hitting yourself" punch, which lives on the
-// DybbukPossessed status rather than in the cat's spells (2026-11-06: a HALT).
-// Looked up by GON name in the cat's slots, then in the game's own list of
-// every ability the cat can use (sub_140117FC0, the list the action bar reads,
-// at Character+0xE90). nullptr if neither has it; `seen`, if given, gets the
-// names that list held, for the log.
+// Resolve SLOT_UNKNOWN by GON name in the cat's slots and tile interactions.
+// For Cannibalize, also reuse or create the instance owned by the character
+// for a deferred passive action. If supplied, seen records tile-interaction
+// names for diagnosing a failed lookup.
 void* ability_find_by_name(void* character, const char* gon, char* seen = nullptr,
                            size_t seen_size = 0);
 

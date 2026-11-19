@@ -130,6 +130,8 @@ void choice_on_event_update(void* world_event);
 void choice_on_level_update(void* level_screen);
 // A level-up screen updated within the last half second on this peer.
 bool choice_level_screen_up();
+// ...and its cat is this player's to pick for.
+bool choice_level_screen_mine();
 
 // HOST: a level-up is being bought in the shop, so the screen that opens next is
 // sent to the client. CLIENT: choice_pump opens that screen, once a frame until
@@ -137,7 +139,7 @@ bool choice_level_screen_up();
 void choice_on_shop_level();
 void choice_pump();
 
-void choice_on_message(const ChoiceMsg& m);
+void choice_on_message(const ChoiceMsg& m, uint8_t from);
 
 // Client: the host's cat as it was before its shop level-up (MSG_CATPRE).
 void choice_on_catpre(const CatDataMsg& m);

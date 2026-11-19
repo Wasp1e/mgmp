@@ -186,6 +186,7 @@ struct State {
     bool        local_cat[kMaxCats] = {};   // this peer's input decides for it
     OwnerTable  owners;                     // which player has which cat this run
     bool        human_cat[kMaxCats] = {};   // a human brain drives it at all
+    bool        familiar_cat[kMaxCats] = {};
     uint32_t    snap_count     = 0;         // the cats of the battle's start; familiars follow
     uint8_t     last_human     = 0xFF;      // the human cat whose action applied last
     bool        snapped        = false;
@@ -228,6 +229,7 @@ struct State {
     uint32_t  pend_head = 0, pend_count = 0;
 
     bool     outstanding = false;   // a local decision is sent but not applied
+    bool     asked_again = false;   // since then, a poll with no decision: it was dropped
     struct {                        // ...and which one it was
         uint32_t    type = 0;
         const void* ability = nullptr;
@@ -403,7 +405,16 @@ void owners_load() {
     uint64_t run[kMaxOwners];
     const uint32_t cats = catsync_run_uids(run, kMaxOwners);
     const OwnerTable saved = split_parse(text);
-    if (!split_covers(saved, run, cats)) return;   // these cats are another run's
+    if (!split_covers(saved, run, cats)) {   // these cats are another run's -- or the run's list did not read
+        static uint32_t said_for = 0xFFFFFFFF;
+        if (said_for != cats) {
+            said_for = cats;
+            log_line("LOCKSTEP", "the saved cat owners (%u cat(s)) do not name all %u cat(s) of this run --"
+                                 " not restored%s", saved.count, cats,
+                     cats ? "" : " (the run's cat list did not read yet)");
+        }
+        return;
+    }
     g.owners = saved;
     log_line("LOCKSTEP", "cat owners restored from the last session: %u cat(s)",
              saved.count);
@@ -816,44 +827,70 @@ uint8_t cat_index_of(const void* character) {
     return kNoCat;
 }
 
-// A FAMILIAR: a summon with a human brain. It is not in the roster the battle
-// started with, so both screens let their own player drive it, and on
-// 2026-11-12 the friend could move the host's familiar and the fight halted.
-// It joins the roster at its first decision, which both peers reach at the same
-// point of the same turn, so it gets the same index on both. Its owner is the
-// owner of the human cat that acted last -- the one that summoned it -- except
-// that with two players a host's familiar goes to a friend with no cats of
-// their own. Called only from the two decision polls, never from a lookup
-// that runs on one screen and not the other.
-static uint8_t adopt_familiar(const void* actor) {
-    if (!g.snapped || !actor || g.cat_count >= kMaxCats) return kNoCat;
-    const void* brain = nullptr;
-    char cls[96] = "?";
-    if (!mem_read((const uint8_t*)actor + kChar_Brain, &brain, sizeof(brain)) || !brain)
+// Native summon registration (RVA 0x11C0A0) stores the summoner's
+// Ref<Character> on the child. The generation rejects recycled pointers.
+static uint8_t familiar_summoner(const void* actor) {
+    constexpr size_t summoner_ref = 0x468;
+    struct { const void* ptr; uint64_t generation; } ref{};
+    if (!mem_read(static_cast<const uint8_t*>(actor) + summoner_ref, &ref, sizeof(ref)) ||
+        !ref.ptr || ref.ptr == actor)
         return kNoCat;
-    rtti_class_name(brain, cls, sizeof(cls));
-    if (!strstr(cls, tune::kReplayBrains)) return kNoCat;   // an AI summon: both drive it
+    const uint8_t cat = cat_index_of(ref.ptr);
+    uint64_t generation = 0;
+    if (cat == kNoCat || !g.human_cat[cat] ||
+        !mem_read(static_cast<const uint8_t*>(ref.ptr) - 8, &generation, sizeof(generation)) ||
+        generation != ref.generation)
+        return kNoCat;
+    return cat;
+}
 
+// A summon can append a Character or activate a pre-existing NoBrain slot.
+// Keep that slot's network index when its brain becomes player-controlled.
+static uint8_t adopt_familiar(const void* actor, uint8_t cat, const void* brain = nullptr,
+                              bool begin_turn = false) {
+    const bool known = cat != kNoCat && g.human_cat[cat];
+    if (known && (!begin_turn || !g.familiar_cat[cat])) return cat;
+    if (!g.snapped || !actor || (cat == kNoCat && g.cat_count >= kMaxCats)) return cat;
+    char cls[96] = "?";
+    if (!brain && (!mem_read((const uint8_t*)actor + kChar_Brain, &brain, sizeof(brain)) || !brain))
+        return cat;
+    rtti_class_name(brain, cls, sizeof(cls));
+    if (!strstr(cls, tune::kReplayBrains)) return cat;
+
+    const uint8_t linked = familiar_summoner(actor);
+    if (known && linked == kNoCat) return cat;
+    const uint8_t summoner = linked != kNoCat ? linked : g.last_human;
     bool mine_have = false, others_have = false;
     for (uint32_t i = 0; i < g.snap_count; ++i) {
-        if (!g.human_cat[i]) continue;
+        if (!g.human_cat[i] || g.familiar_cat[i]) continue;
         if (g.local_cat[i]) mine_have = true; else others_have = true;
     }
     const bool host = net_role() == NetRole::Host;
-    const bool summoner_local = g.last_human < g.cat_count ? g.local_cat[g.last_human] : host;
-    const bool summoner_host  = host ? summoner_local : !summoner_local;
+    const bool summoner_local = summoner < g.cat_count ? g.local_cat[summoner] : host;
     bool local = summoner_local;
-    if (summoner_host && net_peer_count() == 2) {
-        const bool friend_has_none = host ? !others_have : !mine_have;
-        local = host ? !friend_has_none : friend_has_none;
+    if (net_peer_count() == 2) {
+        const bool other_player_has_cats = summoner_local ? others_have : mine_have;
+        if (!other_player_has_cats) local = !summoner_local;
     }
-    const uint8_t i = (uint8_t)g.cat_count++;
+    if (known) {
+        if (g.local_cat[cat] != local) {
+            g.local_cat[cat] = local;
+            log_line("LOCKSTEP", "familiar slot %u reassigned from native summoner cat %u -- %s",
+                     (unsigned)cat, (unsigned)linked, local ? "local control" : "peer control");
+        }
+        return cat;
+    }
+    const bool new_slot = cat == kNoCat;
+    const uint8_t i = new_slot ? (uint8_t)g.cat_count++ : cat;
     g.cats[i]      = actor;
     g.human_cat[i] = true;
     g.local_cat[i] = local;
+    g.familiar_cat[i] = true;
     ++g.humans;
-    log_line("LOCKSTEP", "a familiar joins the roster as cat %u (summoned by cat %d) -- %s", i,
-             g.last_human == kNoCat ? -1 : (int)g.last_human,
+    log_line("LOCKSTEP", "familiar %s roster slot %u (summoner cat %d via %s) -- %s",
+             new_slot ? "joined in" : "activated", i,
+             summoner == kNoCat ? -1 : (int)summoner,
+             linked == kNoCat ? "last action" : "game link",
              local ? "this player drives it" : "the other player drives it");
     return i;
 }
@@ -1012,6 +1049,7 @@ void snapshot_cats(void* turn_control) {
     g.snapped_list = list;
     g.snap_count   = g.cat_count;
     g.last_human   = kNoCat;
+    memset(g.familiar_cat, 0, sizeof(g.familiar_cat));
 
     // A new roster invalidates the table the last hash was taken over, and
     // re-arms the one-shot desync dump for this battle.
@@ -2582,8 +2620,78 @@ uint32_t lockstep_state_fence_end(const char* what) {
 
 uint32_t lockstep_state_fence_hits() { return g_sf.hits; }
 
+// Read-only movement diagnostics. ApplyTurnAction runs before the game's
+// asynchronous movement finishes, so sample until the next action rather than
+// claiming that its return means the cat reached the destination. Only
+// enabled with the existing debug recorder.
+struct MoveTrace {
+    bool active = false;
+    uint8_t cat = 0;
+    uint32_t epoch = 0;
+    uint64_t started = 0, last_sample = 0;
+    int32_t target_x = 0, target_y = 0;
+    int32_t last_x = 0, last_y = 0, last_points = 0, last_used = 0;
+    bool have_last = false;
+};
+MoveTrace g_move_trace;
+
+void move_trace_sample(const char* phase, bool force) {
+    if (!g_move_trace.active) return;
+    const uint64_t now = GetTickCount64();
+    if (!force && now - g_move_trace.last_sample < 250) return;
+    g_move_trace.last_sample = now;
+    if (!g.active || !g.snapped || g_move_trace.epoch != g.epoch ||
+        g_move_trace.cat >= g.cat_count) {
+        g_move_trace.active = false;
+        return;
+    }
+    uint32_t live = 0, appeared = 0;
+    bool still_in[kMaxCats];
+    if (!snapshot_membership(g.snapped_list, live, still_in, appeared) ||
+        !still_in[g_move_trace.cat]) {
+        log_line("MOVETRACE", "cat %u no longer in the battle (%s)",
+                 (unsigned)g_move_trace.cat, phase);
+        g_move_trace.active = false;
+        return;
+    }
+    const uint8_t* cat = (const uint8_t*)g.cats[g_move_trace.cat];
+    void* obj = nullptr; void* back = nullptr;
+    int32_t x = 0, y = 0, points = 0, used = 0;
+    if (!cat || !mem_read(cat + kChar_TObj, &obj, sizeof(obj)) || !obj ||
+        !mem_read((uint8_t*)obj + kTObj_Owner, &back, sizeof(back)) || back != cat ||
+        !mem_read((uint8_t*)obj + kTObj_Tile, &x, sizeof(x)) ||
+        !mem_read((uint8_t*)obj + kTObj_Tile + 4, &y, sizeof(y)) ||
+        !mem_read(cat + 0xD10, &points, sizeof(points)) ||
+        !mem_read(cat + 0xD3C, &used, sizeof(used))) {
+        log_line("MOVETRACE", "cat %u could not read position or counters (%s)",
+                 (unsigned)g_move_trace.cat, phase);
+        g_move_trace.active = false;
+        return;
+    }
+    if (force || !g_move_trace.have_last || x != g_move_trace.last_x ||
+        y != g_move_trace.last_y || points != g_move_trace.last_points ||
+        used != g_move_trace.last_used) {
+        log_line("MOVETRACE", "cat %u %s +%llums tile=(%d,%d) target=(%d,%d) points=%d used=%d",
+                 (unsigned)g_move_trace.cat, phase,
+                 (unsigned long long)(now - g_move_trace.started), x, y,
+                 g_move_trace.target_x, g_move_trace.target_y, points, used);
+        g_move_trace.last_x = x; g_move_trace.last_y = y;
+        g_move_trace.last_points = points; g_move_trace.last_used = used;
+        g_move_trace.have_last = true;
+    }
+    if (!force && now - g_move_trace.started >= 10000) {
+        log_line("MOVETRACE", "cat %u sampling stopped after 10 seconds",
+                 (unsigned)g_move_trace.cat);
+        g_move_trace.active = false;
+    }
+}
+
 void lockstep_pump() {
     if (!g.active) return;
+    if (g_move_trace.active) {
+        Guard guard;
+        move_trace_sample("sample", false);
+    }
 
     if (g.split_deferred && g.snapped && net_peer_count() > 0) {
         log_line("LOCKSTEP", "the peer list is in -- splitting this battle's cats now");
@@ -2647,7 +2755,7 @@ void lockstep_pump() {
             // node, not to a battle, and the epoch counter does not advance on
             // an event node at all.
             case MSG_CHOICE:
-                choice_on_message(m.choice);
+                choice_on_message(m.choice, m.from);
                 break;
 
             case MSG_SAVEFILE:
@@ -2840,8 +2948,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
     if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
         return false;
 
-    uint8_t cat = cat_index_of(actor);
-    if (cat == kNoCat) cat = adopt_familiar(actor);
+    const uint8_t cat = adopt_familiar(actor, cat_index_of(actor), brain);
     // Recorded before the AI and barrier branches below, so it tracks every
     // turn rather than only the ones this function goes on to act upon. A
     // summon (kNoCat) is nobody's, same as an AI cat.
@@ -2928,21 +3035,36 @@ bool lockstep_fill_choice(void* brain, void* out) {
 
         TurnAction a{};
         if (!mem_read(out, &a, sizeof(a))) return false;
-        if (a.type != TA_Ability && a.type != TA_EndTurn) return false;
+        if (a.type != TA_Ability && a.type != TA_EndTurn) {
+            if (g.outstanding) g.asked_again = true;   // the game wants a decision again
+            return false;
+        }
 
         // "Sent and not applied yet" covers the same decision polled twice, not
         // a different one. The game can drop a decision without applying it:
         // measured 2026-11-01 it dropped a Bolt on both peers, and the attack
         // the player made next went unsent because the Bolt still counted as
         // outstanding, so that attack ran on one board only.
+        //
+        // The SAME decision made again is not always the same poll, either: the
+        // game dropped InspirationalSong on both screens (an enemy's counter or
+        // the like), the player cast it again 3.5 s later and it ran -- and that
+        // one went unsent as a repeat, so the buff was the host's alone, a heal
+        // 1 short and a hit 2 short on the friend's screen, and a halt
+        // (2026-11-15). A repeat after the game has asked for a decision again
+        // (a poll with none, between) is a new decision.
         if (g.outstanding) {
-            if (g.last_sent.type == a.type && g.last_sent.ability == a.ability &&
-                g.last_sent.tx == a.target_x && g.last_sent.ty == a.target_y &&
-                g.last_sent.dx == a.dir_x && g.last_sent.dy == a.dir_y)
-                return false;
-            log_line("LOCKSTEP", "cat %u's last decision was never applied and the "
-                                 "player has made a new one -- sending that",
-                     (unsigned)cat);
+            const bool same = g.last_sent.type == a.type && g.last_sent.ability == a.ability &&
+                              g.last_sent.tx == a.target_x && g.last_sent.ty == a.target_y &&
+                              g.last_sent.dx == a.dir_x && g.last_sent.dy == a.dir_y;
+            if (same && !g.asked_again) return false;
+            if (same)
+                log_line("LOCKSTEP", "cat %u's last decision was never applied and the "
+                                     "player made it again -- sending it again", (unsigned)cat);
+            else
+                log_line("LOCKSTEP", "cat %u's last decision was never applied and the "
+                                     "player has made a new one -- sending that",
+                         (unsigned)cat);
         }
 
         ActionMsg msg{};
@@ -2972,8 +3094,8 @@ bool lockstep_fill_choice(void* brain, void* out) {
                 // Unreproducible on the peer: it has no way to name this
                 // ability. Say so loudly rather than send an action the other
                 // side will resolve to nullptr and silently skip.
-                log_line("LOCKSTEP", "!! cat %u used an ability in no known slot "
-                                     "(gon='%s') -- peer cannot resolve it",
+                log_line("LOCKSTEP", "cat %u used an ability in no known slot "
+                                     "(gon='%s') -- peer will resolve it by name",
                          (unsigned)cat, msg.gon[0] ? msg.gon : "?");
             }
         }
@@ -2988,6 +3110,7 @@ bool lockstep_fill_choice(void* brain, void* out) {
 
         if (net_send_action(msg)) {
             g.outstanding = true;
+            g.asked_again = false;
             g.last_sent.type    = a.type;
             g.last_sent.ability = a.ability;
             g.last_sent.tx = a.target_x; g.last_sent.ty = a.target_y;
@@ -3046,8 +3169,7 @@ bool lockstep_hold_poll(void* brain, void* out) {
     const void* actor = nullptr;
     if (!mem_read((const uint8_t*)brain + kBrain_Owner, &actor, sizeof(actor)) || !actor)
         return false;
-    uint8_t cat = cat_index_of(actor);
-    if (cat == kNoCat) cat = adopt_familiar(actor);
+    const uint8_t cat = adopt_familiar(actor, cat_index_of(actor), brain);
     if (cat == kNoCat || !g.human_cat[cat] || g.local_cat[cat]) return false;
 
     Guard guard;
@@ -3091,8 +3213,7 @@ static void apply_remote(const ActionMsg& msg, const void* actor, void* out) {
         AbilitySlot slot{ msg.slot_kind, msg.slot_index };
         a.ability = ability_from_slot(actor, slot);
         if (!a.ability && slot.kind == SLOT_UNKNOWN && msg.gon[0]) {
-            // Not in a slot on the sender either: one a status lends the cat
-            // (the Dybbuk's punch). The same status is on this board's cat.
+            // Resolve contextual and deferred passive abilities on this board.
             char seen[256];
             a.ability = ability_find_by_name((void*)actor, msg.gon, seen, sizeof(seen));
             if (a.ability)
@@ -3172,8 +3293,31 @@ void lockstep_on_applied(const void* action, const void* actor) {
     TurnAction a{};
     if (!mem_read(action, &a, sizeof(a))) return;
 
-    // Types 6 and 7 are generated locally on both peers and are never sent.
-    // They must not clear the outstanding guard or advance anything.
+    if (a.type == TA_Invoke && actor && resolve_is_pinned_build()) {
+        // ChanceToBackflip's callback selects a tile with inline draws from
+        // TLS+0x178. It can run after both peers have the same pending decision
+        // but before that action reaches ApplyTurnAction and restores its RNG.
+        constexpr uintptr_t backflip_callback_vtable_rva = 0x1122AA0;
+        const void* callback = nullptr;
+        const void* vtable = nullptr;
+        memcpy(&callback, a.tail + (0x78 - 0x28), sizeof(callback));
+        const auto* base = reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
+        if (callback && mem_read(callback, &vtable, sizeof(vtable)) &&
+            vtable == base + backflip_callback_vtable_rva) {
+            Guard guard;
+            const uint8_t cat = cat_index_of(actor);
+            if (cat != kNoCat && g.pend_rng.have && g.pend_rng.cat == cat) {
+                if (uint64_t* stream = rng_global_stream()) {
+                    memcpy(stream, g.pend_rng.s, sizeof(g.pend_rng.s));
+                    log_line("LOCKSTEP", "Dybbuk backflip uses cat %u's decision RNG",
+                             (unsigned)cat);
+                }
+            }
+        }
+    }
+
+    // Reactions are generated locally. Keep the pending decision and its RNG
+    // snapshot until the corresponding player action runs.
     if (a.type != TA_Ability && a.type != TA_EndTurn) return;
 
     // Match the recorder's precedence exactly (mgmp_hooks.cpp, h_ApplyAction):
@@ -3191,6 +3335,21 @@ void lockstep_on_applied(const void* action, const void* actor) {
     uint8_t cat = cat_index_of(who);
     if (cat != kNoCat && g.local_cat[cat]) ++g.stats.applied;
     if (cat != kNoCat && g.human_cat[cat]) g.last_human = cat;   // a familiar's summoner
+    if (config().record && g_move_trace.active) {
+        move_trace_sample("before next action", true);
+        g_move_trace.active = false;
+    }
+    if (config().record && cat != kNoCat && g.human_cat[cat] &&
+        a.type == TA_Ability && a.ability && ability_slot_of(who, a.ability).kind == SLOT_MOVE) {
+        g_move_trace = MoveTrace{};
+        g_move_trace.active = true;
+        g_move_trace.cat = cat;
+        g_move_trace.epoch = g.epoch;
+        g_move_trace.started = GetTickCount64();
+        g_move_trace.target_x = a.target_x;
+        g_move_trace.target_y = a.target_y;
+        move_trace_sample("before move", true);
+    }
 
     // Both peers write the facing the decision carried, before the action runs,
     // so whatever it does to facing itself lands on the same value everywhere.
@@ -3559,7 +3718,17 @@ void lockstep_owner_put(uint64_t id, uint8_t pos) {
     ++g.owners.count;
 }
 
-void lockstep_on_begin_turn(const void* character) { g_begun = character; }
+// A FAMILIAR'S TURN begins before its first decision, and its combat menu is
+// up from here: adopted only at that decision, it was nobody's while the menu
+// showed, so the bar stayed live on both screens and the player who did not own
+// it could aim it (2026-11-12, 18 s between its turn and the first poll). Both
+// peers begin the same turn of the same battle, so adopting here keeps the
+// index the same on both; the decision polls still adopt one that slipped by.
+void lockstep_on_begin_turn(const void* character) {
+    g_begun = character;
+    if (character && g.active && g.snapped)
+        adopt_familiar(character, cat_index_of(character), nullptr, true);
+}
 
 bool lockstep_cat_known(uint64_t id) {
     Guard guard;

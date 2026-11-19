@@ -1,7 +1,10 @@
 #include "mgmp_startrun.h"
+#include "mgmp_house.h"
 #include "mgmp_cutscene.h"
 #include "mgmp_leave.h"
 #include "mgmp_lockstep.h"
+#include "mgmp_combatlock.h"
+#include "mgmp_choice.h"
 #include "mgmp_net.h"
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
@@ -200,7 +203,7 @@ void maybe_skip(void* swf) {
         g.skip_seen  = swf;
         g.skip_since = now;
         g.skipping   = false;
-        if (g.cur_at && now - g.cur_at < 2000) strncpy_s(g.skip_name, g.cur_name, _TRUNCATE);
+        if (g.cur_at && now - g.cur_at < 5000) strncpy_s(g.skip_name, g.cur_name, _TRUNCATE);
         else strncpy_s(g.skip_name, "?", _TRUNCATE);
     }
     if (!g.skipping) {
@@ -237,14 +240,25 @@ void* __fastcall swf_update(void* a, void* b, void* c, void* d) {
 // The controller updates every frame whether or not a box is up; its update
 // does the work only with +0x1A8 set and a text at +0x48 (0x2D70A0). Counting
 // every frame had the client's clicks swallowed for good on 2026-11-04.
+// +0x1A8 is only the typing, though: the update clears it when the line is all
+// out (0x1402D74BC), and the box then waits for a click with it down. Read so,
+// a line waiting for its click was no dialog -- the host's click on it was not
+// sent and the client's own were not held, so each player read the professor's
+// opening at their own pace (2026-11-14). The box is up while its text lives:
+// the pointer at +0x48 with its generation at +0x50, the check the update makes
+// itself (0x1402D70BA).
 constexpr uintptr_t kDialog_Active = 0x1A8;
 constexpr uintptr_t kDialog_Text   = 0x48;
+constexpr uintptr_t kDialog_TextGen = 0x50;
 
 void* __fastcall dialog_update(void* a, void* b, void* c, void* d) {
-    uint8_t active = 0;
-    void*   text   = nullptr;
-    if (mem_read((const uint8_t*)a + kDialog_Active, &active, 1) && active &&
-        mem_read((const uint8_t*)a + kDialog_Text, &text, sizeof(text)) && text)
+    uint8_t  active = 0;
+    void*    text   = nullptr;
+    uint64_t gen = 0, have = 1;
+    if (mem_read((const uint8_t*)a + kDialog_Text, &text, sizeof(text)) && text &&
+        mem_read((const uint8_t*)a + kDialog_TextGen, &gen, sizeof(gen)) &&
+        ((mem_read((const uint8_t*)a + kDialog_Active, &active, 1) && active) ||
+         (mem_read((const uint8_t*)text - 8, &have, sizeof(have)) && have == gen)))
         g.dialog_at = GetTickCount64();
     return g.o_dialog(a, b, c, d);
 }
@@ -262,7 +276,11 @@ void* __fastcall drawer_update(void* a, void* b, void* c, void* d) {
     g.drawer_at = GetTickCount64();
     void* r = g.o_drawer(a, b, c, d);
     startrun_house_tick();
-    if (g.office_go >= 0) {
+    house_tick(a);
+    // A pipe delivery is deliberately queued until the cat and map settle.
+    // The host can open an office before that delay expires; opening it here
+    // first would let a new quest begin before the old cat is counted.
+    if (g.office_go >= 0 && !house_pipe_delivery_pending()) {
         const int npc = g.office_go;
         g.office_go  = -1;
         g.going_ours = true;
@@ -742,6 +760,11 @@ void play_hosts(const char* name, uint32_t flags) {
         log_line("CUTSCENE", "!! could not hand the game the name '%s'", name);
         return;
     }
+    // Named here: safe_play calls the game past the play hook, which is what
+    // names a cutscene for the skip -- unnamed, the host's own 'moonboss_intro'
+    // was taken for one of this game's and skipped 2.5 s in (2026-11-14).
+    strncpy_s(g.cur_name, name, _TRUNCATE);
+    g.cur_at = GetTickCount64();
     g.playing_ours = true;
     const bool ok = safe_play(&s, f1, f2, flags & 0xFF, (flags >> 8) & 0xFF);
     g.playing_ours = false;
@@ -803,7 +826,277 @@ const char* input_name(uint8_t what) {
     return what == 0 ? "click" : what == 1 ? "space" : "enter";
 }
 
+// THE TALK'S LINES. A talk -- an NPC's in the House, the professor's in the
+// tutorial -- is a script run by NPCDialogController or Tutorial (vtables
+// 0xED64A8 / 0xF16200, both updating at slot 10 with sub_1408EE760). The runner
+// keeps the command it is at in +0xF4; each frame sub_1408F1930(runner, command)
+// checks the command, and for a "dialog" (type, a std::string at command+0x88)
+// a click while the line still types sets the DialogController's (+0x48) +0x1AA
+// (finish it), and a click after sets the runner's +0xF8: the line is done, and
+// the update moves to the next command. Posting the host's clicks to the
+// client's window went out of step -- a fast host's click landed on a line still
+// typing on one screen and a finished one on the other, and a click on the
+// host's window in the background reached the client and not the host's own
+// game (2026-11-14). So the host sends the line it finished, by its command
+// number, and the client finishes the same line at the same command: it skips
+// the typing first if it is still typing. The client's own click does not
+// finish a line while the host is in a talk.
+constexpr uintptr_t kRva_ScriptCheck  = 0x8F1930;
+const uint8_t kScriptCheckHead[8]     = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74 };
+constexpr uintptr_t kRunner_Dialog    = 0x48;
+constexpr uintptr_t kRunner_Pc        = 0xF4;
+constexpr uintptr_t kRunner_LineDone  = 0xF8;
+constexpr uintptr_t kCommand_Type     = 0x88;
+constexpr uintptr_t kDialog_Typing    = 0x1A8;
+constexpr uintptr_t kDialog_Finish    = 0x1AA;
+constexpr uint32_t  kScriptLine       = 3;      // aux of a kChoiceCutInput: index = the command
+constexpr uint64_t  kScriptLineStaleMs = 60000;
+constexpr uint64_t  kTalkGoneMs       = 400;
+
+using fn_check = void* (__fastcall*)(void*, void*);
+fn_check  o_check  = nullptr;
+uint64_t  talk_at  = 0;       // a talk's line was checked this recently (either role)
+// The line's key, the runner's +0xD0 ("POPUP_LEVEL_UP_INTRO_1"; the dialog
+// command puts "NPC_" before it, 0x1408F2F8B) names the talk without its
+// number. A command number means something inside one talk only: one left over
+// from a talk the host skipped through had the client's next talks catch up to
+// it, every line of them (2026-11-14).
+constexpr uintptr_t kRunner_LineKey = 0xD0;
+constexpr uint64_t  kOtherTalkMs    = 15000;   // a line of a talk this screen is not in waits this long
+struct HostLine { int32_t pc; uint64_t at; char key[48]; };
+
+void talk_of(const char* key, char* out, size_t cap) {
+    strncpy_s(out, cap, key, _TRUNCATE);
+    size_t n = strlen(out);
+    while (n && out[n - 1] >= '0' && out[n - 1] <= '9') out[--n] = 0;
+}
+HostLine  hlines[32];
+uint32_t  hline_n = 0;
+
+bool talk_up() { return talk_at && GetTickCount64() - talk_at < kTalkGoneMs; }
+
+bool is_line(void* command) {
+    char type[24];
+    if (!command || !mem_read_std_string((const uint8_t*)command + kCommand_Type, type, sizeof(type)))
+        return false;
+    return strcmp(type, "dialog") == 0 || strcmp(type, "dialog_and_autopass") == 0 ||
+           strcmp(type, "tooltip_dialog") == 0;
+}
+
+// THE TUTORIAL'S TEACHER IN A FIGHT. Butch tells the player to press Move while
+// it is the host's cat's turn, and the client cannot (2026-11-14). The talk's
+// whole picture -- the teacher, the box, the circle round a button -- is the
+// runner's movie at +0x38, and a movie object shows while bit 0x20 of its +8 is
+// set (the talk's own "marker" arrow is shown and hidden by it, 0x1408F30EA).
+// On the client it is hidden while another player's cat has the turn, and
+// shown again on this player's own.
+constexpr uintptr_t kRva_TutorialVt  = 0xF16200;
+constexpr uintptr_t kRva_NpcDialogVt = 0xED64A8;
+constexpr uintptr_t kRva_ScriptTick  = 0x8EE760;
+constexpr uintptr_t kRunner_Movie    = 0x38;
+constexpr uintptr_t kMovie_Flags     = 0x8;
+constexpr uint8_t   kMovie_Shown     = 0x20;
+fn_update o_tutorial = nullptr;
+void*     hid_movie  = nullptr;     // the teacher this player has hidden
+
+// THE TALK'S EVENTS. Past its lines a script waits on events the game sends it
+// -- sub_1408F2B20(runner, std::string name) clears the wait at +0x108 and
+// returns true when that name is the one waited for. The tutorial's fight waits
+// for the Move button, a tile, an attack: sent by the screen of the player who
+// did it, so the other screen's tutorial stood at "press Move" for good
+// (2026-11-14). Each player sends the events its script took, with the command
+// it was at; the other's script takes the same one at the same command, waiting
+// for it. One that both games took on their own is dropped as already past.
+constexpr uintptr_t kRva_ScriptEvent = 0x8F2B20;
+const uint8_t kScriptEventHead[8]    = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x54 };
+constexpr uintptr_t kRunner_PcAt     = 0xF4;
+constexpr uintptr_t kRunner_Wait     = 0x108;
+constexpr uint32_t  kScriptEventAux  = 4;      // aux of a kChoiceCutInput: index = command, name
+using fn_event = bool (__fastcall*)(void*, void*);
+fn_event  o_event   = nullptr;
+bool      event_ours = false;
+struct PeerEvent { int32_t pc; char name[32]; uint64_t at; };
+PeerEvent pevents[32];
+uint32_t  pevent_n = 0;
+
+bool __fastcall script_event(void* runner, void* ev) {
+    char name[32];
+    read_name(ev, name, sizeof(name));
+    int32_t pc = -1;
+    mem_read((const uint8_t*)runner + kRunner_PcAt, &pc, sizeof(pc));
+    const bool took = o_event(runner, ev);
+    // "cat_turn" comes to both games with the turn itself, and with the cat in
+    // it: one taken from the other player came without, and Butch said
+    // "someone's turn" on the client (2026-11-14). Only what a player does goes.
+    if (took && !event_ours && linked() && name[0] && strcmp(name, "cat_turn") != 0) {
+        ChoiceMsg c{};
+        c.kind  = kChoiceCutInput;
+        c.aux   = kScriptEventAux;
+        c.index = (uint32_t)pc;
+        strncpy_s(c.name, name, _TRUNCATE);
+        net_send_choice(c);
+        log_line("CUTSCENE", "-> the talk took '%s' at command %d", name, pc);
+    }
+    return took;
+}
+
+bool safe_event(void* runner, GameStr* ev, bool& took) {
+    __try { took = o_event(runner, ev); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void take_peer_events(void* runner) {
+    if (!pevent_n || !o_event) return;
+    const uint64_t now = GetTickCount64();
+    while (pevent_n && now - pevents[0].at > 60000)
+        memmove(pevents, pevents + 1, sizeof(PeerEvent) * --pevent_n);
+    if (!pevent_n) return;
+    int32_t pc = -1;
+    char wait[32];
+    if (!mem_read((const uint8_t*)runner + kRunner_PcAt, &pc, sizeof(pc)) ||
+        !mem_read_std_string((const uint8_t*)runner + kRunner_Wait, wait, sizeof(wait)))
+        return;
+    if (pc > pevents[0].pc) {
+        memmove(pevents, pevents + 1, sizeof(PeerEvent) * --pevent_n);   // this one is past here
+        return;
+    }
+    if (pc != pevents[0].pc || strcmp(wait, pevents[0].name) != 0) return;
+    GameStr ev{};
+    bool took = false;
+    if (make_name(ev, pevents[0].name)) {
+        event_ours = true;
+        const bool ok = safe_event(runner, &ev, took);
+        event_ours = false;
+        log_line("CUTSCENE", ok ? "<- the other player's '%s' at command %d%s"
+                                : "!! the other player's '%s' at command %d faulted%s",
+                 pevents[0].name, pc, ok && !took ? " -- not taken" : "");
+    }
+    memmove(pevents, pevents + 1, sizeof(PeerEvent) * --pevent_n);
+}
+
+void* __fastcall tutorial_update(void* runner, void* b, void* c, void* d) {
+    if (linked()) take_peer_events(runner);
+    void* r = o_tutorial(runner, b, c, d);
+    if (net_role() == NetRole::Host || !linked()) return r;
+    void* movie = nullptr;
+    uint8_t flags = 0;
+    if (!mem_read((const uint8_t*)runner + kRunner_Movie, &movie, sizeof(movie)) || !movie ||
+        !mem_read((const uint8_t*)movie + kMovie_Flags, &flags, 1))
+        return r;
+    const bool theirs = lockstep_in_battle() && combatlock_menu_live() && combatlock_engaged();
+    static void* said_for = nullptr;
+    if (theirs && said_for != runner) {
+        said_for = runner;
+        log_line("CUTSCENE", "a talk is up in another player's turn (runner %p, movie %p, flags %02x)",
+                 runner, movie, flags);
+    }
+    if (theirs && (flags & kMovie_Shown)) {
+        flags &= (uint8_t)~kMovie_Shown;
+        mem_write((uint8_t*)movie + kMovie_Flags, &flags, 1);
+        if (hid_movie != movie)
+            log_line("CUTSCENE", "the tutorial's teacher is hidden here while another player's cat moves");
+        hid_movie = movie;
+    } else if (!theirs && hid_movie == movie) {
+        flags |= kMovie_Shown;
+        mem_write((uint8_t*)movie + kMovie_Flags, &flags, 1);
+        hid_movie = nullptr;
+    }
+    return r;
+}
+
+// Who finishes a talk's lines: in a fight, the player whose cat has the turn
+// (Butch teaches whoever is moving); anywhere else, the host. Neither the
+// client's clicks in the host's turn nor the host's in the client's.
+bool drives_lines() {
+    // Butch at a level-up teaches whoever picks it: the cat's owner.
+    if (choice_level_screen_up()) return choice_level_screen_mine();
+    if (lockstep_in_battle() && combatlock_menu_live()) return !combatlock_engaged();
+    return net_role() == NetRole::Host;
+}
+
+void* __fastcall script_check(void* runner, void* command) {
+    if (!linked() || !is_line(command)) return o_check(runner, command);
+    talk_at = GetTickCount64();
+    int32_t pc = -1;
+    uint8_t done0 = 0;
+    mem_read((const uint8_t*)runner + kRunner_Pc, &pc, sizeof(pc));
+    mem_read((const uint8_t*)runner + kRunner_LineDone, &done0, 1);
+    void* r = o_check(runner, command);
+    uint8_t done1 = 0;
+    mem_read((const uint8_t*)runner + kRunner_LineDone, &done1, 1);
+
+    if (done1 && !done0) {
+        if (drives_lines()) {
+            ChoiceMsg c{};
+            c.kind  = kChoiceCutInput;
+            c.aux   = kScriptLine;
+            c.index = (uint32_t)pc;
+            c.count = ++g.sent;
+            mem_read_std_string((const uint8_t*)runner + kRunner_LineKey, c.name, sizeof(c.name));
+            net_send_choice(c);
+        } else {
+            // Not this player's line to finish.
+            const uint8_t zero = 0;
+            mem_write((uint8_t*)runner + kRunner_LineDone, &zero, 1);
+            if (g.swallowed++ == 0)
+                log_line("CUTSCENE", "your clicks in a talk wait for the other player's");
+        }
+    }
+    // The host's lines, each at its own command.
+    const uint64_t now = GetTickCount64();
+    while (hline_n && now - hlines[0].at > kScriptLineStaleMs)
+        memmove(hlines, hlines + 1, sizeof(HostLine) * --hline_n);
+    // A line past here is spent. One ahead of here is caught up to: the other
+    // player finished every line up to it, so each line on the way is finished
+    // too -- a screen one line behind (a click of its own before the turn
+    // changed hands) waited for good on the level-up screen otherwise
+    // (2026-11-14). Only lines: a wait for an event still needs the event.
+    char lkey[48] = "", ltalk[48], htalk[48];
+    mem_read_std_string((const uint8_t*)runner + kRunner_LineKey, lkey, sizeof(lkey));
+    talk_of(lkey, ltalk, sizeof(ltalk));
+    bool same = false;
+    while (hline_n) {
+        talk_of(hlines[0].key, htalk, sizeof(htalk));
+        same = hlines[0].key[0] && strcmp(htalk, ltalk) == 0;
+        if (!same) {
+            // Another talk's: this screen may be on its way there, for a while.
+            if (!hlines[0].key[0] || now - hlines[0].at > kOtherTalkMs) {
+                log_line("CUTSCENE", "the other player's line %d of '%s' never came up here -- dropped",
+                         hlines[0].pc, hlines[0].key);
+                memmove(hlines, hlines + 1, sizeof(HostLine) * --hline_n);
+                continue;
+            }
+            break;
+        }
+        if (pc > hlines[0].pc) {
+            log_line("CUTSCENE", "the other player's line %d is behind this talk (line %d) -- dropped",
+                     hlines[0].pc, pc);
+            memmove(hlines, hlines + 1, sizeof(HostLine) * --hline_n);
+            continue;
+        }
+        break;
+    }
+    if (hline_n && same && pc <= hlines[0].pc) {
+        void* dlg = nullptr;
+        uint8_t typing = 0;
+        const uint8_t one = 1;
+        if (mem_read((const uint8_t*)runner + kRunner_Dialog, &dlg, sizeof(dlg)) && dlg &&
+            mem_read((const uint8_t*)dlg + kDialog_Typing, &typing, 1) && typing) {
+            mem_write((uint8_t*)dlg + kDialog_Finish, &one, 1);    // the line out at once first
+        } else {
+            mem_write((uint8_t*)runner + kRunner_LineDone, &one, 1);
+            log_line("CUTSCENE", pc == hlines[0].pc ? "<- the other player's line %d"
+                                                    : "<- line %d, catching up to the other player's %d",
+                     pc, hlines[0].pc);
+            if (pc == hlines[0].pc) memmove(hlines, hlines + 1, sizeof(HostLine) * --hline_n);
+        }
+    }
+    return r;
+}
+
 } // namespace
+
+bool cutscene_office_active() { return g.office_at && office_up(); }
 
 // ---------------------------------------------------------------------------
 
@@ -859,6 +1152,27 @@ void cutscene_set_base(uintptr_t base) {
     patch(base, kRva_SwfVtable, kRva_SwfUpdate, (void*)&swf_update, g.o_swf, "SwfCutscene");
     patch(base, kRva_DialogVtable, kRva_DialogUpdate, (void*)&dialog_update, g.o_dialog,
           "DialogController");
+    {
+        void* at = (void*)(base + kRva_ScriptCheck);
+        if (memcmp(at, kScriptCheckHead, 8) != 0 ||
+            MH_CreateHook(at, (void*)&script_check, (void**)&o_check) != MH_OK ||
+            MH_EnableHook(at) != MH_OK) {
+            o_check = nullptr;
+            log_line("CUTSCENE", "!! a talk's line check moved -- talks follow the host's clicks as posted");
+        }
+    }
+    patch(base, kRva_TutorialVt, kRva_ScriptTick, (void*)&tutorial_update, o_tutorial, "Tutorial");
+    patch(base, kRva_NpcDialogVt, kRva_ScriptTick, (void*)&tutorial_update, o_tutorial,
+          "NPCDialogController");
+    {
+        void* at = (void*)(base + kRva_ScriptEvent);
+        if (memcmp(at, kScriptEventHead, 8) != 0 ||
+            MH_CreateHook(at, (void*)&script_event, (void**)&o_event) != MH_OK ||
+            MH_EnableHook(at) != MH_OK) {
+            o_event = nullptr;
+            log_line("CUTSCENE", "!! a talk's events moved -- each screen's talk waits on its own");
+        }
+    }
 }
 
 void cutscene_pump() {
@@ -905,6 +1219,7 @@ void cutscene_pump() {
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g.queued; ++i) {
         if (now - g.queue[i].at > kStaleInputMs) continue;
+        if (talk_up()) continue;   // a talk moves by the host's lines, not its clicks
         if (up && kept == 0 && i == 0 && same_as_host() && ui_post_input(g.queue[i].what, g.queue[i].pos)) {
             ++g.played;
             log_line("CUTSCENE", "<- the host's %s", input_name(g.queue[i].what));
@@ -963,6 +1278,24 @@ bool cutscene_on_message(const ChoiceMsg& m) {
         return true;
     }
     if (m.kind != kChoiceCutInput) return false;
+    if (m.aux == kScriptLine) {         // either way
+        if (hline_n < 32) {
+            HostLine& h = hlines[hline_n++];
+            h.pc = (int32_t)m.index;
+            h.at = GetTickCount64();
+            strncpy_s(h.key, m.name, _TRUNCATE);
+        }
+        return true;
+    }
+    if (m.aux == kScriptEventAux) {     // either way
+        if (pevent_n < 32) {
+            PeerEvent& e = pevents[pevent_n++];
+            e.pc = (int32_t)m.index;
+            strncpy_s(e.name, m.name, _TRUNCATE);
+            e.at = GetTickCount64();
+        }
+        return true;
+    }
     if (net_role() == NetRole::Host) return true;
     if (m.aux == kHostUp) {
         g.host_up_at = GetTickCount64();
@@ -1002,7 +1335,7 @@ bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam) {
     if (!up_why()) return false;
 
     if (net_role() == NetRole::Host) {
-        if (down) {
+        if (down && !talk_up()) {
             ChoiceMsg c{};
             c.kind = kChoiceCutInput;
             c.aux  = what;

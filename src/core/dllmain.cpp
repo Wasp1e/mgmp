@@ -164,12 +164,8 @@ DWORD WINAPI init_thread(LPVOID) {
                 " mismatch will be reported and the run will CONTINUE; this run"
                 " cannot show that the peers stayed in sync");
 
-    // These two are compile-time now (mgmp_tuning.h), which makes announcing
-    // them MORE important rather than less: a setting that cannot be checked by
-    // opening a config file has to be visible in the log, or the only way to
-    // find out what a run was made with is to find the binary that made it.
-    if (config().hook[T_SaveScumPenalty])
-        log_raw("[!] savescum penalty is DISABLED (tune::kHookSaveScum)"
+    if (!config_steven())
+        log_raw("[!] savescum penalty / Steven is DISABLED (gameplay.steven = false)"
                 " -- this run does NOT match shipped behaviour");
     if (config().hook[T_TimeDelayTick])
         log_raw("[!] TimeDelayStatusApplication is TURN-DRIVEN (tune::kHookTimeDelay,"

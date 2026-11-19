@@ -1840,13 +1840,18 @@ nobody joined never publishes (`announced == false`).
 **Two settings change the game rather than observe it**, and both shout in the
 startup banner while on:
 
-- **`tune::kHookSaveScum`** (ON) no-ops `MewDirector::ApplySaveScumPenalty` @
+- **`gameplay.steven`** (OFF by default, exposed in F1) controls
+  `MewDirector::ApplySaveScumPenalty` @
   `0x1408DD9C0`. The only write it makes to the run object is `++*(u32*)(run+0xE0)`
   — the scum counter; every other reference is a *read* of it picking an
   escalation tier. It spends that on per-cat penalty fields at `Cat+0x980`/`+0x9A8`
   and on queueing `steven_savescum_100` / `steven_savescum_houseboss_100`. `void`
-  return, both call sites in `ContinueAdventure`, not virtual, so swallowing the
-  call removes it completely. **The reason to disable it is the capture
+  return, both call sites in `ContinueAdventure`, not virtual. The detour is
+  always installed: OFF swallows the call; ON calls the original trampoline.
+  The runtime value is atomic, and F1 saves only this key in `mgmp.json` with
+  an atomic file replacement. F1 disallows changes while connected; both peers
+  must choose the same value before connecting (not network-synchronized).
+  **The reason to disable it is the capture
   methodology**: the penalty mutates cat state as a function of the reload count,
   so with it live no A/B capture of the same battle means anything. The same
   argument applies to multiplayer, which relaunches the game for reasons that have

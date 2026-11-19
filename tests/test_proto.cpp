@@ -7,6 +7,7 @@
 //
 //     cl /nologo /EHsc /std:c++17 /I..\src\net test_proto.cpp && test_proto.exe
 #include "mgmp_proto.h"
+#include "mgmp_aim_wire.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -225,6 +226,37 @@ int main() {
             dec_aim(r, o);              // must not fault at any truncation
         }
         check(true, "truncated AIM frames parse without faulting");
+    }
+
+    printf("\n-- targetless previews clear AIM without disconnecting --\n");
+    {
+        const int32_t invalid[][4] = {
+            {-4000, -4000, 1, 0}, {-1001, 0, 0, 0}, {1001, 0, 0, 0},
+            {0, -1001, 0, 0}, {0, 1001, 0, 0}, {0, 0, -9, 0},
+            {0, 0, 9, 0}, {0, 0, 0, -9}, {0, 0, 0, 9}
+        };
+        for (const auto& v : invalid) {
+            AimMsg a{};
+            a.battle_id = 42; a.cat = 20; a.active = 1;
+            a.slot_kind = 2; a.slot_index = 3;
+            a.tx = v[0]; a.ty = v[1]; a.dx = v[2]; a.dy = v[3];
+            strcpy(a.gon, "MoonHandFlail");
+            aim_sanitize_for_wire(a);
+            check(!a.active && a.battle_id == 42 && a.cat == 20,
+                  "invalid preview becomes a stop for the same cat and battle");
+            uint32_t n = enc_aim(buf, sizeof(buf), a);
+            Reader r(buf, n); r.u8v();
+            AimMsg o{};
+            check(n && dec_aim(r, o) && !o.active && !o.gon[0],
+                  "stop is accepted by the unchanged AIM decoder");
+        }
+        AimMsg a{};
+        a.active = 1; a.tx = -1000; a.ty = 1000; a.dx = -8; a.dy = 8;
+        strcpy(a.gon, "DefaultMove");
+        aim_sanitize_for_wire(a);
+        check(a.active && a.tx == -1000 && a.ty == 1000 &&
+              a.dx == -8 && a.dy == 8 && !strcmp(a.gon, "DefaultMove"),
+              "valid boundary preview remains unchanged");
     }
 
     printf("\n-- CursorMsg is a tile, not a pixel --\n");

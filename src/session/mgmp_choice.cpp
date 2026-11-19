@@ -2,6 +2,7 @@
 // replicating everything the choice does.
 #include "mgmp_peerlog.h"
 #include "mgmp_startrun.h"
+#include "mgmp_house.h"
 #include "mgmp_choice.h"
 #include "mgmp_catsync.h"
 #include "mgmp_follow.h"
@@ -240,6 +241,7 @@ struct State {
     uint32_t reroll_count = 0;
     uint32_t reroll_seq   = 0;
     uint64_t level_seen_at = 0;   // the last level-up screen update
+    bool     level_mine    = false;   // ...and its cat is this player's
     uint64_t shop_cat    = 0;
     uint64_t shop_seed   = 0;
     uint64_t shop_at     = 0;
@@ -1107,6 +1109,7 @@ bool choice_on_level_select(void* screen, void* opt) {
 bool choice_level_screen_up() {
     return g.level_seen_at && GetTickCount64() - g.level_seen_at < 500;
 }
+bool choice_level_screen_mine() { return g.level_mine; }
 
 void choice_on_level_update(void* level_screen) {
     if (!g.on || !level_screen) return;
@@ -1114,6 +1117,7 @@ void choice_on_level_update(void* level_screen) {
 
     const uint64_t cat  = screen_cat(level_screen, kLvl_Cat);
     const bool     mine = lockstep_cat_mine(cat);
+    g.level_mine = mine;
 
     Guard guard;
     g.level_screen = level_screen;
@@ -1142,8 +1146,12 @@ void choice_on_level_update(void* level_screen) {
     } else if (g.said_screen != level_screen) {
         g.said_screen = level_screen;
         g.screen_at   = GetTickCount64();
+        // At once, not a minute on: the same cat's next level-up -- bought in
+        // the shop a minute after a fight's -- was taken for its panel coming
+        // back, handed to the friend, and the screen hung with the host's pick
+        // on top (2026-11-14).
         if (g.is_client && !mine && cat && cat == g.lvl_applied_cat &&
-            g.screen_at - g.lvl_applied_at < 120000) {
+            g.screen_at - g.lvl_applied_at < 10000) {
             g.released_cat    = cat;
             g.lvl_applied_cat = 0;
             log_line("CHOICE", "the host's pick for cat %016llx came back to its options here (a"
@@ -1238,6 +1246,7 @@ void choice_pump() {
     const uint64_t id = g.shop_cat;
     g.shop_cat = 0;
     g.shop_open_uid = id;
+    g.lvl_applied_cat = 0;   // a new screen, not the last one coming back
     void* cat  = catsync_cat_by_uid(id);
     void* shop = g_shop;
     if (cat && shop && safe_open_level(scene, cat, shop))
@@ -1255,12 +1264,13 @@ void choice_pump() {
 
 // --- receiving -------------------------------------------------------------
 
-void choice_on_message(const ChoiceMsg& m) {
+void choice_on_message(const ChoiceMsg& m, uint8_t from) {
     if (m.kind == kChoiceNode) { follow_on_vote(m); return; }   // the map's, not ours
     if (classpick_on_message(m)) return;                         // the class chooser's
     if (cutscene_on_message(m)) return;                          // a cutscene's
     if (peerlog_on_choice(m)) return;                            // a request for the log
     if (startrun_on_message(m)) return;                          // the host setting off
+    if (house_on_choice(m, from)) return;                        // a House cat moved
     if (!g.on) return;
     Guard guard;
 

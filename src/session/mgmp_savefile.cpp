@@ -10,6 +10,7 @@
 #include "mgmp_resolve.h"
 #include "mgmp_follow.h"   // follow_on_map
 #include "mgmp_leave.h"    // leave_on_house, leave_request_reload
+#include "mgmp_house.h"    // house_local_night, house_morning
 #include "mgmp_lockstep.h" // lockstep_in_battle
 #include "mgmp_combatlock.h" // combatlock_menu_live
 // A slot click starts a run, which makes the three per-run dedupe caches stale.
@@ -17,6 +18,7 @@
 #include "mgmp_catsync.h"
 #include "mgmp_invsync.h"
 #include "mgmp_runhist.h"
+#include "mgmp_startrun.h"
 
 #include <windows.h>
 #include <shlobj.h>
@@ -516,6 +518,24 @@ uint64_t day_signature(const uint8_t* d, uint32_t n) {
     return day;
 }
 
+} // namespace
+
+bool savefile_live_path(wchar_t* out, size_t cap) {
+    ensure_dir();
+    if (!g.have_dir) return false;
+    wchar_t wname[128];
+    if (net_role() == NetRole::Host) {
+        if (!g.name[0]) return false;
+        wide(g.name, wname, 128);
+    } else {
+        wide(kCoopSaveName, wname, 128);
+    }
+    _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", g.dir, wname);
+    return true;
+}
+
+namespace {
+
 bool publish(uint8_t to, uint8_t fresh) {
     ensure_dir();
     if (!g.have_dir) return false;
@@ -682,6 +702,7 @@ void house_tick() {
         return;
     }
     if (!house) return;
+    if (!house_night_settled()) return;   // the morning, once the night is over
 
     const uint64_t mtime = save_mtime();
     const bool settled   = mtime && mtime == g.seen_mtime;
@@ -739,6 +760,7 @@ void savefile_on_leaving_house() {
 // the scene walk says exactly which screen is up and nothing about the run. A
 // module that has both can answer when either offset has drifted.
 bool savefile_adventure_is_loaded() { return adventure_is_loaded_impl(); }
+bool savefile_host_save_applied() { return g.is_client && g.applied; }
 
 
 void savefile_init() {
@@ -855,6 +877,9 @@ void savefile_catchup(uint8_t peer) {
     publish(peer, leave_in_run() ? kSaveCatchupInRun : kSaveCatchup);
 }
 
+SaveFileMsg g_deferred{};   // the host's fresh save, held while this game builds its map
+SaveFileMsg g_morning{};    // the host's morning save, held while this game's own night is compared
+
 void savefile_pump() {
     ensure_state();
 
@@ -866,6 +891,29 @@ void savefile_pump() {
     // This function runs exactly once a frame on both roles, which is the unit
     // kPlayRetryFrames is written in.
     if (g.play_cooldown) --g.play_cooldown;
+
+    // The host's morning, once this game's own night is in its save.
+    if (g_morning.data) {
+        const int r = house_morning(g_morning.data, g_morning.size);
+        if (r == 1) {
+            free(g_morning.data);
+            g_morning = SaveFileMsg{};
+            log_line("SAVEFILE", "<- host's morning save not loaded -- this game's night came out the same");
+        } else if (r == 2) {
+            SaveFileMsg m = g_morning;
+            g_morning = SaveFileMsg{};
+            savefile_on_message(m);
+            free(m.data);
+        }
+    }
+
+    // The held save, once this game's map has answered.
+    if (g_deferred.data && startrun_map_state() != 1) {
+        SaveFileMsg m = g_deferred;
+        g_deferred = SaveFileMsg{};
+        savefile_on_message(m);
+        free(m.data);
+    }
 
     if (!g.on || g.is_client) return;
     if (g.published) { house_tick(); return; }
@@ -1017,6 +1065,42 @@ void savefile_on_message(const SaveFileMsg& m) {
     // Unless the host is in a run and this peer is standing in the House or on
     // the menu: then there is no run here to keep, and nothing is coming that
     // would bring it one.
+    // THE CLIENT'S OWN MAP. Set off with the host and built from the host's
+    // stream, this game's run is the host's already: the save that comes as the
+    // host leaves the House is not needed. While the map is still being built
+    // the save waits for the answer (savefile_pump), and a map that did not
+    // come out the same takes it as before.
+    if (m.fresh == kSaveFresh && g.applied && house_local_night() && !g_morning.data) {
+        g_morning = m;
+        g_morning.data = (uint8_t*)malloc(m.size);
+        if (g_morning.data) {
+            memcpy(g_morning.data, m.data, m.size);
+            log_line("SAVEFILE", "<- host's morning save held: this game resolved the same night itself");
+            return;
+        }
+        g_morning = SaveFileMsg{};
+    }
+    if (m.fresh == kSaveFresh && g.applied) {
+        const int st = startrun_map_state();
+        if (st == 2) {
+            startrun_map_kept();
+            log_line("SAVEFILE", "<- host's save (slot %u '%s', hash %016llx) not loaded -- this"
+                                 " game set off with the host and its map is the host's",
+                     m.slot, m.name, (unsigned long long)h);
+            return;
+        }
+        if (st == 1 && !g_deferred.data) {
+            g_deferred = m;
+            g_deferred.data = (uint8_t*)malloc(m.size);
+            if (g_deferred.data) {
+                memcpy(g_deferred.data, m.data, m.size);
+                log_line("SAVEFILE", "<- host's save held: this game's map is still being built"
+                                     " from the host's stream");
+                return;
+            }
+        }
+    }
+
     const bool drop_ours = m.fresh == kSaveFresh ||
                            (m.fresh == kSaveCatchupInRun && !leave_in_run());
     if (g.applied && !drop_ours) {

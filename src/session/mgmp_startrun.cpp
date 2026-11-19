@@ -1,10 +1,12 @@
 #include "mgmp_startrun.h"
+#include "mgmp_house.h"
 #include "mgmp_net.h"
 #include "mgmp_mem.h"
 #include "mgmp_log.h"
 #include "mgmp_resolve.h"
 #include "mgmp_leave.h"
 #include "mgmp_catsync.h"
+#include "mgmp_rng.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -42,6 +44,53 @@ constexpr uintptr_t kRva_PlayCutscene = 0x3C0210;
 const uint8_t kPlayCutscenePrologue[8] = { 0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0xF2 };
 constexpr uintptr_t kRva_CutsceneOwner = 0x13DAC30;
 
+// THE REAL EMBARK. The gear screen's confirm (sub_14034D870) plays the embark
+// with a `done` of vftable 0xF11CD8 holding the InventoryScreen2 at +8; its
+// _Do_call (0x1403510C0) runs sub_14034D9B0(&screen), which closes the screen
+// and, off a defense, sets off to the map (MewDirector sub_1403BABB0 -> the
+// MapScreen's init -> generate_map). The client used to play the cutscene with
+// a `done` that did nothing and wait to reload the host's save from the menu;
+// now it sets off as the host did, on a map from the host's stream (below).
+constexpr uintptr_t kRva_EmbarkDoneVt = 0xF11CD8;
+
+// THE GEAR SCREEN'S WAY OUT, AND THE ACT. The confirm (sub_14034D870) plays the
+// embark itself only when the screen names a cutscene (std::string at +0x110,
+// its size at +0x120); otherwise it runs sub_14034D9B0(&screen) at once, and
+// that takes the run to ActSelection when acts are open. There the three act
+// buttons' lambdas run sub_140069A70(screen, act 1..3), which plays "embark"
+// with a `done` (vftable 0xED4858) that loads the act's map. The client stood on
+// its gear screen through the host's ActSelection, and the cutscene took it to
+// an ActSelection of its own afterwards (2026-11-14). Now it leaves the gear
+// screen when the host does, and on ActSelection the host's act is picked for
+// it, from its own screen's update (vftable 0xF16410, slot 10, 0x140069140);
+// the client's own clicks there do nothing.
+constexpr uintptr_t kRva_GearDone     = 0x34D9B0;
+const uint8_t kGearDoneHead[8]        = { 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0x11, 0x48 };
+constexpr uintptr_t kScreen_CutName   = 0x110;
+constexpr uintptr_t kScreen_CutSize   = 0x120;
+constexpr uintptr_t kRva_ActPick      = 0x69A70;
+const uint8_t kActPickHead[8]         = { 0x4C, 0x8B, 0xDC, 0x48, 0x81, 0xEC, 0x88, 0x00 };
+constexpr uintptr_t kRva_ActTickSlot  = 0xF16410 + 10 * 8;
+constexpr uintptr_t kRva_ActTick      = 0x69140;
+
+// THE MAP. MapScreen::generate_map (sub_14021AE00, map, std::string name, bool)
+// copies TLS+0x178, the simulation stream, into the map's seed (+0x38/+0x48)
+// first thing, and builds the whole map -- its nodes (count +0x7C, list +0x80),
+// their types (+0x138) and seeds (+0x118) -- from that and the stream. Two games
+// that enter it with the same stream and the same save build the same map. The
+// host sends the stream it entered with and a hash of what it built; the client
+// enters with the host's stream and compares. A match keeps this game's run;
+// anything else falls back to the host's save, as before (2026-11-14).
+constexpr uintptr_t kRva_GenMap    = 0x21AE00;
+const uint8_t kGenMapHead[8]       = { 0x48, 0x8B, 0xC4, 0x44, 0x88, 0x40, 0x18, 0x48 };
+constexpr uintptr_t kMap_NodeCount = 0x7C;
+constexpr uintptr_t kMap_Nodes     = 0x80;
+constexpr uintptr_t kNode_Seed     = 0x118;
+constexpr uintptr_t kNode_Type     = 0x138;
+constexpr uint64_t  kSeedWaitMs    = 10000;   // the client on its loading screen, for the host's
+constexpr uint64_t  kSeedFreshMs   = 90000;
+constexpr uint64_t  kMatchKeepMs   = 120000;
+
 constexpr uint32_t kMaxParty   = 8;
 constexpr uint32_t kMaxCollars = 16;
 constexpr uint64_t kStaleMs    = 30000;   // a start not carried out by then is dropped
@@ -57,6 +106,10 @@ struct KeyVec { uint32_t cap; uint32_t count; uint64_t* data; };
 using fn_go      = void* (__fastcall*)(void*, void*, void*, void*);
 using fn_defend  = void* (__fastcall*)(void*, void*, void*);
 using fn_play    = void* (__fastcall*)(void*, void*, void*, double);
+using fn_genmap  = void* (__fastcall*)(void*, void*, void*, void*);
+using fn_act     = void  (__fastcall*)(void*, int);
+using fn_tick4   = void* (__fastcall*)(void*, void*, void*, void*);
+using fn_gdone   = void  (__fastcall*)(void**);
 using fn_alloc   = void* (__cdecl*)(size_t);
 using fn_realloc = void* (__cdecl*)(void*, size_t);
 
@@ -66,6 +119,16 @@ struct State {
     fn_defend  o_defend = nullptr;
     bool       defend   = false;    // client: the pending start is a defense
     fn_play    o_play   = nullptr;
+    fn_genmap  o_genmap = nullptr;
+    fn_act     o_act    = nullptr;
+    fn_tick4   o_act_tick = nullptr;
+    fn_gdone   gear_done  = nullptr;
+    bool       act_ours   = false;
+    int        act_pending = 0;         // client: the host's act, for the next ActSelection update
+    uint64_t   act_at      = 0;
+    bool       map_pending = false;     // client: set off for real, its map not built yet
+    uint64_t   map_pending_at = 0;
+    uint64_t   map_matched_at = 0;      // client: its map came out as the host's
     bool       playing_ours = false;
     bool       cut_pending  = false;
     uint64_t   cut_at       = 0;
@@ -84,6 +147,188 @@ struct State {
     uint32_t collars_n  = 0;
 };
 State g;
+
+// The host's map seed, written by the receiving thread.
+struct SeedBox {
+    bool     ready = false;
+    uint64_t s[4]  = {};
+    uint32_t hash  = 0;
+    uint32_t count = 0;
+    uint64_t at    = 0;
+};
+SeedBox          seed_box;
+CRITICAL_SECTION seed_cs;
+volatile LONG    seed_cs_ready = 0;
+
+void seed_tap(const ChoiceMsg& m) {
+    if (m.kind != kChoiceMapSeed || !seed_cs_ready) return;
+    unsigned long long w2 = 0, w3 = 0;
+    if (sscanf_s(m.name, "%16llx%16llx", &w2, &w3) != 2) return;
+    EnterCriticalSection(&seed_cs);
+    seed_box.s[0] = m.node_seed;
+    seed_box.s[1] = m.cat;
+    seed_box.s[2] = w2;
+    seed_box.s[3] = w3;
+    seed_box.hash  = m.index;
+    seed_box.count = m.count;
+    seed_box.at    = GetTickCount64();
+    seed_box.ready = true;
+    LeaveCriticalSection(&seed_cs);
+}
+
+bool take_seed(SeedBox& out) {
+    if (!seed_cs_ready) return false;
+    EnterCriticalSection(&seed_cs);
+    const bool ok = seed_box.ready && GetTickCount64() - seed_box.at < kSeedFreshMs;
+    if (ok) out = seed_box;
+    seed_box.ready = false;
+    LeaveCriticalSection(&seed_cs);
+    return ok;
+}
+
+bool seed_waiting() {
+    if (!seed_cs_ready) return false;
+    EnterCriticalSection(&seed_cs);
+    const bool r = seed_box.ready;
+    LeaveCriticalSection(&seed_cs);
+    return r;
+}
+
+uint32_t map_hash(void* map, uint32_t& count) {
+    count = 0;
+    void* data = nullptr;
+    if (!mem_read((const uint8_t*)map + kMap_NodeCount, &count, sizeof(count)) ||
+        !mem_read((const uint8_t*)map + kMap_Nodes, &data, sizeof(data)) || !data || count > 4096) {
+        count = 0;
+        return 0;
+    }
+    uint32_t h = 2166136261u;
+    auto mix = [&](const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*)p;
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+        void* node = nullptr;
+        uint32_t type = 0;
+        uint64_t seed[4] = {};
+        if (!mem_read((const uint8_t*)data + i * sizeof(void*), &node, sizeof(node)) || !node) continue;
+        mem_read((const uint8_t*)node + kNode_Type, &type, sizeof(type));
+        mem_read((const uint8_t*)node + kNode_Seed, seed, sizeof(seed));
+        mix(&type, sizeof(type));
+        mix(seed, sizeof(seed));
+    }
+    mix(&count, sizeof(count));
+    return h;
+}
+
+void* __fastcall gen_map(void* map, void* name, void* flag, void* d) {
+    uint64_t* st = rng_global_stream();
+    if (!st || !map || !net_active() || net_peer_count() < 2) return g.o_genmap(map, name, flag, d);
+
+    if (net_role() == NetRole::Host) {
+        uint64_t s[4];
+        memcpy(s, st, sizeof(s));
+        void* r = g.o_genmap(map, name, flag, d);
+        uint32_t n = 0;
+        const uint32_t h = map_hash(map, n);
+        ChoiceMsg m{};
+        m.kind      = kChoiceMapSeed;
+        m.node_seed = s[0];
+        m.cat       = s[1];
+        snprintf(m.name, sizeof(m.name), "%016llx%016llx",
+                 (unsigned long long)s[2], (unsigned long long)s[3]);
+        m.index = h;
+        m.count = n;
+        net_send_choice(m);
+        log_line("STARTRUN", "-> a map of %u node(s), hash %08x, built from stream %016llx --"
+                             " for the other players' maps", n, h, (unsigned long long)s[0]);
+        return r;
+    }
+
+    // The client. Set off for real, it waits for the host's on its loading screen.
+    const uint64_t t0 = GetTickCount64();
+    if (g.map_pending)
+        while (!seed_waiting() && GetTickCount64() - t0 < kSeedWaitMs) Sleep(10);
+    SeedBox hs{};
+    const bool got = take_seed(hs);
+    if (got) memcpy(st, hs.s, sizeof(hs.s));
+    void* r = g.o_genmap(map, name, flag, d);
+    const bool was_pending = g.map_pending;
+    g.map_pending = false;
+    uint32_t n = 0;
+    const uint32_t h = map_hash(map, n);
+    if (got && h == hs.hash && n == hs.count) {
+        if (was_pending) g.map_matched_at = GetTickCount64();
+        log_line("STARTRUN", "<- this map is the host's: %u node(s), hash %08x, from its stream"
+                             " (waited %llu ms)%s", n, h, (unsigned long long)(GetTickCount64() - t0),
+                 was_pending ? " -- this game keeps its run, no reload" : "");
+    } else if (got) {
+        log_line("STARTRUN", "!! this map is not the host's (%u node(s) hash %08x, the host's %u"
+                             " hash %08x) -- the host's save replaces it", n, h, hs.count, hs.hash);
+    } else if (was_pending) {
+        log_line("STARTRUN", "!! the host's map stream did not come in %llu ms -- this game's own"
+                             " map; the host's save replaces it", (unsigned long long)kSeedWaitMs);
+    }
+    return r;
+}
+
+// HOST: an act picked. CLIENT: only the host's.
+void __fastcall act_pick(void* screen, int act) {
+    if (net_active() && net_peer_count() >= 2) {
+        if (net_role() == NetRole::Host) {
+            ChoiceMsg m{}; m.kind = kChoiceRunAct; m.index = (uint32_t)act; net_send_choice(m);
+            log_line("STARTRUN", "-> the host sets off into act %d", act);
+        } else if (!g.act_ours) {
+            static uint64_t said = 0;
+            if (GetTickCount64() - said > 3000) {
+                said = GetTickCount64();
+                log_line("STARTRUN", "an act clicked here -- the host picks the act, this game follows");
+            }
+            return;
+        }
+    }
+    g.o_act(screen, act);
+}
+
+bool safe_act(void* screen, int act) {
+    __try { g.o_act(screen, act); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void* __fastcall act_tick(void* screen, void* b, void* c, void* d) {
+    void* r = g.o_act_tick(screen, b, c, d);
+    if (g.act_pending && net_role() != NetRole::Host) {
+        const int act = g.act_pending;
+        g.act_pending = 0;
+        if (GetTickCount64() - g.act_at < kStaleMs) {
+            g.map_pending    = true;
+            g.map_pending_at = GetTickCount64();
+            g.map_matched_at = 0;
+            g.act_ours = true;
+            const bool ok = safe_act(screen, act);
+            g.act_ours = false;
+            log_line("STARTRUN", ok ? "<- act %d, as the host picked -- this game sets off into it"
+                                    : "!! picking the host's act %d faulted here", act);
+        }
+    }
+    return r;
+}
+
+void __fastcall gear_done_hook(void** cap) {
+    if (net_role() == NetRole::Host && net_active() && net_peer_count() >= 2 && !g.defend) {
+        ChoiceMsg m{};
+        m.kind = kChoiceGearDone;
+        net_send_choice(m);
+        log_line("STARTRUN", "-> the host leaves its gear screen for the run");
+    }
+    g.gear_done(cap);
+}
+
+bool safe_gear_done(void* screen) {
+    void* cap = screen;
+    __try { g.gear_done(&cap); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 
 void* director() {
     void* const* slot = (void* const*)addr_of_data(D_MewDirectorPtr);
@@ -337,6 +582,8 @@ void* prev_of(uint64_t key) {
 // Slot 31: a cat past this player's share is not taken. The drop has cleared
 // the cat's holder already, so it stays where it was let go, as off any room.
 void* __fastcall box_add_hook(void* box, void* cat, void* c, void* d) {
+    if (!box_applying && house_drag_remote_held(cat)) return nullptr;
+    if (box_applying) house_drag_remote_placed(cat);
     const uint32_t players = net_peer_count();
     if (!box_applying && net_active() && players >= 2) {
         const uint8_t me = net_peer_pos();
@@ -688,7 +935,7 @@ bool safe_play(void* owner, GameStr* kind, GameFn* done) {
 
 } // namespace
 
-void startrun_scene_tick() {
+void startrun_scene_tick(void* gear_screen) {
     if (!g.cut_pending || !g.o_play) return;
     g.cut_pending = false;
     if (GetTickCount64() - g.cut_at > kStaleMs) return;
@@ -703,11 +950,22 @@ void startrun_scene_tick() {
     GameFn done{};
     done.storage[0] = (void*)kNoopVt;
     done.impl       = &done.storage[0];
+    // Off the gear screen, and not a defense: the game's own `done`, so this
+    // game sets off to its map as the host's did.
+    const bool real = gear_screen && !g.defend && g.o_genmap;
+    if (real) {
+        done.storage[0] = (void*)(g.base_ + kRva_EmbarkDoneVt);
+        done.storage[1] = gear_screen;
+        g.map_pending    = true;
+        g.map_pending_at = GetTickCount64();
+        g.map_matched_at = 0;
+    }
     g.playing_ours = true;
     const bool ok = safe_play(owner, &kind, &done);
     g.playing_ours = false;
-    log_line("STARTRUN", ok ? "<- the host's '%s' cutscene plays here too"
-                            : "!! the host's '%s' cutscene faulted here", g.cut_kind);
+    log_line("STARTRUN", ok ? "<- the host's '%s' cutscene plays here too%s"
+                            : "!! the host's '%s' cutscene faulted here%s", g.cut_kind,
+             real ? " -- and this game sets off to its map after it" : "");
 }
 
 void startrun_set_base(uintptr_t base) {
@@ -720,6 +978,45 @@ void startrun_set_base(uintptr_t base) {
         MH_EnableHook(dh) != MH_OK) {
         g.o_defend = nullptr;
         log_line("STARTRUN", "!! the House defense moved -- the other player does not follow it");
+    }
+    if (!seed_cs_ready) { InitializeCriticalSection(&seed_cs); InterlockedExchange(&seed_cs_ready, 1); }
+    net_set_choice_tap(&seed_tap);
+    void* gm = (void*)(base + kRva_GenMap);
+    if (memcmp(gm, kGenMapHead, 8) != 0 ||
+        MH_CreateHook(gm, (void*)&gen_map, (void**)&g.o_genmap) != MH_OK ||
+        MH_EnableHook(gm) != MH_OK) {
+        g.o_genmap = nullptr;
+        log_line("STARTRUN", "!! the map generator moved -- the client reloads the host's save to start a run");
+    }
+    {
+        // The host says when its gear screen is left for the run; this player's
+        // own calls go through the original.
+        void* gd = (void*)(base + kRva_GearDone);
+        if (memcmp(gd, kGearDoneHead, 8) == 0 &&
+            MH_CreateHook(gd, (void*)&gear_done_hook, (void**)&g.gear_done) == MH_OK &&
+            MH_EnableHook(gd) == MH_OK) {
+        } else {
+            g.gear_done = nullptr;
+            log_line("STARTRUN", "!! the gear screen's way out moved -- the client waits on its gear screen");
+        }
+    }
+    void* ap = (void*)(base + kRva_ActPick);
+    if (memcmp(ap, kActPickHead, 8) != 0 ||
+        MH_CreateHook(ap, (void*)&act_pick, (void**)&g.o_act) != MH_OK ||
+        MH_EnableHook(ap) != MH_OK) {
+        g.o_act = nullptr;
+        log_line("STARTRUN", "!! the act picker moved -- the client picks its own act");
+    } else {
+        void** slot = (void**)(base + kRva_ActTickSlot);
+        DWORD prot = 0;
+        if ((uintptr_t)*slot == base + kRva_ActTick &&
+            VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+            g.o_act_tick = (fn_tick4)*slot;
+            *slot = (void*)&act_tick;
+            VirtualProtect(slot, sizeof(void*), prot, &prot);
+        } else {
+            log_line("STARTRUN", "!! ActSelection's update moved -- the client picks its own act");
+        }
     }
     void* pc = (void*)(base + kRva_PlayCutscene);
     if (memcmp(pc, kPlayCutscenePrologue, 8) != 0 ||
@@ -753,6 +1050,8 @@ void startrun_house_tick() {
     go_after_host();
 }
 
+bool startrun_box_drag_guard_ready() { return o_box_add && o_box_tick; }
+
 int startrun_box_picker(uint64_t key) {
     return net_role() == NetRole::Host ? picker_of(key) : -1;
 }
@@ -768,7 +1067,60 @@ bool startrun_box_note(uint32_t& mine, uint32_t& most) {
     return true;
 }
 
+void startrun_gear_closed(void* screen) {
+    if (net_role() == NetRole::Host) return;
+    if (!screen || !g.gear_done || g.defend) {
+        log_line("STARTRUN", "the host left its gear screen -- this game waits on its own (%s)",
+                 !screen ? "no screen" : !g.gear_done ? "no way out found" : "a House defense");
+        return;
+    }
+    uint64_t cut = 0;
+    if (!mem_read((const uint8_t*)screen + kScreen_CutSize, &cut, sizeof(cut))) return;
+    g.map_pending    = true;
+    g.map_pending_at = GetTickCount64();
+    g.map_matched_at = 0;
+    if (cut) {
+        // The screen names a cutscene (the way to ActSelection, 2026-11-14): the
+        // confirm plays it with the screen's own `done`, as 0x14034D948 does.
+        char name[48];
+        void* owner = nullptr;
+        void* const* slot = (void* const*)(g.base_ + kRva_CutsceneOwner);
+        GameStr kind{};
+        if (!g.o_play || !read_str((const uint8_t*)screen + kScreen_CutName, name, sizeof(name)) ||
+            !mem_read(slot, &owner, sizeof(owner)) || !owner || !make_str(kind, name)) {
+            log_line("STARTRUN", "!! this game's gear screen names a cutscene it cannot play -- it waits");
+            return;
+        }
+        GameFn done{};
+        done.storage[0] = (void*)(g.base_ + kRva_EmbarkDoneVt);
+        done.storage[1] = screen;
+        done.impl       = &done.storage[0];
+        g.playing_ours = true;
+        const bool ok = safe_play(owner, &kind, &done);
+        g.playing_ours = false;
+        log_line("STARTRUN", ok ? "<- the host left its gear screen -- this game leaves its own the same"
+                                  " way, through '%s'"
+                                : "!! leaving this game's gear screen through '%s' faulted", name);
+        return;
+    }
+    // No cutscene of the screen's own: it leaves at once, as the host's did.
+    const bool ok = safe_gear_done(screen);
+    log_line("STARTRUN", ok ? "<- the host left its gear screen -- this game leaves its own the same way"
+                            : "!! leaving this game's gear screen faulted");
+}
+
+int startrun_map_state() {
+    if (net_role() == NetRole::Host) return 0;
+    const uint64_t now = GetTickCount64();
+    if (g.map_matched_at && now - g.map_matched_at < kMatchKeepMs) return 2;
+    if (g.map_pending && now - g.map_pending_at < 60000) return 1;
+    return 0;
+}
+
+void startrun_map_kept() { g.map_matched_at = 0; }
+
 bool startrun_on_message(const ChoiceMsg& m) {
+    if (m.kind == kChoiceMapSeed) return true;   // taken on arrival, by seed_tap
     if (m.kind == kChoiceBoxCat) {
         if (!box_cs_ready || !m.cat) return true;
         EnterCriticalSection(&box_cs);
@@ -779,10 +1131,21 @@ bool startrun_on_message(const ChoiceMsg& m) {
         return true;
     }
     if (m.kind != kChoiceRunParty && m.kind != kChoiceRunStart && m.kind != kChoiceRunCollar &&
-        m.kind != kChoiceRunCutscene && m.kind != kChoiceRunDefend)
+        m.kind != kChoiceRunCutscene && m.kind != kChoiceRunDefend && m.kind != kChoiceRunAct)
         return false;
     if (net_role() == NetRole::Host) return true;
+    if (m.kind == kChoiceRunAct) {
+        g.act_pending = (int)m.index;
+        g.act_at      = GetTickCount64();
+        log_line("STARTRUN", "<- the host set off into act %u -- picked on this game's ActSelection", m.index);
+        return true;
+    }
     if (m.kind == kChoiceRunCutscene) {
+        // The act's own embark plays here, from the act picked for this game.
+        if (GetTickCount64() - g.act_at < kStaleMs) {
+            log_line("STARTRUN", "<- the host's '%s' cutscene -- this game plays its own, from the act", m.name);
+            return true;
+        }
         strncpy_s(g.cut_kind, m.name, _TRUNCATE);
         g.cut_pending = true;
         g.cut_at      = GetTickCount64();

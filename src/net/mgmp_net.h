@@ -188,6 +188,12 @@ bool net_send_refuse_to(uint8_t peer, const char* reason);
 // from the game thread; drain in a loop until it returns false.
 bool net_poll(NetMsg& out);
 
+// Called on the receiving thread with every CHOICE as it arrives, before it is
+// queued for net_poll -- for the one message the game thread waits on without
+// pumping (the host's map seed). Keep it short; it must not touch the game.
+using ChoiceTap = void (*)(const ChoiceMsg&);
+void net_set_choice_tap(ChoiceTap fn);
+
 // Diagnostics for the banner and the desync dump.
 struct NetStats {
     uint32_t sent = 0, received = 0, dropped = 0;

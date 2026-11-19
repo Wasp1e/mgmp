@@ -72,15 +72,8 @@ constexpr const char* kReplayBrains = "PlayerBrain";
 // Both still announce themselves loudly in the startup banner while on, which
 // is the property that mattered -- not that they were reachable from a file.
 
-// No-op MewDirector::ApplySaveScumPenalty, so that reloading the same save to
-// repeat a battle does not mutate cat state as a function of the reload count.
-// This is a capture-methodology switch, not a cheat: with it live, run N and
-// run N+1 start from different states by construction.
-// ON: a multiplayer test session relaunches the game constantly for reasons
-// that have nothing to do with the run -- a rebuilt DLL, a peer that dropped,
-// a deliberate reconnect -- and Steven counts every one of them. The penalty
-// was measuring our tooling, not the player.
-constexpr bool     kHookSaveScum  = true;
+// Save-scum penalties/Steven are now controlled by gameplay.steven in F1,
+// not by a compile-time switch. The detour stays installed for live toggling.
 // Convert TimeDelayStatusApplication's wall-clock countdown to a turn count.
 // Never yet run against real content -- the one reachable user is AZ_LoseHead.
 constexpr bool     kHookTimeDelay = false;

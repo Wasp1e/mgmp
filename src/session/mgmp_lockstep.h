@@ -172,6 +172,9 @@ LockstepStats lockstep_stats();
 // True once a HASH mismatch or a HALT from the peer has stopped the battle.
 bool lockstep_halted();
 
+// Stop both peers before a native action runs without required game data.
+void lockstep_halt_action(const char* why);
+
 // Whether this peer is standing in a battle it has already snapshotted -- i.e.
 // a fight is on screen and lockstep is driving it.
 //

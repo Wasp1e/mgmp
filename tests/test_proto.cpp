@@ -653,20 +653,19 @@ int main() {
     }
 
     // `fresh` sits between the name and the payload, so a wrong offset would
-    // shift the whole blob. Both values are round-tripped rather than just the
-    // interesting one: a decoder that ignored the byte and left the field at
-    // its default would pass a test that only ever checked fresh = 0.
-    printf("\n-- SAVEFILE's `fresh` byte round-trips both ways --\n");
+    // shift the whole blob. Check every reason, including the full Soul Jar
+    // reload, whose snapshot cannot be replaced by matching map seeds.
+    printf("\n-- SAVEFILE reasons round-trip --\n");
     {
         uint8_t save[64];
         for (size_t i = 0; i < sizeof(save); ++i) save[i] = (uint8_t)(i + 7u);
 
-        for (int want = 0; want <= 1; ++want) {
+        for (uint8_t want : { kSaveCatchup, kSaveFresh, kSaveCatchupInRun, kSaveFreshWithSoulJar }) {
             SaveFileMsg out{};
             out.slot  = 1;
             out.size  = (uint32_t)sizeof(save);
             out.hash  = savefile_hash(save, out.size);
-            out.fresh = (uint8_t)want;
+            out.fresh = want;
             strcpy(out.name, "steamcampaign02.sav");
             out.data = save;
 
@@ -678,8 +677,7 @@ int main() {
             r.u8v();
             SaveFileMsg in{};
             check(dec_savefile(r, in), "decodes");
-            check(in.fresh == (uint8_t)want, want ? "fresh = 1 survives"
-                                                  : "fresh = 0 survives");
+            check(in.fresh == want, "save reason survives");
             check(memcmp(in.data, save, out.size) == 0,
                   "the payload is still aligned behind it");
             free(in.data);

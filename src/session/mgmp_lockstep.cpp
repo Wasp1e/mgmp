@@ -2425,6 +2425,11 @@ bool lockstep_active() { return g.active && net_active(); }
 bool lockstep_halted() { return g.halted; }
 bool lockstep_in_battle() { return g.active && g.snapped && !g.halted; }
 
+void lockstep_halt_action(const char* why) {
+    Guard guard;
+    halt(why);
+}
+
 // One question with three answers, because mgmp_aim needs all three and asking
 // them separately would mean three lookups of the same character and three
 // chances to disagree about the answer.

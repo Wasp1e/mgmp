@@ -103,6 +103,10 @@ bool catsync_apply_pending(const char* why);
 // choice layers carry, which is not the registry's.
 void* catsync_cat_by_uid(uint64_t uid);
 
+// The full Soul Jar refers to a registry record outside the active party.
+bool catsync_run_has_soul_jar();
+bool catsync_has_cat_key(uint64_t key);
+
 // A cat as the game serializes it, into a buffer the caller frees; 0 on failure.
 uint32_t catsync_serialize(void* cat, uint8_t** out);
 // That cat as a push carries it (key, bytes, hash); m.data is the caller's to free.

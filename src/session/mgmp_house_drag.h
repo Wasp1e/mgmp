@@ -14,6 +14,7 @@ public:
     struct Slot {
         uint64_t key = 0, sequence = 0, last_at = 0;
         float x = 0, y = 0;
+        uint64_t placed_sequence = 0;
     };
 
     void reset() { for (auto& s : slots_) s = Slot{}; }
@@ -57,6 +58,20 @@ public:
         if (s.key != key) return false;
         s.key = 0;
         return true;
+    }
+
+    bool can_place(uint8_t peer, uint64_t key, uint64_t sequence) const {
+        const Slot& s = slots_[peer];
+        return peer != kNoPeer && key && sequence > s.placed_sequence &&
+               (s.key != key || s.sequence <= sequence);
+    }
+
+    void complete_placement(uint8_t peer, uint64_t key, uint64_t sequence) {
+        if (!can_place(peer, key, sequence)) return;
+        Slot& s = slots_[peer];
+        s.placed_sequence = sequence;
+        if (s.sequence < sequence) s.sequence = sequence;
+        if (s.key == key) s.key = 0;
     }
 
     const Slot& slot(uint8_t peer) const { return slots_[peer]; }

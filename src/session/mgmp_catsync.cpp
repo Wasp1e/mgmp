@@ -445,6 +445,35 @@ static void* slot_of(void* cat, uint32_t i) {
     return (uint8_t*)cat + kCat_Equipment + i * kCat_EquipmentSize;
 }
 
+bool catsync_run_has_soul_jar() {
+    RunCats rc{};
+    if (!g.by_id || !run_cats(rc)) return false;
+    for (uint32_t i = 0; i < rc.count; ++i) {
+        uint64_t key = 0;
+        void* cat = nullptr;
+        if (!mem_read(rc.ids + i, &key, sizeof(key)) ||
+            !safe_by_id((void*)rc.registry, key, &cat) || !cat)
+            continue;
+        const auto* trinket = static_cast<const uint8_t*>(slot_of(cat, 4));
+        char name[32];
+        if (mem_read_std_string(trinket + kEquip_NameBuf, name, sizeof(name)) &&
+            strcmp(name, "SoulJar_Full") == 0)
+            return true;
+    }
+    return false;
+}
+
+bool catsync_has_cat_key(uint64_t key) {
+    const void* dir = nullptr;
+    void* registry = nullptr;
+    void* cat = nullptr;
+    return g.by_id && g.director_slot &&
+           mem_read(g.director_slot, &dir, sizeof(dir)) && dir &&
+           mem_read(static_cast<const uint8_t*>(dir) + kDir_CatRegistry,
+                    &registry, sizeof(registry)) && registry &&
+           safe_by_id(registry, key, &cat) && cat;
+}
+
 // The five slots alone: everything else on the cat is the host's to say, and the
 // client's copy of it has moved through a battle since the last push.
 static uint32_t serialize_equipment(void* cat, uint8_t** out) {

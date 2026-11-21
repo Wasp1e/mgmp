@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <chrono>
+#include <deque>
 #include <string>
 #include <vector>
 #include <map>
@@ -498,7 +500,14 @@ struct Move {
     uint64_t drag_sequence = 0;
     double drop_xy[2] = {};
     bool has_drop_xy = false;
+    double drop_velocity[2] = {};
+    bool tumble = false;
+    uint64_t received_at = 0;
 };
+constexpr size_t kDropPositionChars = 32;
+constexpr size_t kDropMotionChars = 9;
+constexpr double kDropVelocityScale = 256.0;
+constexpr double kMaxDropVelocity = 100.0;
 constexpr uint32_t kMoveDeliver   = 0xD;     // a pipe hand-over (index = the NPC choice)
 constexpr uint64_t kDeliverSettleMs = 900;   // the pipe here takes the cat and opens its map first
 CRITICAL_SECTION g_cs;
@@ -523,7 +532,7 @@ std::map<uint64_t, WalkSample> g_walk_pending;
 struct HouseAction { uint64_t key, at; uint32_t place, state; char name[16]; };
 std::map<uint64_t, HouseAction> g_action_pending;
 struct HouseCatSnapshot {
-    uint64_t received_at = 0, day = 0, last_step = 0;
+    uint64_t received_at = 0, day = 0;
     uint32_t room = 0, rooms = 0, pose = 15;
     float x = 0, y = 0;
     int32_t facing = 2; // -1, 0, +1 are Animator commands. 2 means unreadable.
@@ -532,10 +541,24 @@ struct HouseCatSnapshot {
     bool action_replayed = false;
     void* holder = nullptr;
 };
+struct HouseCatPlayback {
+    std::deque<HouseCatSnapshot> samples;
+    uint64_t last_step = 0;
+};
 constexpr uint32_t kCatSnapshotOutside = 0x1FFF;
+constexpr uint64_t kCatPlaybackDelayMs = 220;
 constexpr uint64_t kCatSnapshotLifetimeMs = 1200;
-std::map<uint64_t, HouseCatSnapshot> g_cat_snapshots, g_cat_snapshots_pending;
-std::map<uint64_t, uint64_t> g_cat_dropped_until;
+constexpr size_t kCatSnapshotLimit = 32;
+constexpr char kHouseJumpStartAction[] = "jumpStart";
+std::map<uint64_t, HouseCatPlayback> g_cat_snapshots;
+std::map<uint64_t, HouseCatSnapshot> g_cat_snapshots_pending;
+enum class HouseCatDropMode { Local, Remote, FollowHost };
+struct HouseCatDrop {
+    uint64_t accept_at, expires_at;
+    HouseCatDropMode mode;
+    bool landed = false;
+};
+std::map<uint64_t, HouseCatDrop> g_cat_drops;
 void* g_cat_snapshot_scene = nullptr;
 uint64_t g_cat_snapshot_day = 0;
 bool g_cat_snapshot_applied = false;
@@ -545,6 +568,12 @@ uint64_t g_local_drag_key = 0;
 uint64_t g_drag_previous = 0, g_drag_sample_at = 0;
 struct DragMessage { ChoiceMsg msg; uint8_t from; };
 std::vector<DragMessage> g_drag_messages;
+struct LocalCatRelease {
+    ChoiceMsg move;
+    void* cat = nullptr;
+    uint64_t deadline = 0;
+};
+LocalCatRelease g_local_cat_release;
 bool drag_ready();
 void drag_tick(void* comps);
 void drag_install();
@@ -554,6 +583,22 @@ bool drag_move_allowed(uint64_t key, uint8_t from);
 bool apply_house_cat_snapshot(void* cat);
 uint64_t drag_publish_final(void* cat, double (&pos)[2]);
 void drag_guard_note(void* cat, bool box);
+
+uint64_t house_cat_clock_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
+void reset_cat_snapshots_for_drop(uint64_t key, HouseCatDropMode mode) {
+    if (!config().house_cat_sync) return;
+    const uint64_t now = house_cat_clock_ms();
+    // Give the host time to mirror our own release before accepting its
+    // snapshots. The playback delay is included in the existing 800 ms grace.
+    const uint64_t grace = mode == HouseCatDropMode::Local && net_role() == NetRole::Client
+                         ? 800 - kCatPlaybackDelayMs : 0;
+    g_cat_snapshots.erase(key);
+    g_cat_drops[key] = {now + grace, now + 5000, mode};
+}
 
 struct List { uint32_t n = 0; void** data = nullptr; };
 
@@ -916,6 +961,27 @@ bool pipe_index(void* pipe, uint32_t& idx, uint32_t& count) {
     return false;
 }
 
+void encode_cat_drop_position(ChoiceMsg& move, const double (&xy)[2]) {
+    uint64_t bits[2];
+    memcpy(bits, xy, sizeof(bits));
+    snprintf(move.name, sizeof(move.name), "%016llx%016llx",
+             (unsigned long long)bits[0], (unsigned long long)bits[1]);
+}
+
+void queue_cat_release(const ChoiceMsg& move, void* cat) {
+    if (g_local_cat_release.cat) {
+        net_send_choice(g_local_cat_release.move);
+        g_local_cat_release = {};
+    }
+    if (!move.name[0]) {
+        net_send_choice(move);
+        return;
+    }
+    // Wait one native physics update for the release velocity and pose. A
+    // fresh pickup or placement may replace the cat before it updates.
+    g_local_cat_release = {move, cat, GetTickCount64() + 120};
+}
+
 void __fastcall drop(void* drag) {
     void* cat = nullptr;
     void* was = nullptr;
@@ -937,8 +1003,7 @@ void __fastcall drop(void* drag) {
     // Do not immediately overwrite a local player's newly placed cat with an
     // older host sample while the host is processing the placement.
     g_walk_pause_until = GetTickCount64() + 3000;
-    if (config().house_cat_sync && net_role() == NetRole::Client)
-        g_cat_dropped_until[key] = GetTickCount64() + 800;
+    reset_cat_snapshots_for_drop(key, HouseCatDropMode::Local);
     void* now = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &now, sizeof(now));
     g_pipe_cat = nullptr;
@@ -949,7 +1014,8 @@ void __fastcall drop(void* drag) {
         m.cat   = key;
         m.index = kOutside;
         m.node_seed = drag_sequence;
-        net_send_choice(m);
+        if (drag_sequence) encode_cat_drop_position(m, drop_xy);
+        queue_cat_release(m, cat);
         log_line("HOUSE", "-> %s (%016llx) put outside", night_cat_name(key).c_str(), (unsigned long long)key);
         return;
     }
@@ -974,12 +1040,9 @@ void __fastcall drop(void* drag) {
             // FurnitureGrid validates add() against the cat's current
             // position. Carry the exact point even if release arrives in
             // the same update as the final interpolated drag sample.
-            uint64_t bits[2];
-            memcpy(bits, drop_xy, sizeof(bits));
-            snprintf(m.name, sizeof(m.name), "%016llx%016llx",
-                     (unsigned long long)bits[0], (unsigned long long)bits[1]);
+            encode_cat_drop_position(m, drop_xy);
         }
-        net_send_choice(m);
+        queue_cat_release(m, cat);
         const std::string name = night_cat_name(key);
         log_line("HOUSE", "-> %s (%016llx) put in %s %u of %u%s", name.c_str(), (unsigned long long)key,
                  kind_name(kind), i, places.n, was == now ? " (where it was)" : "");
@@ -1084,6 +1147,16 @@ void drag_stop_physics(void* cat, double x, double y) {
     mem_write((uint8_t*)physics + 0x68, &not_held, 1);
 }
 
+void cancel_cat_walk(void* cat) {
+    // State 7 reads the former room-relative target even in the air. State 1
+    // lets HouseCat choose its next destination normally after the fall.
+    uint32_t state = 0;
+    if (mem_read((const uint8_t*)cat + 0x94, &state, sizeof(state)) && state == 7) {
+        const uint32_t idle = 1;
+        mem_write((uint8_t*)cat + 0x94, &idle, sizeof(idle));
+    }
+}
+
 bool drag_safe_room(void* place) {
     uintptr_t vt = 0;
     return place && mem_read(place, &vt, sizeof(vt)) &&
@@ -1169,6 +1242,56 @@ void finish_remote_drag(void* cat, bool restore) {
              restore ? "restored" : "placed", (unsigned long long)key, (unsigned)v.peer);
 }
 
+void start_remote_cat_fall(void* cat, const Move& move, void* holder) {
+    const bool follow_host = config().house_cat_sync && g_cat_snapshot_scene &&
+                             net_role() == NetRole::Client && move.from == kHostPeer;
+    // House tick can receive the first fall sample just before applying the
+    // placement. Preserve it if it belongs to the new path.
+    HouseCatSnapshot first_sample{};
+    const auto snapshot = g_cat_snapshots.find(move.key);
+    if (follow_host && snapshot != g_cat_snapshots.end()) {
+        const auto& latest = snapshot->second.samples.back();
+        if (latest.received_at > move.received_at && latest.holder == holder) first_sample = latest;
+    }
+    finish_remote_drag(cat, false);
+    cancel_cat_walk(cat); // A quick pickup can deliver a drop before its first visible frame.
+    drag_stop_physics(cat, move.drop_xy[0], move.drop_xy[1]);
+
+    if (follow_host) {
+        // Play the host's flight and ordinary movement in one buffer so there
+        // is no handoff from a separate guest physics simulation on landing.
+        reset_cat_snapshots_for_drop(move.key, HouseCatDropMode::FollowHost);
+        g_cat_drops[move.key].accept_at = move.received_at;
+        HouseCatSnapshot start{};
+        start.received_at = move.received_at;
+        start.day = g_cat_snapshot_day;
+        start.x = (float)move.drop_xy[0];
+        start.y = (float)move.drop_xy[1];
+        start.holder = holder;
+        auto& samples = g_cat_snapshots[move.key].samples;
+        samples.push_back(start);
+        if (first_sample.received_at) samples.push_back(first_sample);
+        log_line("HOUSEDRAG", "following host fall cat %016llx from x=%.3f y=%.3f",
+                 (unsigned long long)move.key, move.drop_xy[0], move.drop_xy[1]);
+        return;
+    }
+
+    // The frozen physics still has its pre-pickup contact flag. The native
+    // physics update sets it again on contact (0x1FF740). Use the throw mode
+    // chosen by the releasing peer's physics at 0x1FF5B2.
+    void* physics = nullptr;
+    if (mem_read((const uint8_t*)cat + 0x38, &physics, sizeof(physics)) && physics) {
+        const uint8_t airborne = 0, tumble = move.tumble ? 1 : 0;
+        mem_write((uint8_t*)physics + 0x48, move.drop_velocity, sizeof(move.drop_velocity));
+        mem_write((uint8_t*)physics + 0x69, &airborne, 1);
+        mem_write((uint8_t*)cat + 0xDB, &tumble, 1);
+    }
+    reset_cat_snapshots_for_drop(move.key, HouseCatDropMode::Remote);
+    log_line("HOUSEDRAG", "remote fall cat %016llx mode=%s vx=%.2f vy=%.2f",
+             (unsigned long long)move.key, move.tumble ? "tumble" : "feet",
+             move.drop_velocity[0], move.drop_velocity[1]);
+}
+
 uint64_t drag_publish_final(void* cat, double (&pos)[2]) {
     if (!drag_ready() || !sharing() || !cat ||
         !read_drag_position(cat, pos) || !valid_drag_position(pos)) return 0;
@@ -1191,6 +1314,28 @@ void __fastcall drag_cat_update(void* cat) {
     o_drag_cat(cat);
 }
 
+void send_native_cat_release(void* cat, void* physics, uint64_t key) {
+    if (g_local_cat_release.cat != cat || g_local_cat_release.move.cat != key) return;
+    uint8_t held = 0;
+    if (!mem_read((const uint8_t*)physics + 0x68, &held, 1) || held) return;
+
+    ChoiceMsg move = g_local_cat_release.move;
+    g_local_cat_release = {};
+    if (!sharing()) return;
+    double velocity[2] = {};
+    uint8_t tumble = 0;
+    if (mem_read((const uint8_t*)cat + 0xDB, &tumble, 1)) {
+        if (!mem_read((const uint8_t*)physics + 0x48, velocity, sizeof(velocity)) ||
+            !(std::abs(velocity[0]) <= kMaxDropVelocity && std::abs(velocity[1]) <= kMaxDropVelocity))
+            velocity[0] = velocity[1] = 0.0;
+        const unsigned vx = (unsigned)(std::lround(velocity[0] * kDropVelocityScale) + 0x8000);
+        const unsigned vy = (unsigned)(std::lround(velocity[1] * kDropVelocityScale) + 0x8000);
+        snprintf(move.name + kDropPositionChars, sizeof(move.name) - kDropPositionChars,
+                 "%04x%04x%u", vx, vy, tumble ? 1u : 0u);
+    }
+    net_send_choice(move);
+}
+
 void __fastcall drag_physics_update(void* physics) {
     void* cat = nullptr;
     mem_read((const uint8_t*)physics + 0x40, &cat, sizeof(cat));
@@ -1201,7 +1346,21 @@ void __fastcall drag_physics_update(void* physics) {
         return;
     }
     if (cat && apply_house_cat_snapshot(cat)) return;
+    const bool local_release = cat && cat == g_local_cat_release.cat;
+    const uint64_t key = g_cat_drops.empty() && !local_release ? 0 : cat_key(cat);
     o_drag_physics(physics);
+    if (!key) return;
+    if (local_release) send_native_cat_release(cat, physics, key);
+    auto drop = g_cat_drops.find(key);
+    uint8_t grounded = 0;
+    if (drop != g_cat_drops.end() && drop->second.mode != HouseCatDropMode::FollowHost &&
+        !drop->second.landed &&
+        mem_read((const uint8_t*)physics + 0x69, &grounded, 1) && grounded) {
+        HouseCatDrop& recovery = drop->second;
+        const uint64_t now = house_cat_clock_ms();
+        recovery.landed = true;
+        if (recovery.accept_at < now) recovery.accept_at = now;
+    }
 }
 
 void drag_cancel_losing_hand(void* drag) {
@@ -1236,6 +1395,7 @@ void drag_tick(void* comps) {
         // Never dereference pointers from an old scene.
         g_drag_visuals.clear();
         g_drag_tracker.reset();
+        g_local_cat_release = {};
         g_drag_scene = comps;
         g_drag_previous = g_local_drag_key = 0;
     }
@@ -1256,7 +1416,13 @@ void drag_tick(void* comps) {
         }
         g_drag_visuals.clear();
         g_drag_tracker.reset();
+        g_local_cat_release = {};
         return;
+    }
+    if (g_local_cat_release.cat &&
+        (now >= g_local_cat_release.deadline || g_local_cat_release.move.cat == g_local_drag_key)) {
+        net_send_choice(g_local_cat_release.move);
+        g_local_cat_release = {};
     }
     for (const auto& incoming : messages) {
         const ChoiceMsg& m = incoming.msg;
@@ -1327,6 +1493,7 @@ void drag_tick(void* comps) {
             }
             v.x = s.x; v.y = s.y; v.frame_at = now;
             found = g_drag_visuals.emplace(s.key, v).first;
+            cancel_cat_walk(cat);
             drag_depth(cat, v.depth + 100000);
             if (!drag_held_pose(cat))
                 log_line("HOUSEDRAG", "!! held pose unavailable for cat %016llx",
@@ -1375,7 +1542,7 @@ void drag_install() {
 }
 
 // Out of every place's list (the one it is in, and any stale one), +0xE8 null.
-void put_outside(const List& places, void* cat, const std::string& name, uint64_t key) {
+bool put_outside(const List& places, void* cat, const std::string& name, uint64_t key) {
     void* was = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &was, sizeof(was));
     bool ok = true;
@@ -1396,11 +1563,12 @@ void put_outside(const List& places, void* cat, const std::string& name, uint64_
             }
         }
     }
-    if (!was && !out) return;   // outside already
+    if (!was && !out) return true;   // outside already
     void* none = nullptr;
     ok &= mem_write((uint8_t*)cat + kHouseCat_Place, &none, sizeof(none));
     log_line("HOUSE", ok ? "<- %s (%016llx) put outside, as the other player did"
                          : "!! putting %s (%016llx) outside faulted", name.c_str(), (unsigned long long)key);
+    return ok;
 }
 
 void apply(void* comps, const Move& mv) {
@@ -1409,10 +1577,8 @@ void apply(void* comps, const Move& mv) {
                  (unsigned long long)mv.key, (unsigned)mv.from);
         return;
     }
-    if (drag_ready() && mv.from != kNoPeer && mv.drag_sequence) {
-        const auto& s = g_drag_tracker.slot(mv.from);
-        if (s.key == mv.key && s.sequence > mv.drag_sequence) return;
-    }
+    const bool sequenced = drag_ready() && mv.from != kNoPeer && mv.drag_sequence;
+    if (sequenced && !g_drag_tracker.can_place(mv.from, mv.key, mv.drag_sequence)) return;
     List places, cats;
     const std::string name = night_cat_name(mv.key);
     if (!list_of(comps, kComps_Places, places) || !list_of(comps, kComps_Cats, cats)) {
@@ -1435,8 +1601,15 @@ void apply(void* comps, const Move& mv) {
             log_line("HOUSE", "%s is in Butch's box here -- left there (the box has its own sync)", name.c_str());
             return;
         }
-        finish_remote_drag(cat, false);
-        put_outside(places, cat, name, mv.key);
+        const bool outside = put_outside(places, cat, name, mv.key);
+        if (sequenced && mv.has_drop_xy) {
+            g_drag_tracker.complete_placement(mv.from, mv.key, mv.drag_sequence);
+            if (outside && drag_position(cat, mv.drop_xy[0], mv.drop_xy[1])) {
+                start_remote_cat_fall(cat, mv, nullptr);
+                return;
+            }
+        }
+        finish_remote_drag(cat, !outside);
         return;
     }
     if (places.n != mv.count) {
@@ -1454,7 +1627,7 @@ void apply(void* comps, const Move& mv) {
     mem_read((const uint8_t*)cat + kHouseCat_Place, &was, sizeof(was));
     const bool room = drag_safe_room(place);
     double previous_xy[2] = {};
-    const bool exact_drop = room && drag_ready() && mv.has_drop_xy &&
+    const bool exact_drop = room && sequenced && mv.has_drop_xy &&
                             read_drag_position(cat, previous_xy) &&
                             drag_position(cat, mv.drop_xy[0], mv.drop_xy[1]);
     if (!exact_drop) {
@@ -1473,9 +1646,12 @@ void apply(void* comps, const Move& mv) {
     const bool placed = ok && (!room ||
         (mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) && holder == place));
     if (exact_drop) {
-        if (!placed) drag_position(cat, previous_xy[0], previous_xy[1]);
-        finish_remote_drag(cat, !placed);
-        if (placed) drag_stop_physics(cat, mv.drop_xy[0], mv.drop_xy[1]);
+        g_drag_tracker.complete_placement(mv.from, mv.key, mv.drag_sequence);
+        if (placed) start_remote_cat_fall(cat, mv, place);
+        else {
+            drag_position(cat, previous_xy[0], previous_xy[1]);
+            finish_remote_drag(cat, true);
+        }
     }
     log_line("HOUSE", placed ? "<- %s (%016llx) put in %s %u, as the other player did"
                              : "!! the game did not put %s (%016llx) in %s %u",
@@ -2094,26 +2270,30 @@ void apply_purse(int32_t coins, int32_t food);
 void* g_comps    = nullptr;   // the House scene's components, from the last House update
 uint64_t g_comps_at = 0;
 bool short_house_action(const char* name, uint32_t state);
-bool safe_short_action(void* anim, const char* name);
+bool play_cosmetic_house_action(void* anim, const char* name);
 
 // During the day the host runs the cats normally. The client mirrors only
 // cats with fresh data in the same house and room. The animation component
 // continues to run while HouseCat and its physics are following the snapshot.
 bool apply_house_cat_snapshot(void* cat) {
-    if (!g_cat_snapshot_scene || !sharing() || g_night_at_pub()) return false;
+    if (!g_cat_snapshot_scene || net_role() != NetRole::Client ||
+        !sharing() || g_night_at_pub()) return false;
     const uint64_t key = cat_key(cat);
     auto found = g_cat_snapshots.find(key);
-    if (found == g_cat_snapshots.end() || key == g_local_drag_key ||
-        g_cat_dropped_until.count(key)) return false;
-    HouseCatSnapshot& sample = found->second;
-    const uint64_t now = GetTickCount64();
-    if (now - sample.received_at > kCatSnapshotLifetimeMs) return false;
+    if (found == g_cat_snapshots.end() || key == g_local_drag_key) return false;
+    HouseCatPlayback& playback = found->second;
+    auto& samples = playback.samples;
+    const uint64_t now = house_cat_clock_ms();
+    const auto drop = g_cat_drops.find(key);
+    if (drop != g_cat_drops.end() && drop->second.mode != HouseCatDropMode::FollowHost &&
+        (!drop->second.landed || now < drop->second.accept_at + kCatPlaybackDelayMs)) return false;
+    if (now - samples.back().received_at > kCatSnapshotLifetimeMs) return false;
 
     void* comps = nullptr;
     void* holder = nullptr;
     if (!comps_of(cat, comps) || comps != g_cat_snapshot_scene ||
         !mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) ||
-        holder != sample.holder) return false;
+        holder != samples.back().holder) return false;
     if (holder) {
         if (!drag_safe_room(holder)) return false;
     } else {
@@ -2121,17 +2301,42 @@ bool apply_house_cat_snapshot(void* cat) {
         drag_hand(comps, held);
         if (held == cat || in_box(cat)) return false;
     }
-    if (sample.last_step == now) return true;
+    if (playback.last_step == now) return true;
 
     double pos[2];
     if (!read_drag_position(cat, pos) || !valid_drag_position(pos)) return false;
-    const double alpha = sample.last_step ? std::fmin(1.0, (now - sample.last_step) / 110.0) : 1.0;
-    const double dx = (sample.x - pos[0]) * alpha;
-    pos[0] += dx;
-    pos[1] += (sample.y - pos[1]) * alpha;
+
+    // Show a point on the received path at a fixed delay. At the ends of
+    // the buffer hold the nearest position until more data is available.
+    const uint64_t render_at = now >= kCatPlaybackDelayMs ? now - kCatPlaybackDelayMs : 0;
+    while (samples.size() > 1 && samples[1].received_at <= render_at) {
+        auto& next = samples[1];
+        next.action_replayed = samples.front().action_replayed &&
+                               strcmp(samples.front().action, next.action) == 0;
+        samples.pop_front();
+    }
+    HouseCatSnapshot& sample = samples.front();
+    constexpr uint32_t kStandingPose = 0;
+    constexpr uint32_t kWalkPose = 10;
+    const HouseCatSnapshot* pose_sample = &sample;
+    pos[0] = sample.x;
+    pos[1] = sample.y;
+    double dx = 0.0;
+    if (samples.size() > 1 && render_at > sample.received_at) {
+        const auto& next = samples[1];
+        const double fraction = (double)(render_at - sample.received_at) /
+                                (double)(next.received_at - sample.received_at);
+        dx = (double)next.x - sample.x;
+        const double dy = (double)next.y - sample.y;
+        pos[0] += dx * fraction;
+        pos[1] += dy * fraction;
+        // Enter the walk pose on the first interpolated step out of idle.
+        if (sample.pose == kStandingPose && next.pose == kWalkPose &&
+            (std::abs(dx) > 0.001 || std::abs(dy) > 0.001)) pose_sample = &next;
+    }
     if (!drag_position(cat, pos[0], pos[1])) return false;
     drag_stop_physics(cat, pos[0], pos[1]);
-    sample.last_step = now;
+    playback.last_step = now;
     if (!g_cat_snapshot_applied) {
         g_cat_snapshot_applied = true;
         log_line("HOUSECATS", "following the host's cats for day %llu",
@@ -2143,9 +2348,8 @@ bool apply_house_cat_snapshot(void* cat) {
 
     // HouseCat writes the animator's facing command when it walks
     // (0x1FD328). The renderer consumes it and handles any turn transition.
-    constexpr uint32_t kWalkPose = 10;
-    int32_t facing = sample.facing;
-    if (sample.pose == kWalkPose && std::abs(dx) > 0.001)
+    int32_t facing = pose_sample->facing;
+    if (pose_sample->pose == kWalkPose && std::abs(dx) > 0.001)
         facing = dx < 0 ? -1 : 1;
     int32_t current_facing = 0;
     if (facing != 2 &&
@@ -2158,25 +2362,45 @@ bool apply_house_cat_snapshot(void* cat) {
     char variant[16] = {};
     // An empty variant is the native default. Updating the requested base
     // while an action is active lets Animator decide when to switch clips.
-    if (sample.pose <= 13 &&
+    if (pose_sample->pose <= 13 &&
         mem_read((const uint8_t*)anim + 0x148, &pose, sizeof(pose)) &&
-        (pose != sample.pose ||
+        (pose != pose_sample->pose ||
          (mem_read_std_string((const uint8_t*)anim + 0x170, variant, sizeof(variant)) &&
-          strcmp(variant, sample.variant)))) {
-        set_house_cat_pose(anim, sample.pose, sample.variant);
+          strcmp(variant, pose_sample->variant)))) {
+        set_house_cat_pose(anim, pose_sample->pose, pose_sample->variant);
     }
     if (sample.action[0] && !sample.action_replayed &&
         mem_read((const uint8_t*)anim + 0x210, &active, 1) && !active &&
         mem_read((const uint8_t*)anim + 0x2A0, &queued, 1) && !queued) {
         sample.action_replayed = true;
-        safe_short_action(anim, sample.action);
+        play_cosmetic_house_action(anim, sample.action);
     }
     return true;
+}
+
+bool read_house_cat_action(void* anim, uint32_t state, char (&action)[16]) {
+    // The movement branch queues jumpStart before Animator makes it active.
+    const bool moving_to_target = state == 7;
+    uint8_t queued = 0;
+    if (moving_to_target &&
+        mem_read((const uint8_t*)anim + 0x2A0, &queued, 1) && queued &&
+        mem_read_std_string((const uint8_t*)anim + 0x220, action, sizeof(action)) &&
+        strcmp(action, kHouseJumpStartAction) == 0) return true;
+
+    uint8_t active = 0;
+    return mem_read((const uint8_t*)anim + 0x210, &active, 1) && active &&
+           mem_read_std_string((const uint8_t*)anim + 0x190, action, sizeof(action)) &&
+           (short_house_action(action, state) ||
+            (moving_to_target && strcmp(action, kHouseJumpStartAction) == 0));
 }
 
 void publish_house_cat(const List& places, void* cat, void* held, uint64_t day) {
     if (!cat || cat == held || remote_drag_cat(cat)) return;
     const uint64_t key = cat_key(cat);
+    const auto drop = g_cat_drops.find(key);
+    if (drop != g_cat_drops.end() && !drop->second.landed &&
+        (drop->second.mode != HouseCatDropMode::Local || !drag_ready() ||
+         g_local_cat_release.cat == cat)) return;
     void* holder = nullptr;
     double pos[2];
     if (!key || !mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) ||
@@ -2210,12 +2434,10 @@ void publish_house_cat(const List& places, void* cat, void* held, uint64_t day) 
     if (anim && (!mem_read((const uint8_t*)anim + 0x14C, &facing, sizeof(facing)) ||
                  facing < -1 || facing > 1)) facing = 2;
     char action[16] = {};
-    uint8_t active = 0;
     uint32_t state = 0;
-    if (anim && mem_read((const uint8_t*)anim + 0x210, &active, 1) && active &&
+    if (anim &&
         mem_read((const uint8_t*)cat + 0x94, &state, sizeof(state)) &&
-        mem_read_std_string((const uint8_t*)anim + 0x190, action, sizeof(action)) &&
-        short_house_action(action, state)) {
+        read_house_cat_action(anim, state, action)) {
         strcat_s(m.name, "|");
         strcat_s(m.name, action);
     }
@@ -2227,7 +2449,7 @@ void receive_house_cat(const ChoiceMsg& m, uint8_t from) {
     if (!config().house_cat_sync || !g_drag_hooks || net_role() != NetRole::Client ||
         from != kHostPeer || !g_cs_ready || !m.cat) return;
     HouseCatSnapshot s{};
-    s.received_at = GetTickCount64();
+    s.received_at = house_cat_clock_ms();
     s.day = m.node_seed;
     s.room = m.aux & 0x1FFF;
     s.rooms = (m.aux >> 13) & 0x1FFF;
@@ -2245,7 +2467,8 @@ void receive_house_cat(const ChoiceMsg& m, uint8_t from) {
     memcpy(s.variant, m.name, variant_size);
     if (action) {
         ++action;
-        if (!short_house_action(action, 2) && !short_house_action(action, 4)) return;
+        if (strcmp(action, kHouseJumpStartAction) != 0 &&
+            !short_house_action(action, 2) && !short_house_action(action, 4)) return;
         strcpy_s(s.action, action);
     }
     EnterCriticalSection(&g_cs);
@@ -2262,13 +2485,27 @@ void house_cat_sync_tick(void* comps) {
     if (!g_drag_hooks || g_night_at_pub() || !read_shared_house(director, day)) {
         g_cat_snapshot_scene = nullptr;
         g_cat_snapshots.clear();
-        g_cat_dropped_until.clear();
+        g_cat_drops.clear();
         return;
     }
-    const uint64_t now = GetTickCount64();
     List places;
     if (!list_of(comps, kComps_Places, places)) return;
-    if (net_role() == NetRole::Host) {
+    if (comps != g_cat_snapshot_scene || day != g_cat_snapshot_day) {
+        g_cat_snapshots.clear();
+        g_cat_drops.clear();
+        g_cat_snapshot_scene = comps;
+        g_cat_snapshot_day = day;
+        g_cat_snapshot_applied = false;
+    }
+    const uint64_t clock_now = house_cat_clock_ms();
+    const bool host = net_role() == NetRole::Host;
+    for (auto it = g_cat_drops.begin(); it != g_cat_drops.end();) {
+        if (clock_now >= it->second.expires_at || (host && it->second.landed))
+            it = g_cat_drops.erase(it);
+        else ++it;
+    }
+    if (host) {
+        const uint64_t now = GetTickCount64();
         const uint64_t elapsed = now - sent_at;
         if (elapsed < 50) return;
         const uint32_t batch = elapsed >= 250 ? 60 : (uint32_t)(elapsed / 50) * 12;
@@ -2277,6 +2514,15 @@ void house_cat_sync_tick(void* comps) {
         if (!list_of(comps, kComps_Cats, cats) || !cats.n) return;
         void* held = nullptr;
         drag_hand(comps, held);
+        // A short fall needs the full sample cadence even in a large roster.
+        if (!g_cat_drops.empty() && drag_ready()) {
+            for (uint32_t i = 0; i < cats.n; ++i) {
+                void* cat = item(cats, i);
+                const auto drop = g_cat_drops.find(cat_key(cat));
+                if (drop != g_cat_drops.end() && drop->second.mode == HouseCatDropMode::Local)
+                    publish_house_cat(places, cat, held, day);
+            }
+        }
         // Spread the roster over frames to leave space in the receive queue
         // for drops and other messages when the guest renders slowly.
         next %= cats.n;
@@ -2287,45 +2533,41 @@ void house_cat_sync_tick(void* comps) {
         return;
     }
 
-    if (comps != g_cat_snapshot_scene || day != g_cat_snapshot_day) {
-        g_cat_snapshots.clear();
-        g_cat_dropped_until.clear();
-        g_cat_snapshot_scene = comps;
-        g_cat_snapshot_day = day;
-        g_cat_snapshot_applied = false;
-    }
-    for (auto it = g_cat_dropped_until.begin(); it != g_cat_dropped_until.end();) {
-        if (now >= it->second) it = g_cat_dropped_until.erase(it);
-        else ++it;
-    }
-    for (auto it = g_cat_snapshots.begin(); it != g_cat_snapshots.end();) {
-        if (now - it->second.received_at > kCatSnapshotLifetimeMs) it = g_cat_snapshots.erase(it);
-        else ++it;
-    }
     std::map<uint64_t, HouseCatSnapshot> incoming;
     EnterCriticalSection(&g_cs);
     incoming.swap(g_cat_snapshots_pending);
     LeaveCriticalSection(&g_cs);
+    const uint64_t now = house_cat_clock_ms();
+    for (auto it = g_cat_snapshots.begin(); it != g_cat_snapshots.end();) {
+        if (now - it->second.samples.back().received_at > kCatSnapshotLifetimeMs)
+            it = g_cat_snapshots.erase(it);
+        else ++it;
+    }
     for (auto& entry : incoming) {
         HouseCatSnapshot& s = entry.second;
         if (s.day != day || s.rooms != places.n || now - s.received_at > kCatSnapshotLifetimeMs)
             continue;
+        const auto drop = g_cat_drops.find(entry.first);
+        if (drop != g_cat_drops.end() &&
+            (s.received_at < drop->second.accept_at ||
+             (!drop->second.landed && drop->second.mode != HouseCatDropMode::FollowHost))) continue;
         if (s.room != kCatSnapshotOutside) {
             s.holder = item(places, s.room);
             if (!drag_safe_room(s.holder)) continue;
         }
-        auto& previous = g_cat_snapshots[entry.first];
-        if (previous.holder == s.holder) {
-            s.last_step = previous.last_step;
-            s.action_replayed = previous.action_replayed && strcmp(previous.action, s.action) == 0;
+        auto& playback = g_cat_snapshots[entry.first];
+        auto& samples = playback.samples;
+        if (!samples.empty() && samples.back().holder != s.holder) {
+            samples.clear();
+            playback.last_step = 0;
         }
-        previous = s;
+        if (!samples.empty() && samples.back().received_at >= s.received_at) continue;
+        samples.push_back(s);
+        if (samples.size() > kCatSnapshotLimit) samples.pop_front();
     }
 }
 
-// Only random idle actions observed at call sites with an empty callback.
-// Jumping, landing, pose transitions and interactions with other cats are
-// intentionally excluded: those can carry game-owned callbacks or side effects.
+// Random idle actions observed at call sites with an empty callback.
 bool short_house_action(const char* name, uint32_t state) {
     return (state == 2 && strcmp(name, "scratching") == 0) ||
            (state == 4 && (strcmp(name, "cleanSelf") == 0 || strcmp(name, "stretch") == 0));
@@ -2338,7 +2580,7 @@ struct ActionString {
 static_assert(sizeof(ActionString) == 0x20, "game string layout");
 using fn_house_action = uint8_t (__fastcall*)(void*, void*, void*, void*, uint8_t, uint32_t);
 
-bool safe_short_action(void* anim, const char* name) {
+bool play_cosmetic_house_action(void* anim, const char* name) {
     constexpr uintptr_t kRva_Action = 0x9AA5B0;
     const uint8_t head[] = { 0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44, 0x24, 0x18 };
     uint8_t actual[sizeof(head)] = {};
@@ -2351,8 +2593,8 @@ bool safe_short_action(void* anim, const char* name) {
     action.size = len; action.capacity = 15;
     memcpy(variant.buf, "_DEFAULT", 9);
     variant.size = 8; variant.capacity = 15;
-    // MSVC empty std::function: its target pointer at +0x38 is null. The game
-    // consumes all three arguments just as it does at the observed call site.
+    // An empty MSVC std::function keeps jumpStart cosmetic. The host's
+    // callbacks at 0x1FD242 and 0x1FD2E7 drive its jump physics.
     alignas(16) uint8_t callback[0x40] = {};
     __try {
         return ((fn_house_action)(g_base + kRva_Action))(anim, &action, &variant, callback, 0, 0) != 0;
@@ -2478,7 +2720,7 @@ void walk_tick(void* comps) {
             if (holder != expected) { reason = "different room or dragging"; break; }
             if (state != a.state) { reason = "different state"; break; }
             if (active || queued) { reason = "animation busy"; break; }
-            const bool ok = safe_short_action(anim, a.name);
+                const bool ok = play_cosmetic_house_action(anim, a.name);
             log_line("CATACTION", ok ? "<- cat %016llx %s replayed"
                                      : "!! cat %016llx %s could not be replayed",
                      (unsigned long long)a.key, a.name);
@@ -3003,11 +3245,30 @@ bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
     if (m.kind != kChoiceHouseMove) return false;
     if (!g_cs_ready || !place_add) return true;
     Move move{m.cat, m.index, m.count, m.aux, GetTickCount64(), from, m.node_seed};
-    if (m.node_seed && (m.aux == 1 || m.aux == 3) && strlen(m.name) == 32) {
+    const size_t payload_size = strlen(m.name);
+    const bool has_motion = payload_size == kDropPositionChars + kDropMotionChars;
+    if (m.node_seed && (m.index == kOutside || m.aux == 1 || m.aux == 3) &&
+        (payload_size == kDropPositionChars || has_motion)) {
         unsigned long long bits[2];
         if (sscanf_s(m.name, "%16llx%16llx", &bits[0], &bits[1]) == 2) {
             memcpy(move.drop_xy, bits, sizeof(bits));
             move.has_drop_xy = valid_drag_position(move.drop_xy);
+            if (move.has_drop_xy) move.received_at = house_cat_clock_ms();
+        }
+        if (move.has_drop_xy && has_motion) {
+            const char* motion = m.name + kDropPositionChars;
+            unsigned vx = 0, vy = 0;
+            const char tumble = motion[kDropMotionChars - 1];
+            if ((tumble == '0' || tumble == '1') && sscanf_s(motion, "%4x%4x", &vx, &vy) == 2 &&
+                vx <= 0xFFFF && vy <= 0xFFFF) {
+                const double x = ((int)vx - 0x8000) / kDropVelocityScale;
+                const double y = ((int)vy - 0x8000) / kDropVelocityScale;
+                if (std::abs(x) <= kMaxDropVelocity && std::abs(y) <= kMaxDropVelocity) {
+                    move.drop_velocity[0] = x;
+                    move.drop_velocity[1] = y;
+                    move.tumble = tumble == '1';
+                }
+            }
         }
     }
     EnterCriticalSection(&g_cs);
@@ -3142,16 +3403,19 @@ void house_tick(void* component) {
     if (!g_cs_ready || !g_move_n) return;
     const char* step = nullptr;
     if (!leave_on_house() || leave_loading(&step)) return;
-    const uint64_t now = GetTickCount64();
+    const bool visible_drag = drag_ready();
     Move todo[32];
     uint32_t n = 0;
     EnterCriticalSection(&g_cs);
+    const uint64_t now = GetTickCount64();
     uint32_t keep = 0;
     for (uint32_t i = 0; i < g_move_n; ++i) {
         // In order: one not settled yet holds back the ones after it.
-        const uint64_t settle = g_moves[i].kind == kMoveDeliver ? kDeliverSettleMs : kMoveSettleMs;
-        if (keep || now - g_moves[i].at < settle) {
-            if (now - g_moves[i].at > 30000) continue;   // never came to a House: dropped
+        const Move& move = g_moves[i];
+        const uint64_t settle = move.kind == kMoveDeliver ? kDeliverSettleMs : kMoveSettleMs;
+        const bool immediate_drop = visible_drag && move.has_drop_xy;
+        if (keep || (!immediate_drop && now - move.at < settle)) {
+            if (now - move.at > 30000) continue;   // never came to a House: dropped
             g_moves[keep++] = g_moves[i];
         } else {
             todo[n++] = g_moves[i];

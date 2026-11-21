@@ -10,7 +10,6 @@ struct ItemText {
     char name[96]   = {};   // "Осколок стекла"; the key itself when there is no text
     char desc[512]  = {};   // markup like [img:str] taken out
     char bonus[192] = {};   // "Сила +1, Щит +4", empty when none
-    char icon[32]   = {};   // "weapon_2": icons/<kind>_<frame>.png, empty when none
 };
 
 // False when the key is no item this game knows.

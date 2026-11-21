@@ -33,10 +33,19 @@ the actual visual/physics experiment; it does not need `-HouseDrag`.
   consumed `_DEFAULT` string/animation command 8 supplies the held pose.
 - Pipe/box add guards reject automatic pickup while the remote lease is
   shown. A real replicated placement ends the freeze before the normal add.
-- Waits up to 700 ms after a release for room/pipe/box placement. A lost lease,
-  disconnect, or release without placement restores the original safe room
-  and position. A placement associated with an older drag is not applied to
-  a newer active pickup.
+- In protocol 103 a confirmed room or yard drop retires the drag lease and
+  resumes native physics from the exact release point. The receiver waits
+  for its cat to land before accepting movement samples again, and the host
+  pauses publishing samples for that cat during its own fall.
+- In protocol 104 the receiving game cancels the old walk on pickup. The
+  releasing game sends the velocity and tumble flag from its first native
+  physics update so both games can show the same kind of fall.
+- With `house_cat_sync` enabled, guests use the host's position and pose
+  samples from release through landing when the host drops a cat. Playback
+  starts at the confirmed release point and continues into ordinary movement.
+- Waits up to 700 ms for a placement after an unpaired release. A lost lease,
+  disconnect, or missing placement restores the original safe room and
+  position. An older placement cannot interrupt a newer active pickup.
 - Hook validation failure leaves visible dragging disabled.
 
 ## Local observations, 2026-11-19

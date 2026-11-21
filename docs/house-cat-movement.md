@@ -4,11 +4,13 @@
 
 `tools/restart_test.ps1 -HouseCatSync -HouseDragSync -SplitPrimary` starts
 the opt-in experiment on both peers. The host simulates daytime cat movement
-and sends position, facing, the base pose and the three validated short idle
-actions. The client follows fresh samples for a cat in the same room or yard.
+and sends position, facing, the base pose, three short idle actions and the
+`jumpStart` crouch. The client follows fresh samples for a cat in the same room
+or yard. It plays the crouch on the same 220 ms playback timeline as movement
+with an empty animation callback. The host drives takeoff and the jump path.
 Local pickups, replicated drags and nighttime still use their own paths.
 
-House cat synchronization was verified in a two-player session on protocol 101.
+House cat synchronization was verified in a two-player session on protocol 104.
 Social actions and animations with native callbacks still need separate
 validation. The older `-HouseWalk` experiment is still available for comparison.
 

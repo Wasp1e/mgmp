@@ -258,9 +258,6 @@ foreach ($peer in $peers.Keys) {
     $dir = Join-Path $root $peers[$peer]
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     Copy-Item (Join-Path $outDir 'mgmp.dll'), (Join-Path $outDir 'mgmp_loader.exe') $dir -Force
-    # The collar menu's pictures (tools/icons), when they have been rendered.
-    $icons = Join-Path $outDir 'icons'
-    if (Test-Path $icons) { Copy-Item $icons $dir -Recurse -Force }
 
     $list = if ($peer -eq 'host') { $HostCats } elseif ($peer -eq 'client') { $ClientCats } else { @() }
     if ($Players -gt 2) { $list = @() }   # an explicit split is for two players only

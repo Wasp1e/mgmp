@@ -747,7 +747,8 @@ void savefile_on_leaving_house() {
     g.in_run   = true;
     log_line("SAVEFILE", "the run left the House -- sending it to the client first");
     g.entry_flush = true;
-    publish(kNoPeer, /*fresh=*/true);
+    const uint8_t reason = catsync_run_has_soul_jar() ? kSaveFreshWithSoulJar : kSaveFresh;
+    publish(kNoPeer, reason);
     g.entry_flush = false;
 }
 
@@ -1101,7 +1102,18 @@ void savefile_on_message(const SaveFileMsg& m) {
         }
     }
 
-    const bool drop_ours = m.fresh == kSaveFresh ||
+    if (m.fresh == kSaveFreshWithSoulJar) {
+        // The party and map match is insufficient: it omits the CatData
+        // record the item points to. This snapshot also supersedes older saves.
+        free(g_morning.data);
+        g_morning = SaveFileMsg{};
+        free(g_deferred.data);
+        g_deferred = SaveFileMsg{};
+        startrun_map_kept();
+        log_line("SAVEFILE", "<- loading the host's run with a full Soul Jar and its saved cat");
+    }
+
+    const bool drop_ours = m.fresh == kSaveFresh || m.fresh == kSaveFreshWithSoulJar ||
                            (m.fresh == kSaveCatchupInRun && !leave_in_run());
     if (g.applied && !drop_ours) {
         ++g.refused;

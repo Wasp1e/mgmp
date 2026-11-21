@@ -34,7 +34,7 @@ const Bonus kBonuses[] = {
 constexpr size_t kNumBonuses = sizeof(kBonuses) / sizeof(kBonuses[0]);
 
 struct Item {
-    std::string name_key, desc_key, variant_of, durability, kind, frame;
+    std::string name_key, desc_key, variant_of, durability;
     int  bonus[kNumBonuses] = {};
 };
 
@@ -119,8 +119,6 @@ void parse_gon(const char* data, size_t size) {
             else if (field == "desc") it.desc_key = v;
             else if (field == "variant_of") it.variant_of = v;
             else if (field == "durability") it.durability = v;
-            else if (field == "kind") it.kind = v;
-            else if (field == "frame") it.frame = v;
             else
                 for (size_t b = 0; b < kNumBonuses; ++b)
                     if (field == kBonuses[b].key) it.bonus[b] = atoi(v.c_str());
@@ -233,16 +231,6 @@ bool gametext_item(const char* key, ItemText& out) {
         auto t = g.text.find(k);
         return t == g.text.end() ? nullptr : &t->second;
     };
-    // The picture too may be the parent's.
-    const Item* pic = it;
-    for (int d = 0; d < 4 && (pic->kind.empty() || pic->frame.empty()) && !pic->variant_of.empty(); ++d) {
-        const Item* up = find(pic->variant_of);
-        if (!up) break;
-        pic = up;
-    }
-    if (!pic->kind.empty() && !pic->frame.empty())
-        snprintf(out.icon, sizeof(out.icon), "%s_%s", pic->kind.c_str(), pic->frame.c_str());
-
     const std::string* name = text(words->name_key);
     if (name) strip_markup(*name, out.name, sizeof(out.name));
     else snprintf(out.name, sizeof(out.name), "%s", key);

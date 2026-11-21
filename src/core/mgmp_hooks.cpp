@@ -90,6 +90,18 @@ fn_this       o_NextTurn    = nullptr;
 fn_two_ptr    o_GetChoice   = nullptr;
 fn_this_ptr_b o_DoAction    = nullptr;
 fn_this_ptr   o_Trigger     = nullptr;
+using fn_gon_index = const void* (__fastcall*)(const void*, const void*);
+using fn_ability_item = const void* (__fastcall*)(const void*);
+fn_gon_index    o_GonIndex = nullptr;
+fn_ability_item get_ability_item = nullptr;
+thread_local const void* bombardment_target = nullptr;
+thread_local uint64_t bombardment_battle = 0;
+thread_local bool bombardment_logged = false;
+struct NativeShortString {
+    char text[16];
+    uint64_t size;
+    uint64_t capacity = 15;
+};
 fn_this_i32   o_BeginTurn   = nullptr;
 fn_this       o_EndTurn     = nullptr;
 fn_this       o_FrameBegin  = nullptr;
@@ -262,10 +274,79 @@ void __fastcall h_DoAction(void* self, void* ta, unsigned char flag) {
     o_DoAction(self, ta, flag);
 }
 
+// Ranged attack setup and the queued impact code each read this property.
+// Only use the native non-staggered path for Zaratana's VS bombardment in co-op.
+const void* __fastcall h_GonIndex(const void* self, const void* key) {
+    if (bombardment_target && self == bombardment_target) {
+        const uintptr_t site = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base;
+        if ((site == 0x78A4A8 || site == 0x7A26DD || site == 0x821F03) &&
+            lockstep_active() && lockstep_battle_id() == bombardment_battle) {
+            if (!bombardment_logged) {
+                bombardment_logged = true;
+                log_line("LOCKSTEP", "using the non-staggered impact path for Zaratana's bombardment");
+            }
+            static constexpr NativeShortString missing_key{ "", 0 };
+            return o_GonIndex(self, &missing_key);
+        }
+    }
+    return o_GonIndex(self, key);
+}
+
+void install_combat_fixes() {
+    if (!resolve_is_pinned_build()) return;
+    constexpr uint8_t item_entry[] = { 0x48, 0x8B, 0x81, 0x08, 0x07, 0x00, 0x00,
+                                      0x48, 0x85, 0xC0, 0x74, 0x13 };
+    const auto* item = reinterpret_cast<const uint8_t*>(g_base + 0x475C0);
+    uint8_t item_bytes[sizeof(item_entry)];
+    if (mem_read(item, item_bytes, sizeof(item_bytes)) &&
+        memcmp(item_bytes, item_entry, sizeof(item_entry)) == 0)
+        get_ability_item = reinterpret_cast<fn_ability_item>(item);
+    else
+        log_line("LOCKSTEP", "!! could not verify the Soul Jar's native item lookup");
+
+    constexpr uint8_t gon_entry[] = { 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89,
+                                     0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x30 };
+    auto* gon = reinterpret_cast<uint8_t*>(g_base + 0x942CA0);
+    uint8_t gon_bytes[sizeof(gon_entry)];
+    if (!mem_read(gon, gon_bytes, sizeof(gon_bytes)) ||
+        memcmp(gon_bytes, gon_entry, sizeof(gon_entry)) != 0 ||
+        MH_CreateHook(gon, reinterpret_cast<void*>(&h_GonIndex),
+                      reinterpret_cast<void**>(&o_GonIndex)) != MH_OK ||
+        MH_EnableHook(gon) != MH_OK) {
+        o_GonIndex = nullptr;
+        log_line("LOCKSTEP", "!! could not install the Zaratana bombardment fix");
+    }
+}
+
 void __fastcall h_Trigger(void* self, void* ta) {
     Who    w(self, "abil");
     TaDump d(ta);
     log_line("TRIGGER", "%s %s", w.text, d.text);
+    char gon[64];
+    const bool coop = lockstep_active() && ability_gon_name(self, gon, sizeof(gon));
+    if (coop && o_GonIndex && strcmp(gon, "ZaratanaVSBombardment") == 0) {
+        const void* def = nullptr;
+        if (mem_read(static_cast<const uint8_t*>(self) + kAbilData, &def, sizeof(def)) && def) {
+            static constexpr NativeShortString target_key{ "target", 6 };
+            const uint64_t battle = lockstep_battle_id();
+            if (bombardment_battle != battle) bombardment_logged = false;
+            bombardment_battle = battle;
+            bombardment_target = o_GonIndex(def, &target_key);
+        }
+    }
+    if (coop && get_ability_item && strcmp(gon, "tk_SoulJar") == 0) {
+        // QueueSpawnAnimation loads CatData by the item's aux key and
+        // copy-constructs from the result without a null check.
+        const void* item = get_ability_item(self);
+        int32_t key = -1;
+        if (item && mem_read(static_cast<const uint8_t*>(item) + 0x4C, &key, sizeof(key)) &&
+            key >= 0 && !catsync_has_cat_key(static_cast<uint64_t>(key))) {
+            char reason[112];
+            snprintf(reason, sizeof(reason), "Soul Jar's saved cat (%d) is missing", key);
+            lockstep_halt_action(reason);
+            return;
+        }
+    }
     o_Trigger(self, ta);
 }
 
@@ -877,6 +958,7 @@ int hooks_install() {
     }
 
     rng_set_base(g_base);
+    install_combat_fixes();
     catsync_set_base(g_base);
     invsync_set_base(g_base);
     runhist_set_base(g_base);

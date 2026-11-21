@@ -5,7 +5,7 @@ import sys as _s, os as _o; _s.path.insert(0, _o.path.join(_o.path.dirname(_o.pa
 import os
 from gpak import GPak
 import zlib, struct, collections, sys
-g=GPak(os.environ.get('MEWGENICS_GPAK', r'D:/SteamLibrary/steamapps/common/Mewgenics/resources.gpak'))
+g=GPak(os.environ.get('MEWGENICS_GPAK', 'C:/Program Files (x86)/Steam/steamapps/common/Mewgenics/resources.gpak'))
 def load(name):
     b=g.read(name)
     sig=b[:3]

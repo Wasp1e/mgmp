@@ -9,7 +9,7 @@ from swf import symbols
 from bmp import png
 from sprites import subtags
 OUT = sys.argv[1]; os.makedirs(OUT, exist_ok=True)
-g = GPak(os.environ.get('MEWGENICS_GPAK', r'D:/SteamLibrary/steamapps/common/Mewgenics/resources.gpak'))
+g = GPak(os.environ.get('MEWGENICS_GPAK', 'C:/Program Files (x86)/Steam/steamapps/common/Mewgenics/resources.gpak'))
 # collars: every labelled frame of ClassCollar
 ui = Swf('swfs/ui.swf'); sym = {v: k for k, v in symbols(ui.b).items()}; sym_ui = sym
 cid = sym['ClassCollar']; code, p, ln = ui.ch[cid]; f = 0

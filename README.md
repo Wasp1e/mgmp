@@ -4,7 +4,7 @@ An unofficial mod that lets two people play one Mewgenics campaign together:
 the same House, the same runs, the same cats and the same fights, each player
 in charge of their own half of the cats.
 
-Version **0.25** (network protocol 92 in this development build), for Mewgenics **1.1.21239**.
+Version **0.3 pre-release** (network protocol 104), for Mewgenics **1.1.21239**.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the
@@ -26,6 +26,9 @@ Mewgenics. It is a hobby project built by reading the game's compiled code.
 **The House**
 - The friend's game follows the host's House: NPC offices and their dialogs
   (the host's clicks move them on both screens), quest rewards, cutscenes.
+- Both players can move items between storage and trash and see each other
+  drag and release cats. The prebuilt release enables synchronized cat
+  movement and animations during the day, including the host's drop path.
 - After the end of the day both players get the night's report — who bred,
   who fought, which kittens were born — on a torn paper note.
 - Only the host ends the day.

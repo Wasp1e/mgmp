@@ -496,6 +496,8 @@ struct Move {
     uint64_t key; uint32_t index, count, kind; uint64_t at;
     uint8_t from = 255;
     uint64_t drag_sequence = 0;
+    double drop_xy[2] = {};
+    bool has_drop_xy = false;
 };
 constexpr uint32_t kMoveDeliver   = 0xD;     // a pipe hand-over (index = the NPC choice)
 constexpr uint64_t kDeliverSettleMs = 900;   // the pipe here takes the cat and opens its map first
@@ -532,7 +534,7 @@ void drag_install();
 bool remote_drag_cat(void* cat);
 void finish_remote_drag(void* cat, bool restore);
 bool drag_move_allowed(uint64_t key, uint8_t from);
-void drag_publish_final(void* cat);
+uint64_t drag_publish_final(void* cat, double (&pos)[2]);
 void drag_guard_note(void* cat, bool box);
 
 struct List { uint32_t n = 0; void** data = nullptr; };
@@ -910,7 +912,8 @@ void __fastcall drop(void* drag) {
         mem_write((uint8_t*)drag + kDrag_Cat, &none, sizeof(none));
         return; // losing a simultaneous pickup must not place the winner's cat
     }
-    drag_publish_final(cat);
+    double drop_xy[2] = {};
+    const uint64_t drag_sequence = drag_publish_final(cat, drop_xy);
     o_drop(drag);
     if (!cat || !key || !sharing()) return;
     // Do not immediately overwrite a local player's newly placed cat with an
@@ -925,7 +928,7 @@ void __fastcall drop(void* drag) {
         m.kind  = kChoiceHouseMove;
         m.cat   = key;
         m.index = kOutside;
-        if (drag_ready()) m.node_seed = g_drag_sequence;
+        m.node_seed = drag_sequence;
         net_send_choice(m);
         log_line("HOUSE", "-> %s (%016llx) put outside", night_cat_name(key).c_str(), (unsigned long long)key);
         return;
@@ -946,7 +949,16 @@ void __fastcall drop(void* drag) {
         m.index = i;
         m.count = places.n;
         m.aux   = kind;
-        if (drag_ready()) m.node_seed = g_drag_sequence;
+        m.node_seed = drag_sequence;
+        if (drag_sequence && (kind == 1 || kind == 3)) {
+            // FurnitureGrid validates add() against the cat's current
+            // position. Carry the exact point even if release arrives in
+            // the same update as the final interpolated drag sample.
+            uint64_t bits[2];
+            memcpy(bits, drop_xy, sizeof(bits));
+            snprintf(m.name, sizeof(m.name), "%016llx%016llx",
+                     (unsigned long long)bits[0], (unsigned long long)bits[1]);
+        }
         net_send_choice(m);
         const std::string name = night_cat_name(key);
         log_line("HOUSE", "-> %s (%016llx) put in %s %u of %u%s", name.c_str(), (unsigned long long)key,
@@ -1010,12 +1022,23 @@ void* drag_hand(void* comps, void*& cat) {
     return drag;
 }
 
-void drag_position(void* cat, double x, double y) {
+bool read_drag_position(void* cat, double (&pos)[2]) {
+    const uint8_t* transform = nullptr;
+    return mem_read((const uint8_t*)cat + 0x40, &transform, sizeof(transform)) && transform &&
+           mem_read(transform + 0x80, pos, sizeof(pos));
+}
+
+bool valid_drag_position(const double (&pos)[2]) {
+    return std::abs(pos[0]) <= 10000 && std::abs(pos[1]) <= 10000;
+}
+
+bool drag_position(void* cat, double x, double y) {
     void* transform = nullptr;
     if (mem_read((const uint8_t*)cat + 0x40, &transform, sizeof(transform)) && transform) {
         const double pos[2] = { x, y };
-        mem_write((uint8_t*)transform + 0x80, pos, sizeof(pos));
+        return mem_write((uint8_t*)transform + 0x80, pos, sizeof(pos));
     }
+    return false;
 }
 
 void drag_depth(void* cat, int32_t depth) {
@@ -1101,14 +1124,14 @@ void finish_remote_drag(void* cat, bool restore) {
     void* holder = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder));
     if (restore && !holder && !in_box(cat)) {
+        x = v.home_x; y = v.home_y;
+        drag_position(cat, x, y);
         List places;
         if (v.home != kOutside && list_of(g_drag_scene, kComps_Places, places) &&
             places.n == v.places) {
             void* home = item(places, v.home);
             if (drag_safe_room(home)) safe_place(home, cat);
         }
-        x = v.home_x; y = v.home_y;
-        drag_position(cat, x, y);
     }
     drag_depth(cat, v.depth + (g_local_drag_key == key ? 100000 : 0));
     drag_stop_physics(cat, x, y);
@@ -1116,20 +1139,16 @@ void finish_remote_drag(void* cat, bool restore) {
              restore ? "restored" : "placed", (unsigned long long)key, (unsigned)v.peer);
 }
 
-void drag_publish_final(void* cat) {
-    if (!drag_ready() || !sharing() || !cat) return;
-    void* transform = nullptr;
-    double pos[2] = {};
-    if (!mem_read((const uint8_t*)cat + 0x40, &transform, sizeof(transform)) || !transform ||
-        !mem_read((const uint8_t*)transform + 0x80, pos, sizeof(pos)) ||
-        !std::isfinite(pos[0]) || !std::isfinite(pos[1]) ||
-        std::abs(pos[0]) > 10000 || std::abs(pos[1]) > 10000) return;
+uint64_t drag_publish_final(void* cat, double (&pos)[2]) {
+    if (!drag_ready() || !sharing() || !cat ||
+        !read_drag_position(cat, pos) || !valid_drag_position(pos)) return 0;
     const float x = (float)pos[0], y = (float)pos[1];
     ChoiceMsg m{};
     m.kind = kChoiceHouseDragTrace; m.cat = cat_key(cat); m.index = 1;
     m.node_seed = ++g_drag_sequence;
     memcpy(&m.count, &x, sizeof(x)); memcpy(&m.aux, &y, sizeof(y));
     net_send_choice(m);
+    return m.node_seed;
 }
 
 void __fastcall drag_cat_update(void* cat) {
@@ -1396,19 +1415,35 @@ void apply(void* comps, const Move& mv) {
                  mv.index, place ? kind_name(kind_of(place)) : "nothing", kind_name(mv.kind), name.c_str());
         return;
     }
-    finish_remote_drag(cat, false);
     void* was = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &was, sizeof(was));
-    if (was == place) return;
+    const bool room = drag_safe_room(place);
+    double previous_xy[2] = {};
+    const bool exact_drop = room && drag_ready() && mv.has_drop_xy &&
+                            read_drag_position(cat, previous_xy) &&
+                            drag_position(cat, mv.drop_xy[0], mv.drop_xy[1]);
+    if (!exact_drop) {
+        finish_remote_drag(cat, false);
+        if (was == place) return;
+    }
     if (mv.kind == 2) {   // the other player's cat down this game's pipe: its NPC is theirs to pick
         g_pipe_remote_key = mv.key;
         g_pipe_remote_at  = GetTickCount64();
     }
     g_applying = true;
-    const bool ok = safe_place(place, cat);
+    const bool ok = was == place || safe_place(place, cat);
     g_applying = false;
-    log_line("HOUSE", ok ? "<- %s (%016llx) put in %s %u, as the other player did"
-                         : "!! putting %s (%016llx) in %s %u faulted",
+    // The native add can decline a room without throwing an exception.
+    void* holder = nullptr;
+    const bool placed = ok && (!room ||
+        (mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) && holder == place));
+    if (exact_drop) {
+        if (!placed) drag_position(cat, previous_xy[0], previous_xy[1]);
+        finish_remote_drag(cat, !placed);
+        if (placed) drag_stop_physics(cat, mv.drop_xy[0], mv.drop_xy[1]);
+    }
+    log_line("HOUSE", placed ? "<- %s (%016llx) put in %s %u, as the other player did"
+                             : "!! the game did not put %s (%016llx) in %s %u",
              name.c_str(), (unsigned long long)mv.key, kind_name(mv.kind), mv.index);
 }
 
@@ -1475,6 +1510,285 @@ struct NightClick { uint32_t n, action, arg; };
 NightClick g_clicks[16];
 uint32_t   g_click_n = 0;
 bool night_shared();
+
+// The two calls from TrashScreenItemBox2::click into Inventory's move routine.
+// Other callers use it for game effects and should keep their native behavior.
+constexpr uintptr_t kRva_DrawerMove = 0x2E19B0;
+constexpr uintptr_t kRva_MoveToTrash = 0x213E90;
+constexpr uintptr_t kRva_MoveToStorage = 0x21409D;
+constexpr uintptr_t kRva_DrawerRefresh = 0x211700;
+constexpr uintptr_t kRva_DrawersVtbl = 0xEE6688;
+constexpr uintptr_t kComps_InventoryDrawers = 0x48D0;
+constexpr uintptr_t kRva_InventorySlot = 0x13C7560;
+constexpr uintptr_t kRva_IsQuestItem = 0x2DDFE0;
+constexpr uintptr_t kRva_CannotTrash = 0x2DE0A0;
+constexpr uintptr_t kRva_EraseBucketItem = 0x2E24D0;
+constexpr uintptr_t kRva_SaveHouse = 0x3BDCF0;
+constexpr uintptr_t kDir_CurrentDay = 0x580;
+constexpr uintptr_t kProgression_StorageUpgrade = 0x114;
+constexpr uintptr_t kHouseStore_StorageUpgrade = 0xBC;
+constexpr uint32_t kStorage = 1, kTrash = 2;
+constexpr uint32_t kMaxDrawerItems = 4096;
+
+using fn_drawer_move = void* (__fastcall*)(void*, uint64_t, uint32_t);
+using fn_item_test = bool (__fastcall*)(const void*);
+using fn_bucket_erase = void (__fastcall*)(void*, const uint64_t*);
+fn_drawer_move o_drawer_move = nullptr;
+
+using Equipment = const uint8_t*;
+uint8_t* drawer_bucket(void* inventory, uint32_t loc) {
+    return (uint8_t*)inventory + (loc == kStorage ? kInv_Storage : kInv_Trash);
+}
+
+template <typename Visit>
+bool visit_drawer_items(void* inventory, uint32_t loc, Visit visit) {
+    const uint8_t* head = nullptr;
+    if (!mem_read(drawer_bucket(inventory, loc) + 8, &head, sizeof(head)) || !head)
+        return false;
+    const uint8_t* node = head;
+    for (uint32_t n = 0; n <= kMaxDrawerItems; ++n) {
+        if (!mem_read(node, &node, sizeof(node)) || !node) return false;
+        if (node == head) return true;
+        if (n == kMaxDrawerItems) return false;
+        visit(node + 0x18);
+    }
+    return false;
+}
+
+uint64_t drawer_fingerprint(Equipment item) {
+    // The game remints +0 IDs on load. The two strings and the saved item
+    // fields distinguish variants. +0x54 is the drawer's local sort position,
+    // and hovering marks the item seen by clearing bit 1 at +0x50.
+    char str[4097];
+    if (!mem_read_std_string(item + 8, str, sizeof(str))) return 0;
+    uint64_t hash = fnv(0xCBF29CE484222325ull, str, strlen(str) + 1);
+    if (!mem_read_std_string(item + 0x28, str, sizeof(str))) return 0;
+    hash = fnv(hash, str, strlen(str) + 1);
+    uint32_t fields[3], category;
+    uint8_t variant;
+    if (!mem_read(item + 0x48, fields, sizeof(fields)) ||
+        !mem_read(item + 0x58, &variant, sizeof(variant)) ||
+        !mem_read(item + 0x5C, &category, sizeof(category))) return 0;
+    fields[2] &= ~2u;
+    hash = fnv(hash, fields, sizeof(fields));
+    hash = fnv(hash, &variant, sizeof(variant));
+    return fnv(hash, &category, sizeof(category));
+}
+
+struct DrawerMatch {
+    Equipment item = nullptr;
+    uint32_t count = 0;
+};
+
+DrawerMatch drawer_match(void* inventory, uint32_t loc, uint64_t fingerprint) {
+    DrawerMatch match;
+    if (!visit_drawer_items(inventory, loc, [&](Equipment item) {
+            if (drawer_fingerprint(item) != fingerprint) return;
+            if (!match.item) match.item = item;
+            ++match.count;
+        })) return {};
+    return match;
+}
+
+bool drawer_context(void*& director, uint64_t& day) {
+    return net_active() && net_peer_count() >= 2 && !leave_busy() &&
+           !g_night_at && !g_night_go && leave_scene_up(kScene_House) &&
+           mem_read((const void*)(g_base + kRva_MewDirectorPtr), &director, sizeof(director)) && director &&
+           mem_read((const uint8_t*)director + kDir_CurrentDay, &day, sizeof(day));
+}
+
+void* live_inventory_drawers(const void* director) {
+    const uint8_t* scenes = nullptr;
+    uintptr_t begin = 0, end = 0;
+    if (!mem_read((const uint8_t*)director + kDir_SceneDirector, &scenes, sizeof(scenes)) ||
+        !mem_read(scenes, &begin, sizeof(begin)) ||
+        !mem_read(scenes + kDirector_ScenesEnd, &end, sizeof(end)) ||
+        !begin || end < begin || (end - begin) % sizeof(void*) ||
+        (end - begin) / sizeof(void*) > 64) return nullptr;
+    for (uintptr_t at = begin; at < end; at += sizeof(void*)) {
+        const uint8_t* scene = nullptr;
+        uint8_t dying = 1;
+        void* comps = nullptr;
+        List drawers;
+        if (!mem_read((const void*)at, &scene, sizeof(scene)) || !scene ||
+            !mem_read(scene + kScene_Destroying, &dying, sizeof(dying)) || dying ||
+            !mem_read(scene + kScene_Comps, &comps, sizeof(comps)) || !comps ||
+            !list_of(comps, kComps_InventoryDrawers, drawers)) continue;
+        void* drawer = item(drawers, 0);
+        uintptr_t vtable = 0;
+        void* views[2] = {};
+        if (mem_read(drawer, &vtable, sizeof(vtable)) && vtable == g_base + kRva_DrawersVtbl &&
+            mem_read((const uint8_t*)drawer + 0x38, views, sizeof(views)) && views[0] && views[1])
+            return drawer;
+    }
+    return nullptr;
+}
+
+bool safe_drawer_call(uintptr_t rva, void* self) {
+    __try { ((fn_house)(g_base + rva))(self); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool safe_drawer_move(void* inventory, uint64_t id, uint32_t dest, void*& result) {
+    __try { result = o_drawer_move(inventory, id, dest); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool safe_drawer_erase(void* bucket, uint64_t id) {
+    __try { ((fn_bucket_erase)(g_base + kRva_EraseBucketItem))(bucket, &id); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool safe_item_test(uintptr_t rva, Equipment item, bool& result) {
+    __try { result = ((fn_item_test)(g_base + rva))(item); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool can_move_drawer_item(void* director, void* inventory, Equipment item, uint32_t dest) {
+    bool quest = false;
+    if (!safe_item_test(kRva_IsQuestItem, item, quest)) return false;
+    if (dest == kTrash) {
+        bool protected_item = true;
+        uint32_t flags = 0;
+        return safe_item_test(kRva_CannotTrash, item, protected_item) && !protected_item &&
+               (!quest || (mem_read(item + 0x50, &flags, sizeof(flags)) && !(flags & 0x2000)));
+    }
+
+    uint32_t category = 0;
+    if (!mem_read(item + 0x5C, &category, sizeof(category)) || category == 5) return false;
+    if (quest) return true;
+
+    // TrashScreenItemBox2::click checks the number of regular items against
+    // min(400, (3 + House upgrade)^2 + progression upgrade). Quest items
+    // use their own tab and do not occupy these slots.
+    const uint8_t* house = nullptr;
+    const uint8_t* progression = nullptr;
+    int32_t house_upgrade = 0, progression_upgrade = 0;
+    if (!mem_read((const void*)(g_base + kRva_FurnitureStore), &house, sizeof(house)) || !house ||
+        !mem_read(house + kHouseStore_StorageUpgrade, &house_upgrade, sizeof(house_upgrade)) ||
+        !mem_read((uint8_t*)director + kDir_Progression, &progression, sizeof(progression)) || !progression ||
+        !mem_read(progression + kProgression_StorageUpgrade, &progression_upgrade, sizeof(progression_upgrade)))
+        return false;
+    const int64_t width = (int64_t)house_upgrade + 3;
+    const int64_t capacity = width * width + progression_upgrade;
+    int32_t stored = 0;
+    bool read_ok = true;
+    return visit_drawer_items(inventory, kStorage, [&](Equipment entry) {
+               bool is_quest = false;
+               read_ok &= safe_item_test(kRva_IsQuestItem, entry, is_quest);
+               if (!is_quest) ++stored;
+           }) && read_ok && stored < capacity && stored < 400;
+}
+
+void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
+    const uintptr_t ret = (uintptr_t)_ReturnAddress() - g_base;
+    if ((dest != kStorage || ret != kRva_MoveToStorage + 5) &&
+        (dest != kTrash || ret != kRva_MoveToTrash + 5))
+        return o_drawer_move(inventory, id, dest);
+
+    void* director = nullptr;
+    uint64_t day = 0;
+    const bool host = net_role() == NetRole::Host;
+    if (!drawer_context(director, day)) {
+        if (!host && net_active() && net_peer_count() >= 2) return nullptr;
+        return o_drawer_move(inventory, id, dest);
+    }
+    const uint32_t source = dest == kStorage ? kTrash : kStorage;
+    uint64_t fingerprint = 0;
+    const bool read = visit_drawer_items(inventory, source, [&](Equipment item) {
+        uint64_t local_id = 0;
+        if (mem_read(item, &local_id, sizeof(local_id)) && local_id == id)
+            fingerprint = drawer_fingerprint(item);
+    });
+    const DrawerMatch match = read && fingerprint ? drawer_match(inventory, source, fingerprint) : DrawerMatch{};
+    if (!match.count) {
+        log_line("HOUSE", "!! could not identify the item for a shared drawer move");
+        return host ? o_drawer_move(inventory, id, dest) : nullptr;
+    }
+
+    ChoiceMsg m{};
+    m.kind = kChoiceHouseItemMove;
+    m.index = dest;
+    m.count = match.count;
+    m.node_seed = fingerprint;
+    m.cat = day;
+    void* result = host ? o_drawer_move(inventory, id, dest) : nullptr;
+    if (host && !result && dest != kStorage) return result;
+    // Some items become coins or furniture when stored. Only the host runs
+    // that conversion. The other peer erases the spent item on confirmation.
+    m.aux = host && !result ? 1 : 0;
+    if (!net_send_choice(m))
+        log_line("HOUSE", "!! could not send the drawer move");
+    return result;
+}
+
+void on_drawer_move(const ChoiceMsg& m, uint8_t from) {
+    const bool host = net_role() == NetRole::Host;
+    if (!o_drawer_move || from == kNoPeer || (host ? from == kHostPeer : from != kHostPeer) ||
+        (m.index != kStorage && m.index != kTrash) || !m.node_seed || !m.count ||
+        m.count > kMaxDrawerItems || m.aux > 1 || (m.aux && (host || m.index != kStorage))) return;
+
+    void* director = nullptr;
+    void* inventory = nullptr;
+    uint64_t day = 0;
+    if (!drawer_context(director, day) || m.cat != day ||
+        !mem_read((const void*)(g_base + kRva_InventorySlot), &inventory, sizeof(inventory)) || !inventory) return;
+    const uint32_t source = m.index == kStorage ? kTrash : kStorage;
+    const DrawerMatch match = drawer_match(inventory, source, m.node_seed);
+    uint64_t id = 0;
+    if (!match.item || !mem_read(match.item, &id, sizeof(id)) ||
+        (host && (match.count != m.count || !can_move_drawer_item(director, inventory, match.item, m.index)))) {
+        log_line("HOUSE", "!! drawer move declined: source item or destination changed");
+        return;
+    }
+
+    void* result = nullptr;
+    const bool moved = m.aux ? safe_drawer_erase(drawer_bucket(inventory, source), id) :
+                       safe_drawer_move(inventory, id, m.index, result) &&
+                       (result || (host && m.index == kStorage));
+    if (!moved) {
+        log_line("HOUSE", "!! the game could not apply the drawer move");
+        return;
+    }
+    if (host) {
+        ChoiceMsg confirmed = m;
+        confirmed.aux = result ? 0 : 1;
+        if (!net_send_choice(confirmed))
+            log_line("HOUSE", "!! could not confirm the drawer move to the other players");
+    }
+
+    if (void* drawer = live_inventory_drawers(director)) {
+        if (!safe_drawer_call(kRva_DrawerRefresh, drawer))
+            log_line("HOUSE", "!! refreshing the shared drawers faulted");
+    } else if (host && !safe_drawer_call(kRva_SaveHouse, director)) {
+        // The ordinary close button saves when the host has the drawers open.
+        log_line("HOUSE", "!! saving the guest's drawer move faulted");
+    }
+    log_line("HOUSE", "<- applied shared drawer move to %s", m.index == kStorage ? "storage" : "trash");
+}
+
+void install_drawer_move(uintptr_t base) {
+    auto matches = [base](uintptr_t rva, const char* bytes, size_t n) {
+        uint8_t have[8];
+        return mem_read((const void*)(base + rva), have, n) && memcmp(have, bytes, n) == 0;
+    };
+    void* target = (void*)(base + kRva_DrawerMove);
+    if (!matches(kRva_MoveToTrash, "\xE8\x1B\xDB\x0C\x00", 5) ||
+        !matches(kRva_MoveToStorage, "\xE8\x0E\xD9\x0C\x00", 5) ||
+        !matches(kRva_DrawerMove, "\x48\x89\x5C\x24\x08\x48\x89\x54", 8) ||
+        !matches(kRva_DrawerRefresh, "\x48\x89\x4C\x24\x08\x55\x53\x56", 8) ||
+        !matches(kRva_IsQuestItem, "\x40\x53\x48\x83\xEC\x40\x48\x8B", 8) ||
+        !matches(kRva_CannotTrash, "\x48\x89\x5C\x24\x08\x57\x48\x83", 8) ||
+        !matches(kRva_EraseBucketItem, "\x40\x53\x48\x83\xEC\x20\x44\x0F", 8) ||
+        !matches(kRva_SaveHouse, "\x48\x89\x5C\x24\x18\x48\x89\x74", 8) ||
+        MH_CreateHook(target, (void*)&drawer_move, (void**)&o_drawer_move) != MH_OK ||
+        MH_EnableHook(target) != MH_OK) {
+        o_drawer_move = nullptr;
+        log_line("HOUSE", "!! could not hook shared storage and trash moves");
+        return;
+    }
+    log_line("HOUSE", "shared storage and trash moves hooked");
+}
 
 void __fastcall inter_ok(void* closure) {
     void* scene = nullptr;
@@ -2180,6 +2494,7 @@ const char* house_note() {
 void house_set_base(uintptr_t base) {
     if (o_drop) return;
     g_base = base;
+    if (!o_drawer_move) install_drawer_move(base);
     {
         void** slot = (void**)(base + kRva_GridVtbl + 34 * 8);
         void* have = nullptr;
@@ -2304,6 +2619,10 @@ void house_set_base(uintptr_t base) {
 }
 
 bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
+    if (m.kind == kChoiceHouseItemMove) {
+        on_drawer_move(m, from);
+        return true;
+    }
     if (m.kind == kChoiceHouseDragTrace) {
         if ((!config().house_drag_trace && !config().house_drag_sync) ||
             !g_cs_ready || !m.cat || !m.node_seed || m.index > 1 ||
@@ -2415,9 +2734,17 @@ bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
     }
     if (m.kind != kChoiceHouseMove) return false;
     if (!g_cs_ready || !place_add) return true;
+    Move move{m.cat, m.index, m.count, m.aux, GetTickCount64(), from, m.node_seed};
+    if (m.node_seed && (m.aux == 1 || m.aux == 3) && strlen(m.name) == 32) {
+        unsigned long long bits[2];
+        if (sscanf_s(m.name, "%16llx%16llx", &bits[0], &bits[1]) == 2) {
+            memcpy(move.drop_xy, bits, sizeof(bits));
+            move.has_drop_xy = valid_drag_position(move.drop_xy);
+        }
+    }
     EnterCriticalSection(&g_cs);
     if (g_move_n < 32)
-        g_moves[g_move_n++] = Move{ m.cat, m.index, m.count, m.aux, GetTickCount64(), from, m.node_seed };
+        g_moves[g_move_n++] = move;
     LeaveCriticalSection(&g_cs);
     return true;
 }

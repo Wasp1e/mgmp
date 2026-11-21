@@ -3,6 +3,7 @@
 #
 #   .\tools\restart_test.ps1         # asks before closing running games
 #   .\tools\restart_test.ps1 -Force  # close running games without asking
+#   .\tools\restart_test.ps1 -SplitPrimary  # host left, client right
 #
 # Both instances use the real Mewgenics save directory. Close the games
 # normally first if you need to make sure the current session is saved.
@@ -14,6 +15,7 @@ param(
     [switch]$HouseActions,
     [switch]$HouseDrag,
     [switch]$HouseDragSync,
+    [switch]$SplitPrimary,
     [string]$BuildDir = 'build',
     [string]$Config = 'Release'
 )
@@ -46,38 +48,72 @@ if (-not ('MgmpTestWindow' -as [type])) {
 using System;
 using System.Runtime.InteropServices;
 public static class MgmpTestWindow {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Rect { public int Left, Top, Right, Bottom; }
+
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(IntPtr window, IntPtr after,
         int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr window, out Rect rect);
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
 }
 '@
 }
 
-$screens = @([System.Windows.Forms.Screen]::AllScreens | Sort-Object { -not $_.Primary }, { $_.Bounds.X }, { $_.Bounds.Y })
-$games = @(Get-Process Mewgenics -ErrorAction SilentlyContinue | Sort-Object StartTime)
-if ($games.Count -ne 2) {
-    Write-Warning "Expected two game processes, found $($games.Count); windows were not moved."
-    return
-}
-if ($screens.Count -lt 2) {
-    Write-Warning 'Only one display was found; windows were not moved.'
+$deadline = (Get-Date).AddSeconds(25)
+do {
+    $games = @(Get-Process Mewgenics -ErrorAction SilentlyContinue | Sort-Object StartTime)
+    $visible = @($games | Where-Object {
+        $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -like 'Mewgenics*'
+    })
+    if ($games.Count -eq 2 -and $visible.Count -eq 2) { break }
+    Start-Sleep -Milliseconds 500
+} while ((Get-Date) -lt $deadline)
+if ($games.Count -ne 2 -or $visible.Count -ne 2) {
+    Write-Warning "Expected two game windows, found $($visible.Count); windows were not moved."
     return
 }
 
-for ($i = 0; $i -lt 2; ++$i) {
-    $game = $games[$i]
-    $role = if ($i -eq 0) { 'host' } else { 'client' }
-    if ($game.MainWindowHandle -eq [IntPtr]::Zero) {
-        Write-Warning "No window found for $role (PID $($game.Id)); move it manually."
-        continue
+# Use physical monitor and window coordinates even when the displays have
+# different scales.
+$dpi = [MgmpTestWindow]::SetThreadDpiAwarenessContext([IntPtr](-4))
+try {
+    $screens = @([System.Windows.Forms.Screen]::AllScreens | Sort-Object { -not $_.Primary }, { $_.Bounds.X }, { $_.Bounds.Y })
+    if ($screens.Count -lt 2) { $SplitPrimary = $true }
+    for ($i = 0; $i -lt 2; ++$i) {
+        $window = $games[$i].MainWindowHandle
+        $role = if ($i -eq 0) { 'host' } else { 'client' }
+        $x = 0
+        $width = 0
+        $height = 0
+        $flags = 0x15 # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+        if ($SplitPrimary) {
+            $area = $screens[0].WorkingArea
+            $half = $area.Width -shr 1
+            $x = $area.Left + $i * $half
+            $width = if ($i -eq 0) { $half } else { $area.Width - $half }
+            $height = $area.Height
+            $flags = 0x14 # Allow resizing
+            if ([MgmpTestWindow]::IsZoomed($window)) { [MgmpTestWindow]::ShowWindow($window, 9) | Out-Null }
+        } else {
+            $area = $screens[$i].WorkingArea
+            $x = $area.Left
+        }
+        if (-not [MgmpTestWindow]::SetWindowPos($window, [IntPtr]::Zero, $x, $area.Top, $width, $height, $flags)) {
+            Write-Warning "Could not move $role window."
+            continue
+        }
+        $rect = New-Object 'MgmpTestWindow+Rect'
+        if ([MgmpTestWindow]::GetWindowRect($window, [ref]$rect)) {
+            Write-Host "$role window on $($area.X),$($area.Y): $($rect.Left),$($rect.Top) $($rect.Right - $rect.Left)x$($rect.Bottom - $rect.Top)"
+        }
     }
-    $area = $screens[$i].WorkingArea
-    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE: preserve the game's size
-    # and do not steal focus while putting each window on its monitor.
-    if ([MgmpTestWindow]::SetWindowPos($game.MainWindowHandle, [IntPtr]::Zero,
-            $area.X, $area.Y, 0, 0, 0x15)) {
-        Write-Host "$role window moved to $($screens[$i].DeviceName)."
-    } else {
-        Write-Warning "Could not move $role window; move it manually."
-    }
+} finally {
+    if ($dpi -ne [IntPtr]::Zero) { [MgmpTestWindow]::SetThreadDpiAwarenessContext($dpi) | Out-Null }
 }

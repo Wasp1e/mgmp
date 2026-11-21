@@ -51,7 +51,9 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 99; // 99 carries the exact drop point for shared House cat dragging.
+constexpr uint32_t kProtoVersion = 101; // 101 sends the House animator's actual facing.
+// 100 adds experimental host-owned House cat movement.
+// 99 carries the exact drop point for shared House cat dragging.
 // 98 synchronizes transfers between House storage and trash.
 // 96 syncs the Dybbuk backflip RNG, 95 reads the native summoner link, 94 assigns reused slots, 93 resolves Cannibalize.
 /* Previous protocol declaration and wire history:
@@ -820,6 +822,11 @@ constexpr uint8_t kChoiceHousePurse   = 46;
 // The client requests a move and the host confirms it. A confirmation with
 // aux = 1 means the game's on-store effect consumed the item.
 constexpr uint8_t kChoiceHouseItemMove = 50;
+// Host -> client, House cat snapshot. index/count are float x/y, node_seed
+// is the day, aux packs room, room count, pose and facing, name is the
+// animation variant and an optional "|" followed by an idle action.
+// Room 0x1FFF is outside. Facing uses bits 30 and 31 for -1, 0, +1 or unknown.
+constexpr uint8_t kChoiceHouseCatState = 51;
 // Host -> client: the NPC office's conversation number `index` is `name` (see
 // mgmp_cutscene.cpp, office_talk). Empty name: the office has no more to say.
 constexpr uint8_t kChoiceOfficeTalk   = 17;

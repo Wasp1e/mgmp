@@ -522,6 +522,23 @@ struct WalkSample {
 std::map<uint64_t, WalkSample> g_walk_pending;
 struct HouseAction { uint64_t key, at; uint32_t place, state; char name[16]; };
 std::map<uint64_t, HouseAction> g_action_pending;
+struct HouseCatSnapshot {
+    uint64_t received_at = 0, day = 0, last_step = 0;
+    uint32_t room = 0, rooms = 0, pose = 15;
+    float x = 0, y = 0;
+    int32_t facing = 2; // -1, 0, +1 are Animator commands. 2 means unreadable.
+    char variant[16] = {};
+    char action[16] = {};
+    bool action_replayed = false;
+    void* holder = nullptr;
+};
+constexpr uint32_t kCatSnapshotOutside = 0x1FFF;
+constexpr uint64_t kCatSnapshotLifetimeMs = 1200;
+std::map<uint64_t, HouseCatSnapshot> g_cat_snapshots, g_cat_snapshots_pending;
+std::map<uint64_t, uint64_t> g_cat_dropped_until;
+void* g_cat_snapshot_scene = nullptr;
+uint64_t g_cat_snapshot_day = 0;
+bool g_cat_snapshot_applied = false;
 HouseDragTracker g_drag_tracker;
 uint64_t g_drag_sequence = 0;
 uint64_t g_local_drag_key = 0;
@@ -534,6 +551,7 @@ void drag_install();
 bool remote_drag_cat(void* cat);
 void finish_remote_drag(void* cat, bool restore);
 bool drag_move_allowed(uint64_t key, uint8_t from);
+bool apply_house_cat_snapshot(void* cat);
 uint64_t drag_publish_final(void* cat, double (&pos)[2]);
 void drag_guard_note(void* cat, bool box);
 
@@ -919,6 +937,8 @@ void __fastcall drop(void* drag) {
     // Do not immediately overwrite a local player's newly placed cat with an
     // older host sample while the host is processing the placement.
     g_walk_pause_until = GetTickCount64() + 3000;
+    if (config().house_cat_sync && net_role() == NetRole::Client)
+        g_cat_dropped_until[key] = GetTickCount64() + 800;
     void* now = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &now, sizeof(now));
     g_pipe_cat = nullptr;
@@ -1087,22 +1107,31 @@ void drag_guard_note(void* cat, bool box) {
              box ? "box" : "pipe", (unsigned long long)it->first);
 }
 
-bool drag_held_pose(void* cat) {
-    // HouseCat::update calls this exact command with enum 8 and an owned
-    // _DEFAULT string while held. The game consumes the string argument.
+bool set_house_cat_pose(void* animation, uint32_t pose, const char* variant) {
+    // The game consumes the variant string. An inline MSVC string needs no
+    // allocation in the game's heap.
     struct InlineString { char text[16]; uint64_t size, capacity; };
-    InlineString name{{'_','D','E','F','A','U','L','T',0}, 8, 15};
-    void* animation = nullptr;
-    if (!mem_read((const uint8_t*)cat + 0x68, &animation, sizeof(animation)) || !animation) return false;
+    const size_t size = strlen(variant);
+    if (size >= 16) return false;
+    InlineString name{{}, size, 15};
+    memcpy(name.text, variant, size);
     const uint8_t head[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x20};
     if (memcmp((const void*)(g_base + 0x9AA360), head, sizeof(head))) return false;
-    using SetPose = void (__fastcall*)(void*, int, void*);
+    using SetPose = void (__fastcall*)(void*, uint32_t, void*);
     __try {
-        ((SetPose)(g_base + 0x9AA360))(animation, 8, &name);
-        const uint8_t held = 1;
-        mem_write((uint8_t*)animation + 0xB0, &held, 1);
+        ((SetPose)(g_base + 0x9AA360))(animation, pose, &name);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool drag_held_pose(void* cat) {
+    // HouseCat::update selects enum 8 while held.
+    void* animation = nullptr;
+    if (!mem_read((const uint8_t*)cat + 0x68, &animation, sizeof(animation)) || !animation ||
+        !set_house_cat_pose(animation, 8, "_DEFAULT")) return false;
+    const uint8_t held = 1;
+    mem_write((uint8_t*)animation + 0xB0, &held, 1);
+    return true;
 }
 
 bool drag_move_allowed(uint64_t key, uint8_t from) {
@@ -1120,6 +1149,7 @@ void finish_remote_drag(void* cat, bool restore) {
     const DragVisual v = it->second;
     const uint64_t key = it->first;
     g_drag_visuals.erase(it); // stop guards before invoking a real placement
+    g_cat_snapshots.erase(key);
     double x = v.x, y = v.y;
     void* holder = nullptr;
     mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder));
@@ -1157,6 +1187,7 @@ void __fastcall drag_cat_update(void* cat) {
         drag_position(cat, v.x, v.y);
         return;
     }
+    if (apply_house_cat_snapshot(cat)) return;
     o_drag_cat(cat);
 }
 
@@ -1169,6 +1200,7 @@ void __fastcall drag_physics_update(void* physics) {
         drag_stop_physics(cat, v.x, v.y);
         return;
     }
+    if (cat && apply_house_cat_snapshot(cat)) return;
     o_drag_physics(physics);
 }
 
@@ -1318,7 +1350,7 @@ void drag_tick(void* comps) {
 }
 
 void drag_install() {
-    if (!config().house_drag_sync) return;
+    if (!config().house_drag_sync && !config().house_cat_sync) return;
     struct Hook { uintptr_t rva; const char* head; void* det; fn_drag_update* orig; };
     const Hook hooks[] = {
         {0x1FACC0, "\x48\x8b\xc4\x55\x53\x56\x57\x41\x54\x41", (void*)&drag_cat_update, &o_drag_cat},
@@ -1330,13 +1362,16 @@ void drag_install() {
         if (memcmp(at, h.head, 10) != 0 ||
             MH_CreateHook(at, h.det, (void**)h.orig) != MH_OK ||
             MH_EnableHook(at) != MH_OK) {
-            log_line("HOUSEDRAG", "!! safety hook %llx failed; visible dragging disabled",
+            log_line("HOUSEDRAG", "!! safety hook %llx failed; experimental cat hooks disabled",
                      (unsigned long long)h.rva);
             return;
         }
     }
     g_drag_hooks = true;
-    log_line("HOUSEDRAG", "EXPERIMENTAL visible drag hooks installed; waiting for pipe/box guards");
+    if (config().house_drag_sync)
+        log_line("HOUSEDRAG", "EXPERIMENTAL visible drag hooks installed; waiting for pipe/box guards");
+    if (config().house_cat_sync)
+        log_line("HOUSECATS", "EXPERIMENTAL host-owned cat movement enabled");
 }
 
 // Out of every place's list (the one it is in, and any stale one), +0xE8 null.
@@ -1590,7 +1625,7 @@ DrawerMatch drawer_match(void* inventory, uint32_t loc, uint64_t fingerprint) {
     return match;
 }
 
-bool drawer_context(void*& director, uint64_t& day) {
+bool read_shared_house(void*& director, uint64_t& day) {
     return net_active() && net_peer_count() >= 2 && !leave_busy() &&
            !g_night_at && !g_night_go && leave_scene_up(kScene_House) &&
            mem_read((const void*)(g_base + kRva_MewDirectorPtr), &director, sizeof(director)) && director &&
@@ -1689,7 +1724,7 @@ void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
     void* director = nullptr;
     uint64_t day = 0;
     const bool host = net_role() == NetRole::Host;
-    if (!drawer_context(director, day)) {
+    if (!read_shared_house(director, day)) {
         if (!host && net_active() && net_peer_count() >= 2) return nullptr;
         return o_drawer_move(inventory, id, dest);
     }
@@ -1731,7 +1766,7 @@ void on_drawer_move(const ChoiceMsg& m, uint8_t from) {
     void* director = nullptr;
     void* inventory = nullptr;
     uint64_t day = 0;
-    if (!drawer_context(director, day) || m.cat != day ||
+    if (!read_shared_house(director, day) || m.cat != day ||
         !mem_read((const void*)(g_base + kRva_InventorySlot), &inventory, sizeof(inventory)) || !inventory) return;
     const uint32_t source = m.index == kStorage ? kTrash : kStorage;
     const DrawerMatch match = drawer_match(inventory, source, m.node_seed);
@@ -2058,6 +2093,235 @@ void apply_purse(int32_t coins, int32_t food);
 
 void* g_comps    = nullptr;   // the House scene's components, from the last House update
 uint64_t g_comps_at = 0;
+bool short_house_action(const char* name, uint32_t state);
+bool safe_short_action(void* anim, const char* name);
+
+// During the day the host runs the cats normally. The client mirrors only
+// cats with fresh data in the same house and room. The animation component
+// continues to run while HouseCat and its physics are following the snapshot.
+bool apply_house_cat_snapshot(void* cat) {
+    if (!g_cat_snapshot_scene || !sharing() || g_night_at_pub()) return false;
+    const uint64_t key = cat_key(cat);
+    auto found = g_cat_snapshots.find(key);
+    if (found == g_cat_snapshots.end() || key == g_local_drag_key ||
+        g_cat_dropped_until.count(key)) return false;
+    HouseCatSnapshot& sample = found->second;
+    const uint64_t now = GetTickCount64();
+    if (now - sample.received_at > kCatSnapshotLifetimeMs) return false;
+
+    void* comps = nullptr;
+    void* holder = nullptr;
+    if (!comps_of(cat, comps) || comps != g_cat_snapshot_scene ||
+        !mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) ||
+        holder != sample.holder) return false;
+    if (holder) {
+        if (!drag_safe_room(holder)) return false;
+    } else {
+        void* held = nullptr;
+        drag_hand(comps, held);
+        if (held == cat || in_box(cat)) return false;
+    }
+    if (sample.last_step == now) return true;
+
+    double pos[2];
+    if (!read_drag_position(cat, pos) || !valid_drag_position(pos)) return false;
+    const double alpha = sample.last_step ? std::fmin(1.0, (now - sample.last_step) / 110.0) : 1.0;
+    const double dx = (sample.x - pos[0]) * alpha;
+    pos[0] += dx;
+    pos[1] += (sample.y - pos[1]) * alpha;
+    if (!drag_position(cat, pos[0], pos[1])) return false;
+    drag_stop_physics(cat, pos[0], pos[1]);
+    sample.last_step = now;
+    if (!g_cat_snapshot_applied) {
+        g_cat_snapshot_applied = true;
+        log_line("HOUSECATS", "following the host's cats for day %llu",
+                 (unsigned long long)sample.day);
+    }
+
+    void* anim = nullptr;
+    if (!mem_read((const uint8_t*)cat + 0x68, &anim, sizeof(anim)) || !anim) return true;
+
+    // HouseCat writes the animator's facing command when it walks
+    // (0x1FD328). The renderer consumes it and handles any turn transition.
+    constexpr uint32_t kWalkPose = 10;
+    int32_t facing = sample.facing;
+    if (sample.pose == kWalkPose && std::abs(dx) > 0.001)
+        facing = dx < 0 ? -1 : 1;
+    int32_t current_facing = 0;
+    if (facing != 2 &&
+        mem_read((const uint8_t*)anim + 0x14C, &current_facing, sizeof(current_facing)) &&
+        facing != current_facing)
+        mem_write((uint8_t*)anim + 0x14C, &facing, sizeof(facing));
+
+    uint8_t active = 0, queued = 0;
+    uint32_t pose = 0;
+    char variant[16] = {};
+    // An empty variant is the native default. Updating the requested base
+    // while an action is active lets Animator decide when to switch clips.
+    if (sample.pose <= 13 &&
+        mem_read((const uint8_t*)anim + 0x148, &pose, sizeof(pose)) &&
+        (pose != sample.pose ||
+         (mem_read_std_string((const uint8_t*)anim + 0x170, variant, sizeof(variant)) &&
+          strcmp(variant, sample.variant)))) {
+        set_house_cat_pose(anim, sample.pose, sample.variant);
+    }
+    if (sample.action[0] && !sample.action_replayed &&
+        mem_read((const uint8_t*)anim + 0x210, &active, 1) && !active &&
+        mem_read((const uint8_t*)anim + 0x2A0, &queued, 1) && !queued) {
+        sample.action_replayed = true;
+        safe_short_action(anim, sample.action);
+    }
+    return true;
+}
+
+void publish_house_cat(const List& places, void* cat, void* held, uint64_t day) {
+    if (!cat || cat == held || remote_drag_cat(cat)) return;
+    const uint64_t key = cat_key(cat);
+    void* holder = nullptr;
+    double pos[2];
+    if (!key || !mem_read((const uint8_t*)cat + kHouseCat_Place, &holder, sizeof(holder)) ||
+        !read_drag_position(cat, pos) || !valid_drag_position(pos)) return;
+    uint32_t room = kCatSnapshotOutside;
+    if (holder) {
+        if (!drag_safe_room(holder)) return;
+        room = 0;
+        while (room < places.n && item(places, room) != holder) ++room;
+        if (room == places.n) return;
+    } else if (in_box(cat)) {
+        return;
+    }
+
+    ChoiceMsg m{};
+    m.kind = kChoiceHouseCatState;
+    m.cat = key;
+    m.node_seed = day;
+    const float xy[2] = {(float)pos[0], (float)pos[1]};
+    memcpy(&m.index, &xy[0], sizeof(float));
+    memcpy(&m.count, &xy[1], sizeof(float));
+    void* anim = nullptr;
+    uint32_t pose = 15;
+    if (!mem_read((const uint8_t*)cat + 0x68, &anim, sizeof(anim)) || !anim ||
+        !mem_read((const uint8_t*)anim + 0x148, &pose, sizeof(pose)) || pose > 13 ||
+        !mem_read_std_string((const uint8_t*)anim + 0x170, m.name, 16)) {
+        pose = 15;
+        m.name[0] = 0;
+    }
+    int32_t facing = 2;
+    if (anim && (!mem_read((const uint8_t*)anim + 0x14C, &facing, sizeof(facing)) ||
+                 facing < -1 || facing > 1)) facing = 2;
+    char action[16] = {};
+    uint8_t active = 0;
+    uint32_t state = 0;
+    if (anim && mem_read((const uint8_t*)anim + 0x210, &active, 1) && active &&
+        mem_read((const uint8_t*)cat + 0x94, &state, sizeof(state)) &&
+        mem_read_std_string((const uint8_t*)anim + 0x190, action, sizeof(action)) &&
+        short_house_action(action, state)) {
+        strcat_s(m.name, "|");
+        strcat_s(m.name, action);
+    }
+    m.aux = room | (places.n << 13) | (pose << 26) | ((uint32_t)(facing + 1) << 30);
+    net_send_choice(m);
+}
+
+void receive_house_cat(const ChoiceMsg& m, uint8_t from) {
+    if (!config().house_cat_sync || !g_drag_hooks || net_role() != NetRole::Client ||
+        from != kHostPeer || !g_cs_ready || !m.cat) return;
+    HouseCatSnapshot s{};
+    s.received_at = GetTickCount64();
+    s.day = m.node_seed;
+    s.room = m.aux & 0x1FFF;
+    s.rooms = (m.aux >> 13) & 0x1FFF;
+    s.pose = (m.aux >> 26) & 15;
+    s.facing = (int32_t)(m.aux >> 30) - 1;
+    memcpy(&s.x, &m.index, sizeof(float));
+    memcpy(&s.y, &m.count, sizeof(float));
+    const double pos[2] = {s.x, s.y};
+    if (!valid_drag_position(pos) || s.rooms > 4096 ||
+        (s.room >= s.rooms && s.room != kCatSnapshotOutside) ||
+        (s.pose > 13 && s.pose != 15)) return;
+    const char* action = strchr(m.name, '|');
+    const size_t variant_size = action ? (size_t)(action - m.name) : strlen(m.name);
+    if (variant_size >= sizeof(s.variant)) return;
+    memcpy(s.variant, m.name, variant_size);
+    if (action) {
+        ++action;
+        if (!short_house_action(action, 2) && !short_house_action(action, 4)) return;
+        strcpy_s(s.action, action);
+    }
+    EnterCriticalSection(&g_cs);
+    if (g_cat_snapshots_pending.size() < 4096 || g_cat_snapshots_pending.count(m.cat))
+        g_cat_snapshots_pending[m.cat] = s;
+    LeaveCriticalSection(&g_cs);
+}
+
+void house_cat_sync_tick(void* comps) {
+    static uint64_t sent_at = 0;
+    static uint32_t next = 0;
+    void* director = nullptr;
+    uint64_t day = 0;
+    if (!g_drag_hooks || g_night_at_pub() || !read_shared_house(director, day)) {
+        g_cat_snapshot_scene = nullptr;
+        g_cat_snapshots.clear();
+        g_cat_dropped_until.clear();
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    List places;
+    if (!list_of(comps, kComps_Places, places)) return;
+    if (net_role() == NetRole::Host) {
+        const uint64_t elapsed = now - sent_at;
+        if (elapsed < 50) return;
+        const uint32_t batch = elapsed >= 250 ? 60 : (uint32_t)(elapsed / 50) * 12;
+        sent_at = now;
+        List cats;
+        if (!list_of(comps, kComps_Cats, cats) || !cats.n) return;
+        void* held = nullptr;
+        drag_hand(comps, held);
+        // Spread the roster over frames to leave space in the receive queue
+        // for drops and other messages when the guest renders slowly.
+        next %= cats.n;
+        for (uint32_t i = 0; i < batch && i < cats.n; ++i) {
+            publish_house_cat(places, item(cats, next), held, day);
+            next = (next + 1) % cats.n;
+        }
+        return;
+    }
+
+    if (comps != g_cat_snapshot_scene || day != g_cat_snapshot_day) {
+        g_cat_snapshots.clear();
+        g_cat_dropped_until.clear();
+        g_cat_snapshot_scene = comps;
+        g_cat_snapshot_day = day;
+        g_cat_snapshot_applied = false;
+    }
+    for (auto it = g_cat_dropped_until.begin(); it != g_cat_dropped_until.end();) {
+        if (now >= it->second) it = g_cat_dropped_until.erase(it);
+        else ++it;
+    }
+    for (auto it = g_cat_snapshots.begin(); it != g_cat_snapshots.end();) {
+        if (now - it->second.received_at > kCatSnapshotLifetimeMs) it = g_cat_snapshots.erase(it);
+        else ++it;
+    }
+    std::map<uint64_t, HouseCatSnapshot> incoming;
+    EnterCriticalSection(&g_cs);
+    incoming.swap(g_cat_snapshots_pending);
+    LeaveCriticalSection(&g_cs);
+    for (auto& entry : incoming) {
+        HouseCatSnapshot& s = entry.second;
+        if (s.day != day || s.rooms != places.n || now - s.received_at > kCatSnapshotLifetimeMs)
+            continue;
+        if (s.room != kCatSnapshotOutside) {
+            s.holder = item(places, s.room);
+            if (!drag_safe_room(s.holder)) continue;
+        }
+        auto& previous = g_cat_snapshots[entry.first];
+        if (previous.holder == s.holder) {
+            s.last_step = previous.last_step;
+            s.action_replayed = previous.action_replayed && strcmp(previous.action, s.action) == 0;
+        }
+        previous = s;
+    }
+}
 
 // Only random idle actions observed at call sites with an empty callback.
 // Jumping, landing, pose transitions and interactions with other cats are
@@ -2619,6 +2883,10 @@ void house_set_base(uintptr_t base) {
 }
 
 bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
+    if (m.kind == kChoiceHouseCatState) {
+        receive_house_cat(m, from);
+        return true;
+    }
     if (m.kind == kChoiceHouseItemMove) {
         on_drawer_move(m, from);
         return true;
@@ -2774,7 +3042,8 @@ void house_tick(void* component) {
     drag_tick(comps);
     trace_house_drag(comps);
     trace_cat_positions(comps);
-    walk_tick(comps);
+    if (config().house_cat_sync) house_cat_sync_tick(comps);
+    else walk_tick(comps);
     if (g_comps_at - g_live_cache_at > 1000) {
         g_live_cache.clear();
         live_rows_now(g_live_cache);

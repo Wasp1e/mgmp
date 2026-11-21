@@ -15,6 +15,7 @@ param(
     [switch]$HouseActions,
     [switch]$HouseDrag,
     [switch]$HouseDragSync,
+    [switch]$HouseCatSync,
     [switch]$SplitPrimary,
     [string]$BuildDir = 'build',
     [string]$Config = 'Release'
@@ -40,7 +41,7 @@ if ($running.Count -gt 0 -and -not $Force) {
     }
 }
 
-& (Join-Path $PSScriptRoot 'net_test.ps1') -BuildDir $BuildDir -Config $Config -HousePositions:$HousePositions -HouseWalk:$HouseWalk -HouseActions:$HouseActions -HouseDrag:$HouseDrag -HouseDragSync:$HouseDragSync
+& (Join-Path $PSScriptRoot 'net_test.ps1') -BuildDir $BuildDir -Config $Config -HousePositions:$HousePositions -HouseWalk:$HouseWalk -HouseActions:$HouseActions -HouseDrag:$HouseDrag -HouseDragSync:$HouseDragSync -HouseCatSync:$HouseCatSync
 
 Add-Type -AssemblyName System.Windows.Forms
 if (-not ('MgmpTestWindow' -as [type])) {

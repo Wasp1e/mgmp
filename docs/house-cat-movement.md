@@ -1,5 +1,19 @@
 # House cat movement investigation
 
+## Host-owned preview
+
+`tools/restart_test.ps1 -HouseCatSync -HouseDragSync -SplitPrimary` starts
+the opt-in experiment on both peers. The host simulates daytime cat movement
+and sends position, facing, the base pose and the three validated short idle
+actions. The client follows fresh samples for a cat in the same room or yard.
+Local pickups, replicated drags and nighttime still use their own paths.
+
+House cat synchronization was verified in a two-player session on protocol 101.
+Social actions and animations with native callbacks still need separate
+validation. The older `-HouseWalk` experiment is still available for comparison.
+
+## Earlier experiment
+
 Visible drag work is tracked separately in [house-cat-drag.md](house-cat-drag.md).
 Independent walking/idle-action synchronization remains disabled during drag
 testing.

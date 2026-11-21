@@ -368,6 +368,7 @@ void config_load(const wchar_t* dll_dir) {
         read_bool(*d, "house_action_sync", g_cfg.house_action_sync);
         read_bool(*d, "house_drag_trace",  g_cfg.house_drag_trace);
         read_bool(*d, "house_drag_sync",   g_cfg.house_drag_sync);
+        read_bool(*d, "house_cat_sync",    g_cfg.house_cat_sync);
         read_bool(*d, "desync_halt",     g_cfg.net_desync_halt);
         read_bool(*d, "record",          g_cfg.record);
         read_str (*d, "record_note",     g_cfg.record_note, sizeof(g_cfg.record_note));

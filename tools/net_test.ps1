@@ -51,6 +51,7 @@ param(
     [switch]$HouseActions,
     [switch]$HouseDrag,
     [switch]$HouseDragSync,
+    [switch]$HouseCatSync,
     # Stop the client following the host through the map screen, i.e. drive
     # both instances to the same battle by hand. That is how phase 4 was
     # tested, and it is still the way to tell a battle-layer problem from a
@@ -304,6 +305,7 @@ foreach ($peer in $peers.Keys) {
     $cfg.debug | Add-Member -NotePropertyName house_action_sync -NotePropertyValue ([bool]$HouseActions) -Force
     $cfg.debug | Add-Member -NotePropertyName house_drag_trace -NotePropertyValue ([bool]$HouseDrag) -Force
     $cfg.debug | Add-Member -NotePropertyName house_drag_sync -NotePropertyValue ([bool]$HouseDragSync) -Force
+    $cfg.debug | Add-Member -NotePropertyName house_cat_sync -NotePropertyValue ([bool]$HouseCatSync) -Force
     $cfg.debug.record_note     = "lockstep $peer, cats [$cats]"
     # Lockstep owns Brain::GetChoice. Leaving a replay file configured would put
     # two injectors on one buffer, and lockstep wins -- so the replay would

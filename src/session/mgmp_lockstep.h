@@ -107,6 +107,7 @@ void lockstep_owners_read(const EnterNodeMsg& m);
 // Whether this player decides for the cat with this persistent id outside a
 // battle. A cat the table does not know, or whose player has left, is the host's.
 bool lockstep_cat_mine(uint64_t id);
+uint8_t lockstep_cat_owner_peer(uint64_t id);
 
 // True when the owner table has cat `id` and gives it to another player. A cat
 // the table has not seen belongs to nobody yet, so this is false for it.

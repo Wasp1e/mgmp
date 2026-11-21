@@ -21,9 +21,12 @@
 #include "MinHook.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 namespace mgmp {
 namespace {
@@ -60,6 +63,22 @@ constexpr uintptr_t kLvlOpt_Name = 200;
 constexpr uint32_t kMaxOptions = 64;
 
 using fn_cap = void (__fastcall*)(void*);
+using fn_button_press = void (__fastcall*)(void*, uint8_t);
+using fn_button_allows = bool (__fastcall*)(void*, int32_t, uint8_t);
+using fn_button_find = void* (__fastcall*)(void*, void*, uint8_t);
+
+struct EventNextButton {
+    void* screen = nullptr;
+    void* button = nullptr;
+    uint64_t cookie = 0;
+    uint64_t node_seed = 0;
+    uint64_t cat = 0;
+    uint32_t rewards_left = 0;
+    char event[48] = {};
+    bool pressed = false;
+};
+
+struct EventNextPick { ChoiceMsg msg; uint8_t from; };
 
 // A level-up bought in a shop opens from inside the purchase, which only the host
 // makes. The tail of that branch (sub_14079ACB0, type 12) is all the client needs:
@@ -131,6 +150,14 @@ struct State {
 
     void* world_event  = nullptr;   // latest WorldEvent*,    from its update
     void* level_screen = nullptr;   // latest LevelUpScreen*, from its update
+    uint64_t event_cat = 0;
+    EventNextButton event_next;
+    std::vector<EventNextPick> event_next_picks;
+    fn_cap o_event_result_buttons = nullptr;
+    fn_button_press o_event_button_press = nullptr;
+    fn_button_allows event_button_allows = nullptr;
+    fn_button_find event_button_find = nullptr;
+    bool event_next_hooked = false;
 
     // A CHOICE can arrive before this peer's screen exists -- the client is
     // following the host into the node and may not have opened it yet. Hold it
@@ -528,6 +555,191 @@ bool prologue_is(uintptr_t addr, const char* bytes, size_t n) {
     return mem_read((const void*)addr, have, n) && memcmp(have, bytes, n) == 0;
 }
 
+void* transition_scene() {
+    void* mgr = nullptr;
+    if (!mem_read((const void*)(g.base + kRva_SceneMgr), &mgr, sizeof(mgr)) || !mgr) return nullptr;
+    uint8_t busy = 0;
+    if (!mem_read((const uint8_t*)mgr + kMgr_Busy, &busy, 1) || busy) return nullptr;
+    void* list = nullptr;
+    void* scene = nullptr;
+    if (!mem_read((const uint8_t*)mgr + kMgr_Scenes, &list, sizeof(list)) || !list ||
+        !mem_read((const uint8_t*)list + 8, &scene, sizeof(scene)) || !scene ||
+        !mem_read((const uint8_t*)scene + kScene_Leaving, &busy, 1) || busy) return nullptr;
+    return scene;
+}
+
+// The result screen's builder gives the arrow either the `ok` or `skip`
+// movie key. Both use Event_ExitButton; a reward's separate accept button
+// does not. Each skipped reward removes one 0x60-byte entry and rebuilds it.
+constexpr uintptr_t kRva_EventResultButtons = 0x91E550;
+constexpr uintptr_t kRva_ButtonFind = 0x97C4F0;
+constexpr uintptr_t kRva_ButtonPress = 0x97E8E0;
+constexpr uintptr_t kRva_ButtonAllows = 0x97EAF0;
+constexpr uintptr_t kRva_ButtonVtbl = 0xEE2048;
+constexpr uintptr_t kEvt_RewardBegin = 0x1A58;
+constexpr uintptr_t kEvt_RewardEnd = 0x1A60;
+constexpr uintptr_t kEvt_RewardChoice = 0x1A70;
+constexpr uintptr_t kEvt_RewardStride = 0x60;
+constexpr uint32_t kMaxEventRewards = 64;
+
+bool event_next_online() {
+    return g.on && g.event_next_hooked && net_active() && net_peer_count() >= 2;
+}
+
+void* find_result_button(void* movie, const char* key) {
+    // The game's lookup consumes its string argument. Use inline storage and
+    // pass create=0 so only an existing button can be returned.
+    struct InlineString { char text[16]; uint64_t length, capacity; };
+    InlineString name{{}, strlen(key), 15};
+    memcpy(name.text, key, name.length);
+    __try { return g.event_button_find(movie, &name, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+bool is_result_arrow(void* button) {
+    if (!button) return false;
+    uintptr_t vtable = 0;
+    char style[32] = {};
+    return mem_read(button, &vtable, sizeof(vtable)) && vtable == g.base + kRva_ButtonVtbl &&
+           read_game_string((uint8_t*)button + 0x1F8, style, sizeof(style)) &&
+           strcmp(style, "Event_ExitButton") == 0;
+}
+
+void __fastcall event_result_buttons(void* screen) {
+    g.o_event_result_buttons(screen);
+    if (!event_next_online()) return;
+    Guard guard;
+    const EventNextButton previous = g.event_next;
+    g.event_next = {};
+
+    const auto* evt = (const uint8_t*)screen;
+    void* movie = nullptr;
+    uintptr_t begin = 0, end = 0;
+    uint8_t reward_choice = 0;
+    EventNextButton next{};
+    next.screen = screen;
+    next.node_seed = follow_here_seed();
+    if (!next.node_seed ||
+        !read_game_string(evt + kEvt_EventName, next.event, sizeof(next.event)) || !next.event[0] ||
+        !mem_read(evt + 0x40, &movie, sizeof(movie)) || !movie ||
+        !mem_read(evt + kEvt_RewardBegin, &begin, sizeof(begin)) ||
+        !mem_read(evt + kEvt_RewardEnd, &end, sizeof(end)) || end < begin ||
+        !mem_read(evt + kEvt_RewardChoice, &reward_choice, 1) ||
+        (end - begin) % kEvt_RewardStride || (end - begin) / kEvt_RewardStride > kMaxEventRewards) return;
+    next.rewards_left = (uint32_t)((end - begin) / kEvt_RewardStride);
+    next.cat = screen_cat(screen, kEvt_Cat);
+    if (!next.cat && screen == g.said_event) next.cat = g.event_cat;
+    next.button = find_result_button(movie, reward_choice && next.rewards_left ? "ok" : "skip");
+    if (!is_result_arrow(next.button) ||
+        !mem_read((const uint8_t*)next.button - 8, &next.cookie, sizeof(next.cookie))) return;
+    next.pressed = previous.pressed && previous.screen == screen &&
+                   previous.node_seed == next.node_seed && previous.rewards_left == next.rewards_left;
+    g.event_next = next;
+}
+
+bool event_next_button_live(const EventNextButton& next) {
+    uint64_t cookie = 0;
+    return next.button &&
+           mem_read((const uint8_t*)next.button - 8, &cookie, sizeof(cookie)) && cookie == next.cookie &&
+           is_result_arrow(next.button);
+}
+
+bool event_next_button_ready(void* button, uint8_t force) {
+    const auto* b = (const uint8_t*)button;
+    uint8_t locked = 0;
+    uint32_t status = 0;
+    double cooldown[2] = {};
+    void* callback = nullptr;
+    if (!transition_scene() ||
+        !mem_read(b + 0x59, &locked, 1) || (locked && !force) ||
+        !mem_read(b + 0x2FC, &status, sizeof(status)) || status == 1 ||
+        !mem_read(b + 0x60, cooldown, sizeof(cooldown)) ||
+        !std::isfinite(cooldown[0]) || !std::isfinite(cooldown[1]) || cooldown[0] > cooldown[1] ||
+        !mem_read(b + 0xF0, &callback, sizeof(callback)) || !callback) return false;
+    __try { return g.event_button_allows(button, -1, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void __fastcall event_button_press(void* button, uint8_t force) {
+    if (!event_next_online() || button != g.event_next.button) {
+        g.o_event_button_press(button, force);
+        return;
+    }
+    Guard guard;
+    auto& next = g.event_next;
+    if (!event_next_button_live(next) || next.node_seed != follow_here_seed()) {
+        g.o_event_button_press(button, force);
+        return;
+    }
+    if (next.pressed || !lockstep_cat_mine(next.cat)) return;
+    if (!event_next_button_ready(button, force)) return;
+    ChoiceMsg m{};
+    m.kind = kChoiceEventNext;
+    m.node_seed = next.node_seed;
+    m.cat = next.cat;
+    m.index = next.rewards_left;
+    memcpy(m.name, next.event, sizeof(m.name));
+    if (!net_send_choice(m)) {
+        log_line("CHOICE", "!! could not send event next '%s'; the arrow is still available", m.name);
+        return;
+    }
+    next.pressed = true;
+    ++g.sent;
+    log_line("CHOICE", "-> event next '%s' (%u rewards left)", m.name, m.index);
+    g.o_event_button_press(button, force);
+}
+
+void apply_event_next(void* screen) {
+    auto& next = g.event_next;
+    if (!event_next_online() || next.screen != screen || next.node_seed != follow_here_seed() ||
+        next.pressed || g.event_next_picks.empty() || !event_next_button_live(next)) return;
+    const uint8_t owner = lockstep_cat_owner_peer(next.cat);
+    if (owner == kNoPeer || owner == net_self()) return;
+    const auto pick = std::find_if(g.event_next_picks.begin(), g.event_next_picks.end(),
+        [&](const EventNextPick& p) {
+            return p.from == owner && p.msg.node_seed == next.node_seed && p.msg.cat == next.cat &&
+                   p.msg.index == next.rewards_left && strcmp(p.msg.name, next.event) == 0;
+        });
+    if (pick == g.event_next_picks.end() || !event_next_button_ready(next.button, 1)) return;
+    const ChoiceMsg m = pick->msg;
+    g.event_next_picks.erase(pick);
+    next.pressed = true;
+    ++g.applied;
+    g.o_event_button_press(next.button, 1);
+    log_line("CHOICE", "<- applied event next '%s' (%u rewards left) from peer %u",
+             m.name, m.index, (unsigned)owner);
+}
+
+void clear_event_next_for_node(uint64_t seed) {
+    auto& picks = g.event_next_picks;
+    picks.erase(std::remove_if(picks.begin(), picks.end(), [seed](const EventNextPick& p) {
+        return p.msg.node_seed == seed;
+    }), picks.end());
+}
+
+bool install_event_next(uintptr_t base) {
+    if (!prologue_is(base + kRva_EventResultButtons, "\x48\x89\x5C\x24\x08\x55\x56\x57", 8) ||
+        !prologue_is(base + kRva_ButtonFind, "\x48\x89\x54\x24\x10\x53\x55\x56", 8) ||
+        !prologue_is(base + kRva_ButtonPress, "\x48\x89\x74\x24\x18\x57\x48\x83", 8) ||
+        !prologue_is(base + kRva_ButtonAllows, "\x48\x89\x5C\x24\x08\x48\x89\x6C", 8)) return false;
+    void* build = (void*)(base + kRva_EventResultButtons);
+    void* press = (void*)(base + kRva_ButtonPress);
+    if (MH_CreateHook(build, (void*)&event_result_buttons, (void**)&g.o_event_result_buttons) != MH_OK)
+        return false;
+    if (MH_CreateHook(press, (void*)&event_button_press, (void**)&g.o_event_button_press) != MH_OK) {
+        MH_RemoveHook(build);
+        return false;
+    }
+    if (MH_EnableHook(build) != MH_OK || MH_EnableHook(press) != MH_OK) {
+        MH_RemoveHook(build);
+        MH_RemoveHook(press);
+        return false;
+    }
+    g.event_button_find = (fn_button_find)(base + kRva_ButtonFind);
+    g.event_button_allows = (fn_button_allows)(base + kRva_ButtonAllows);
+    return true;
+}
+
 // Shared by both apply ticks.
 void apply_pending(uint8_t kind, void* screen) {
     if (!g.pending[kind]) return;
@@ -840,6 +1052,11 @@ void choice_on_catpre(const CatDataMsg& m) {
 
 void choice_set_base(uintptr_t base) {
     g.base = base;
+    if (!g.event_next_hooked) {
+        g.event_next_hooked = install_event_next(base);
+        if (!g.event_next_hooked)
+            log_line("CHOICE", "!! event result button hooks unavailable; each player advances locally");
+    }
     if (!g.o_lvl_init) {
         void* li = (void*)(base + kRva_LevelInit);
         if (memcmp(li, kLevelInitPrologue, 8) != 0 ||
@@ -914,6 +1131,10 @@ void choice_init() {
     g.is_client   = (net_role() == NetRole::Client);
     g.world_event = nullptr;
     g.level_screen = nullptr;
+    g.said_event = nullptr;
+    g.event_cat = 0;
+    g.event_next = {};
+    g.event_next_picks.clear();
     g.pending[0] = g.pending[1] = false;
     g.injecting = false;
     if (!g.on) { log_line("CHOICE", "choice replication disabled by net_choice = 0"); return; }
@@ -1011,9 +1232,11 @@ void choice_on_event_update(void* world_event) {
         log_line("CHOICE", "event screen for cat %016llx -- %s", (unsigned long long)cat,
                  mine ? "this player picks" : "the other player picks");
     }
+    if (cat) g.event_cat = cat;
 
     if (g.is_client) apply_pending(kChoiceEvent, world_event);
     else if (!mine)  apply_peer_pick(kChoiceEvent, world_event, cat);
+    apply_event_next(world_event);
 }
 
 // --- the level-up screen ---------------------------------------------------
@@ -1233,15 +1456,8 @@ void choice_pump() {
     if (g.shop_seed != g.here_seed) return;     // still on the way to that shop
     if (invsync_screen_open() && GetTickCount64() - g.shop_at < State::kShopHoldMs) return;
 
-    void* mgr = nullptr;
-    if (!mem_read((const void*)(g.base + kRva_SceneMgr), &mgr, sizeof(mgr)) || !mgr) return;
-    uint8_t busy = 0;
-    if (!mem_read((const uint8_t*)mgr + kMgr_Busy, &busy, 1) || busy) return;
-    void* list  = nullptr;
-    void* scene = nullptr;
-    if (!mem_read((const uint8_t*)mgr + kMgr_Scenes, &list, sizeof(list)) || !list) return;
-    if (!mem_read((const uint8_t*)list + 8, &scene, sizeof(scene)) || !scene) return;
-    if (!mem_read((const uint8_t*)scene + kScene_Leaving, &busy, 1) || busy) return;
+    void* scene = transition_scene();
+    if (!scene) return;
 
     const uint64_t id = g.shop_cat;
     g.shop_cat = 0;
@@ -1266,13 +1482,30 @@ void choice_pump() {
 
 void choice_on_message(const ChoiceMsg& m, uint8_t from) {
     if (m.kind == kChoiceNode) { follow_on_vote(m); return; }   // the map's, not ours
-    if (classpick_on_message(m)) return;                         // the class chooser's
+    if (classpick_on_message(m, from)) return;                   // the class chooser's
     if (cutscene_on_message(m)) return;                          // a cutscene's
     if (peerlog_on_choice(m)) return;                            // a request for the log
     if (startrun_on_message(m)) return;                          // the host setting off
     if (house_on_choice(m, from)) return;                        // a House cat moved
     if (!g.on) return;
     Guard guard;
+
+    if (m.kind == kChoiceEventNext) {
+        if (!event_next_online() || !m.node_seed || !m.name[0] || m.index > kMaxEventRewards ||
+            from == kNoPeer || from == net_self() || was_skipped(m.node_seed)) return;
+        const auto duplicate = std::find_if(g.event_next_picks.begin(), g.event_next_picks.end(),
+            [&](const EventNextPick& p) {
+                return p.from == from && p.msg.node_seed == m.node_seed && p.msg.cat == m.cat &&
+                       p.msg.index == m.index && strcmp(p.msg.name, m.name) == 0;
+            });
+        if (duplicate != g.event_next_picks.end()) return;
+        if (g.event_next_picks.size() >= 32) {
+            log_line("CHOICE", "!! event next queue full; dropping '%s'", m.name);
+            return;
+        }
+        g.event_next_picks.push_back({m, from});
+        return;
+    }
 
     if (m.kind == kChoiceOpen) {
         if (!g.is_client) g.client_open_cat = m.cat;
@@ -1393,7 +1626,11 @@ void choice_on_message(const ChoiceMsg& m, uint8_t from) {
 void choice_on_node_entered(uint64_t node_seed) {
     if (!g.on) return;
     Guard guard;
+    if (g.here_seed != node_seed) clear_event_next_for_node(g.here_seed);
     g.here_seed = node_seed;
+    g.event_next = {};
+    g.said_event = nullptr;
+    g.event_cat = 0;
 
     // The cached screens belong to the node just left. Clearing them is not
     // tidiness: choice_on_message applies straight into whichever pointer is
@@ -1420,6 +1657,7 @@ void choice_on_node_skipped(uint64_t node_seed) {
     if (!g.on || !node_seed) return;
     Guard guard;
     remember_skipped(node_seed);
+    clear_event_next_for_node(node_seed);
 
     for (uint8_t kind = 0; kind < 2; ++kind) {
         if (!g.pending[kind] || g.pending_seed[kind] != node_seed) continue;

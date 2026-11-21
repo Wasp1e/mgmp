@@ -18,6 +18,7 @@
 #include "mgmp_runhist.h"
 #include "mgmp_follow.h"
 #include "mgmp_choice.h"
+#include "mgmp_classpick.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
 #include "mgmp_session.h"
@@ -2794,6 +2795,10 @@ void lockstep_pump() {
                 choice_on_catpre(m.catpre);
                 break;
 
+            case MSG_GEARCAT:
+                classpick_on_gearcat(m.catpre, m.from);
+                break;
+
             // Run state as well, and not epoch-gated for the same reason.
             case MSG_INVENTORY:
                 invsync_on_message(m.inventory);
@@ -3688,12 +3693,21 @@ void lockstep_on_run_restart() {
     g.owners        = OwnerTable{};
 }
 
+static uint8_t cat_owner_position(uint64_t id, uint32_t players) {
+    const int row = id ? g.owners.find(id) : -1;
+    return (row >= 0 && g.owners.pos[row] < players) ? g.owners.pos[row] : 0;
+}
+
 bool lockstep_cat_mine(uint64_t id) {
     Guard guard;
-    const uint32_t players = net_peer_count();
-    const int row = id ? g.owners.find(id) : -1;
-    const uint32_t owner = (row >= 0 && g.owners.pos[row] < players) ? g.owners.pos[row] : 0;
-    return owner == net_peer_pos();
+    return cat_owner_position(id, net_peer_count()) == net_peer_pos();
+}
+
+uint8_t lockstep_cat_owner_peer(uint64_t id) {
+    Guard guard;
+    uint8_t peers[kMaxPeers] = {};
+    if (!net_peer_ids(peers, kMaxPeers)) return kNoPeer;
+    return peers[cat_owner_position(id, net_peer_count())];
 }
 
 bool lockstep_cat_theirs(uint64_t id) {

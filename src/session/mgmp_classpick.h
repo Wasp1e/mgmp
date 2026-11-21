@@ -13,6 +13,7 @@
 namespace mgmp {
 
 struct ChoiceMsg;
+struct CatDataMsg;
 
 // Patches ClassTagBox's per-frame slot and its click, and the embark button.
 void classpick_set_base(uintptr_t base);
@@ -20,9 +21,14 @@ void classpick_set_base(uintptr_t base);
 // Once a frame, both roles. Host: publishes the chooser while it is up and
 // makes the client's picks on it. Client: drops a menu the host stopped sending.
 void classpick_pump();
+void classpick_on_run_restart();
 
 // Choice kinds kChoiceClassCat..kChoiceClassEquip, kChoiceClassStats, kChoiceClassUnequip.
-bool classpick_on_message(const ChoiceMsg& m);
+bool classpick_on_message(const ChoiceMsg& m, uint8_t from);
+void classpick_on_gearcat(CatDataMsg& m, uint8_t from);
+bool classpick_ready_badge(uint32_t& count, uint32_t& total);
+void classpick_hide_ready_note();
+bool classpick_allow_gear_exit(void* screen);
 
 // --- the client's menu, for the panel ----------------------------------------
 

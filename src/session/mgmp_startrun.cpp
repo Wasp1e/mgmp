@@ -1,4 +1,5 @@
 #include "mgmp_startrun.h"
+#include "mgmp_classpick.h"
 #include "mgmp_house.h"
 #include "mgmp_net.h"
 #include "mgmp_mem.h"
@@ -315,6 +316,8 @@ void* __fastcall act_tick(void* screen, void* b, void* c, void* d) {
 }
 
 void __fastcall gear_done_hook(void** cap) {
+    if (!classpick_allow_gear_exit(*cap)) return;
+    classpick_hide_ready_note();
     if (net_role() == NetRole::Host && net_active() && net_peer_count() >= 2 && !g.defend) {
         ChoiceMsg m{};
         m.kind = kChoiceGearDone;
@@ -634,8 +637,27 @@ void* __fastcall box_tick(void* box, void* b, void* c, void* d) {
         void* cats[kBoxSlots]; uint64_t keys[kBoxSlots];
         if (!box_keys(box, cats, keys)) break;
         const bool in = key_in(keys, ops[i].key);
-        if (ops[i].add && in && ops[i].pos != me) mark_picker(ops[i].key, ops[i].pos);
-        if (ops[i].add == in) continue;               // already as the other player has it
+        auto acknowledge = [&] {
+            uint64_t* empty = nullptr;
+            for (uint64_t& known : box_known) {
+                if (known == ops[i].key) {
+                    if (!ops[i].add) known = 0;
+                    return;
+                }
+                if (!known) empty = &known;
+            }
+            if (ops[i].add && empty) *empty = ops[i].key;
+        };
+        if (ops[i].add && in && picker_of(ops[i].key) != ops[i].pos) {
+            // The drag can place a cat here before its box message arrives.
+            // Apply the confirmed picker even when it is this client.
+            mark_picker(ops[i].key, ops[i].pos);
+            if (host) send_box(true, ops[i].key, ops[i].pos);
+        }
+        if (ops[i].add == in) {
+            acknowledge();
+            continue;
+        }
         // The host's every-3-s box, sent before it heard this player take the cat out.
         if (ops[i].add && !host && ops[i].key == box_out_key && now - box_out_at < 2000) continue;
         void* hc = nullptr;
@@ -665,15 +687,16 @@ void* __fastcall box_tick(void* box, void* b, void* c, void* d) {
             }
         }
         box_applying = false;
-        box_keys(box, cats, keys);
+        if (!box_keys(box, cats, keys)) continue;
         mark_picker(ops[i].key, ops[i].add && key_in(keys, ops[i].key) ? ops[i].pos : -1);
         log_line("STARTRUN", "<- the other player %s cat %016llx %s the box%s",
                  ops[i].add ? "put" : "took", (unsigned long long)ops[i].key,
                  ops[i].add ? "in" : "out of",
                  !ok ? " -- the game faulted on it" :
                  key_in(keys, ops[i].key) != ops[i].add ? " -- this game would not" : "");
-        // Taken as the other player's, not told back to them.
-        for (uint32_t s = 0; s < kBoxSlots; ++s) box_known[s] = keys[s];
+        // A remote operation acknowledges this cat only. Local changes in the
+        // same tick still need to be counted and sent below.
+        if (key_in(keys, ops[i].key) == ops[i].add) acknowledge();
     }
 
     // Then this player's: what changed since the other player was last told.
@@ -917,6 +940,7 @@ struct GameFn { void* storage[7]; void* impl; };
 
 // HOST: an embark cutscene goes out as it starts.
 void* __fastcall play_cutscene(void* owner, void* kind, void* done, double t) {
+    classpick_hide_ready_note();
     if (!g.playing_ours && host_with_peer()) {
         char name[48];
         read_str(kind, name, sizeof(name));
@@ -929,6 +953,7 @@ void* __fastcall play_cutscene(void* owner, void* kind, void* done, double t) {
 }
 
 bool safe_play(void* owner, GameStr* kind, GameFn* done) {
+    classpick_hide_ready_note();
     __try { g.o_play(owner, kind, done, 0.0); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }

@@ -564,6 +564,20 @@ void catsync_send_equipment() {
 bool catsync_has_pending() { return g.pend_count != 0; }
 void catsync_drop_pending() { free_pending(); }
 
+void catsync_drop_pending_cat(uint64_t id) {
+    for (uint32_t i = 0; i < g.pend_count; ++i) {
+        if (g.pend_id[i] != id) continue;
+        free(g.pend_data[i]);
+        const uint32_t last = --g.pend_count;
+        g.pend_id[i] = g.pend_id[last];
+        g.pend_hash[i] = g.pend_hash[last];
+        g.pend_size[i] = g.pend_size[last];
+        g.pend_data[i] = g.pend_data[last];
+        g.pend_data[last] = nullptr;
+        return;
+    }
+}
+
 void catsync_mark_sent() {
     ensure_state();
     RunCats rc{};
@@ -595,11 +609,11 @@ void catsync_take_equipment(bool keep) {
     free_pending();
 }
 
-static void apply_now(const CatDataMsg& m, const char* when) {
+static bool apply_now(const CatDataMsg& m, const char* when) {
     if (fnv1a(m.data, m.size) != m.hash) {
         log_line("CATSYNC", "!! cat %016llx failed its hash -- not applied",
                  (unsigned long long)m.id);
-        return;
+        return false;
     }
 
     // The run's cat list when there is a run; in the House there is none, but
@@ -611,7 +625,7 @@ static void apply_now(const CatDataMsg& m, const char* when) {
         if (!g.director_slot || !mem_read(g.director_slot, &dir, sizeof(dir)) || !dir ||
             !mem_read((const uint8_t*)dir + kDir_CatRegistry, &rc.registry, sizeof(rc.registry)) ||
             !rc.registry)
-            return;   // before a save is loaded: nothing to write into
+            return false;   // before a save is loaded: nothing to write into
     }
 
     void* cat = nullptr;
@@ -619,11 +633,11 @@ static void apply_now(const CatDataMsg& m, const char* when) {
         log_line("CATSYNC", "!! cat %016llx is not in this peer's run -- not "
                             "applied. The two runs are not the same run.",
                  (unsigned long long)m.id);
-        return;
+        return false;
     }
 
     uint8_t bs[kByteStreamSize];
-    if (!bs_construct(bs)) return;
+    if (!bs_construct(bs)) return false;
 
     *(uint32_t*)(bs + kBS_Mode)    = 0;              // read
     *(const void**)(bs + kBS_ReadBuf) = m.data;      // BORROWED, see kBS_ReadOwns
@@ -655,6 +669,7 @@ static void apply_now(const CatDataMsg& m, const char* when) {
                             "copy of that cat is now UNTRUSTWORTHY",
                  (unsigned long long)m.id);
     }
+    return ok;
 }
 
 static void free_pending() {
@@ -854,6 +869,6 @@ bool catsync_snapshot(void* cat, CatDataMsg& m) {
     m.hash = fnv1a(m.data, m.size);
     return true;
 }
-void     catsync_apply_now(const CatDataMsg& m, const char* why) { apply_now(m, why); }
+bool     catsync_apply_now(const CatDataMsg& m, const char* why) { return apply_now(m, why); }
 
 } // namespace mgmp

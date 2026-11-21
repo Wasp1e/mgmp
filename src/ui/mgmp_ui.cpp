@@ -358,7 +358,7 @@ float tear(uint32_t i, uint32_t salt) {
     return (float)(h & 0xFFFF) / 65535.0f;
 }
 
-void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false) {
+void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false, bool long_tears = true) {
     std::vector<ImVec2> pts;
     const float step = 26.0f;
     // top, left to right
@@ -371,7 +371,7 @@ void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false) {
     uint32_t k = 0;
     for (float x = b.x; x > a.x; x -= step, ++k) {
         float y = b.y + (tear(k, 3) - 0.5f) * 8.0f;
-        if (tear(k, 6) > 0.84f) y += 14.0f + tear(k, 4) * 24.0f;
+        if (long_tears && tear(k, 6) > 0.84f) y += 14.0f + tear(k, 4) * 24.0f;
         pts.push_back(ImVec2(x, y));
     }
     // left side
@@ -473,9 +473,12 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
 // A one-line scrap at the top, no buttons, not taking the mouse.
 // `beside_round`: in a fight, top right under the game's turn order (the
 // user's pick, 2026-11-05), not over the round counter; otherwise centred.
-void draw_paper_note(const char* text, bool beside_round = false) {
+void draw_paper_note(const char* text, bool beside_round = false, bool ready_counter = false) {
     const ImGuiIO& io = ImGui::GetIO();
-    if (beside_round)
+    if (ready_counter)
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f, io.DisplaySize.y - 24.0f),
+                                ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    else if (beside_round)
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f, io.DisplaySize.y * 0.15f),
                                 ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     else
@@ -487,11 +490,12 @@ void draw_paper_note(const char* text, bool beside_round = false) {
     const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
                                ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
-    if (ImGui::Begin("##mgmp_endday", nullptr, f)) {
+    if (ImGui::Begin(ready_counter ? "##mgmp_ready_counter" : "##mgmp_endday", nullptr, f)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->ChannelsSplit(2);
         dl->ChannelsSetCurrent(1);
-        if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f);
+        if (g.paper_font || ready_counter)
+            ImGui::PushFont(g.paper_font ? g.paper_font : ImGui::GetFont(), ready_counter ? 48.0f : 32.0f);
         const std::string t = upper_utf8(text);
         const ImVec2 sz = ImGui::CalcTextSize(t.c_str());
         const ImVec2 at0 = ImGui::GetCursorScreenPos();
@@ -499,11 +503,12 @@ void draw_paper_note(const char* text, bool beside_round = false) {
         for (int o = 0; o < 4; ++o)
             dl->AddText(ImVec2(at0.x + (o & 1) * 1.1f, at0.y + (o >> 1) * 1.0f), ink, t.c_str());
         ImGui::Dummy(ImVec2(sz.x + 1.1f, sz.y + 1.0f));
-        if (g.paper_font) ImGui::PopFont();
+        if (g.paper_font || ready_counter) ImGui::PopFont();
         dl->ChannelsSetCurrent(0);
         dl->PushClipRectFullScreen();
         const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12), true);
+        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12),
+              true, !ready_counter);
         dl->PopClipRect();
         dl->ChannelsMerge();
     }
@@ -1247,7 +1252,9 @@ void ui_on_swap(void* window) {
                  box_mine, box_most);
         note = box_note;
     }
-    g.forced = loading || night || note;
+    uint32_t ready_count = 0, ready_total = 0;
+    const bool run_ready = !loading && classpick_ready_badge(ready_count, ready_total);
+    g.forced = loading || night || note || run_ready;
     if (!g.visible && !g.forced) return;
 
     if (!g.ready) {
@@ -1270,6 +1277,11 @@ void ui_on_swap(void* window) {
     if (loading) draw_loading(step);
     if (night) draw_night(night, nights, loading);
     else if (note && !loading) draw_paper_note(note, true);   // all in the top right corner
+    if (run_ready) {
+        char label[16];
+        snprintf(label, sizeof(label), "%u/%u", ready_count, ready_total);
+        draw_paper_note(label, false, true);
+    }
 
     ImGui::Render();
     // RenderDrawData backs up and restores the GL state it touches, which is

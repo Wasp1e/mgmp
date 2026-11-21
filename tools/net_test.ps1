@@ -254,6 +254,14 @@ $outDir = Get-CmakeOutDir
 # that does not exist cannot be replaced. Against an object none of that is
 # needed: a key that is absent is simply assigned.
 $baseConfig = Get-Content (Join-Path $outDir 'mgmp.json') -Raw
+$houseOptions = @{
+    HousePositions = 'house_positions'
+    HouseWalk = 'house_walk_sync'
+    HouseActions = 'house_action_sync'
+    HouseDrag = 'house_drag_trace'
+    HouseDragSync = 'house_drag_sync'
+    HouseCatSync = 'house_cat_sync'
+}
 foreach ($peer in $peers.Keys) {
     $dir = Join-Path $root $peers[$peer]
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -297,12 +305,11 @@ foreach ($peer in $peers.Keys) {
     # keep alive.
     $cfg.debug.desync_halt     = -not $NoHalt
     $cfg.debug.record          = [bool]$Record
-    $cfg.debug | Add-Member -NotePropertyName house_positions -NotePropertyValue ([bool]$HousePositions) -Force
-    $cfg.debug | Add-Member -NotePropertyName house_walk_sync -NotePropertyValue ([bool]$HouseWalk) -Force
-    $cfg.debug | Add-Member -NotePropertyName house_action_sync -NotePropertyValue ([bool]$HouseActions) -Force
-    $cfg.debug | Add-Member -NotePropertyName house_drag_trace -NotePropertyValue ([bool]$HouseDrag) -Force
-    $cfg.debug | Add-Member -NotePropertyName house_drag_sync -NotePropertyValue ([bool]$HouseDragSync) -Force
-    $cfg.debug | Add-Member -NotePropertyName house_cat_sync -NotePropertyValue ([bool]$HouseCatSync) -Force
+    foreach ($option in $houseOptions.Keys) {
+        if ($PSBoundParameters.ContainsKey($option)) {
+            $cfg.debug | Add-Member -NotePropertyName $houseOptions[$option] -NotePropertyValue ([bool]$PSBoundParameters[$option]) -Force
+        }
+    }
     $cfg.debug.record_note     = "lockstep $peer, cats [$cats]"
     # Lockstep owns Brain::GetChoice. Leaving a replay file configured would put
     # two injectors on one buffer, and lockstep wins -- so the replay would

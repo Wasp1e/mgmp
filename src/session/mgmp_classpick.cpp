@@ -16,6 +16,7 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <intrin.h>
 
@@ -126,7 +127,7 @@ constexpr uint64_t kFree        = ~0ull;
 constexpr uint64_t kGoneMs      = 500;
 constexpr uint64_t kResendMs    = 2000;
 constexpr uint64_t kStaleMs     = 6000;
-constexpr uint64_t kEmbarkAgain = 10000;
+constexpr uint64_t kConfirmRetryMs = 1500;
 
 using fn_this = void* (__fastcall*)(void*, void*, void*, void*);
 using fn_click = void (__fastcall*)(void*);
@@ -165,7 +166,6 @@ struct State {
     uint64_t sent_at   = 0;
     bool     open_sent = false;
     bool     applying  = false;
-    uint64_t embark_at = 0;
     uint64_t said_cat  = 0;
     Pick     queue[8]  = {};
     uint32_t queued    = 0;
@@ -178,7 +178,6 @@ struct State {
     fn_lookup lookup    = nullptr;
     uint64_t run_tried_at = 0;
     fn_parts parts      = nullptr;
-    uint64_t embark_refused_at = 0;
     bool     embark_due = false;        // client: the host embarked; this chooser follows
     void*    embark_for = nullptr;      // ...for this chooser
     struct Gear { bool on; uint64_t cat; uint64_t item; uint8_t list; char name[48]; };
@@ -194,6 +193,10 @@ struct State {
     uint64_t mut_key[kClassPickCats] = {};      // whose mutations muts[] holds
     char     muts[kClassPickCats][48] = {};
     uint64_t inv_at     = 0;     // the inventory screen's last update
+    void*    inv_screen = nullptr;
+    void*    adventure_gear = nullptr;
+    void*    run_backpack = nullptr;
+    void*    gear_ready_for = nullptr;  // an explicit click before the stage was published
     bool     host_gear_closed = false;   // client: the host left its gear screen
     uint64_t host_gear_closed_at = 0;
     uint8_t  phase      = 0;     // what was last sent: 0 none, 1 collars, 2 gear
@@ -207,6 +210,91 @@ struct State {
 };
 
 State g;
+
+struct RunReady {
+    uint64_t id = 0;
+    void* screen = nullptr;   // host's instance of this stage
+    uint64_t attempted_at = 0;
+    uint32_t phase = 0;
+    uint32_t count = 0;
+    uint32_t total = 0;
+    bool transitioning = false;
+    bool voted[kNoPeer] = {};
+};
+
+RunReady ready;
+void* authorized_gear_exit = nullptr;
+uint64_t ready_sequence = 0;
+CatDataMsg gear_cats[kClassPickCats] = {};
+uint32_t gear_cat_count = 0;
+uint32_t gear_cat_expected = 0;
+bool gear_cats_required = false;
+bool gear_cats_applied = false;
+bool gear_cats_failed = false;
+
+bool shared_start() { return net_active() && net_peer_count() >= 2; }
+
+void clear_gear_cats() {
+    for (uint32_t i = 0; i < gear_cat_count; ++i) {
+        free(gear_cats[i].data);
+        gear_cats[i] = CatDataMsg{};
+    }
+    gear_cat_count = 0;
+    gear_cat_expected = 0;
+}
+
+void publish_ready() {
+    uint8_t peers[kMaxPeers];
+    if (!net_peer_ids(peers, kMaxPeers)) return;
+    ready.total = net_peer_count();
+    ready.count = 0;
+    for (uint32_t i = 0; i < ready.total; ++i) ready.count += ready.voted[peers[i]];
+    ChoiceMsg m{};
+    m.kind = kChoiceRunReadyState;
+    m.node_seed = ready.id;
+    m.index = ready.phase;
+    m.count = ready.total;
+    m.aux = ready.count;
+    net_send_choice(m);
+}
+
+void begin_ready(uint32_t phase, void* screen) {
+    if ((ready.phase == phase && ready.screen == screen) || !screen) return;
+    ready = RunReady{};
+    ready.id = ++ready_sequence;
+    ready.screen = screen;
+    ready.phase = phase;
+}
+
+void press_ready(uint32_t phase, void* screen) {
+    if (ready.phase != phase || !ready.id) return;
+    if (net_role() == NetRole::Host) {
+        if (ready.screen != screen) return;
+        ready.voted[kHostPeer] = !ready.voted[kHostPeer];
+        publish_ready();
+        if (ready.voted[kHostPeer])
+            log_line("CLASSPICK", "host confirmed %s (%u/%u)", phase == 1 ? "collars" : "gear",
+                     ready.count, ready.total);
+    } else {
+        ChoiceMsg m{};
+        m.kind = kChoiceRunReadyVote;
+        m.node_seed = ready.id;
+        m.index = phase;
+        m.aux = !ready.voted[net_self()];
+        if (net_send_choice(m)) ready.voted[net_self()] = m.aux != 0;
+    }
+}
+
+bool take_ready(uint32_t phase, void* screen) {
+    if (net_role() != NetRole::Host || !shared_start() || ready.phase != phase ||
+        ready.screen != screen || ready.attempted_at || ready.total < 2 ||
+        ready.total != net_peer_count() || ready.count != ready.total)
+        return false;
+    ready.attempted_at = GetTickCount64();
+    log_line("CLASSPICK", "every player confirmed %s (%u/%u)",
+             phase == 1 ? "collars" : "gear", ready.count, ready.total);
+    return true;
+}
 
 bool chooser_up() { return g.chooser && GetTickCount64() - g.seen < kGoneMs; }
 
@@ -238,6 +326,50 @@ bool apply_gear();
 bool run_gear();
 uint64_t key_of(void* cat);
 
+// The chooser's native continuation commits the party before it invokes the
+// callback that opens InventoryScreen2. Apply the host's party before init
+// builds the native widgets that refer into each cat's equipment.
+constexpr uintptr_t kRva_InvInit = 0x349F70;
+// The InventoryScreen2 constructor for adventure preparation, used both when
+// the collar chooser completes and when a save resumes directly on gear.
+constexpr uintptr_t kRva_AdventureGearInitReturn = 0x399822;
+const uint8_t kInvInitHead[] = {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10};
+using fn_inv_init = void* (__fastcall*)(void*, uint32_t, void*, void*, uint8_t);
+fn_inv_init o_inv_init = nullptr;
+uint32_t inv_initializing = 0;
+
+void* __fastcall inv_init(void* a, uint32_t b, void* c, void* d, uint8_t e) {
+    authorized_gear_exit = nullptr;
+    uint32_t node = 0;
+    const bool backpack = follow_current_node(node) || follow_marker_node(node) ||
+                          lockstep_in_battle();
+    g.run_backpack = backpack ? a : nullptr;
+    void* done = nullptr;
+    const bool starts_run = b == 0 && e == 0 && d &&
+        mem_read((const uint8_t*)d + 0x38, &done, sizeof(done)) && !done;
+    const bool adventure = !backpack && (starts_run ||
+        (uintptr_t)_ReturnAddress() == g.base + kRva_AdventureGearInitReturn ||
+        (net_role() == NetRole::Host ? g.claimed_for != nullptr : g.embark_due && gear_cats_required));
+    g.adventure_gear = adventure ? a : nullptr;
+    g.gear_ready_for = nullptr;
+    if (adventure && shared_start())
+        log_line("CLASSPICK", "opened the adventure gear screen");
+    if (adventure && net_role() != NetRole::Host && g.embark_due && gear_cats_required &&
+        !gear_cats_applied && !gear_cats_failed) {
+        bool ok = true;
+        for (uint32_t i = 0; i < gear_cat_count; ++i)
+            ok &= catsync_apply_now(gear_cats[i], "after collars, before the gear screen");
+        gear_cats_applied = ok;
+        gear_cats_failed = !ok;
+        clear_gear_cats();
+        if (!ok) log_line("CLASSPICK", "!! could not apply the host's party before the gear screen");
+    }
+    ++inv_initializing;
+    void* result = o_inv_init(a, b, c, d, e);
+    --inv_initializing;
+    return result;
+}
+
 // What the gear screen's sort buttons call after re-sorting (the storage
 // grid's sub_14034AA00, then sub_14034B620): the screen built again from the
 // data, which is what the client's needs after the host's items moved in it --
@@ -254,39 +386,79 @@ bool safe_rebuild(void* screen) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-// CLIENT: its gear screen's confirm, <lambda_1> of InventoryScreen2::init
-// (vftable 0xF11D10, _Do_call sub_140351300 -> sub_14034D870), does nothing
-// while the host's gear screen is up: confirmed here it set off this game's own
-// fight or map, and the run or the fight is the host's, by its save. Staying
-// on this screen is also where the host's embark cutscene plays.
-constexpr uintptr_t kRva_GearConfirmSlot = 0xF11D10 + 2 * 8;
-constexpr uintptr_t kRva_GearConfirm     = 0x351300;
-void* __fastcall gear_confirm(void* a, void* b, void* c, void* d) {
-    if (net_role() != NetRole::Host && net_active() && g.active && g.view.phase == 2) {
-        log_line("CLASSPICK", "confirm pressed on this gear screen -- the host confirms, this game follows");
-        return nullptr;
+// InventoryScreen2::done advances the adventure when +0x60 is zero.
+bool advances_run(void* screen) {
+    if (screen == g.run_backpack) return false;
+    uint8_t return_only = 1;
+    return screen && mem_read((const uint8_t*)screen + 0x60, &return_only, sizeof(return_only)) &&
+           !return_only;
+}
+
+constexpr uintptr_t kRva_GearConfirm = 0x34D870;
+const uint8_t kGearConfirmHead[] = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x81};
+using fn_gear_confirm = void (__fastcall*)(void*);
+fn_gear_confirm o_gear_confirm = nullptr;
+
+void __fastcall gear_confirm(void* screen) {
+    if (screen == g.run_backpack) {
+        o_gear_confirm(screen);
+        return;
     }
-    return g.o_confirm(a, b, c, d);
+    if (shared_start() && screen &&
+        (advances_run(screen) || screen == g.adventure_gear ||
+         (net_role() == NetRole::Host && g.claimed_for))) {
+        g.adventure_gear = screen;
+        if (ready.phase != 2 || (net_role() == NetRole::Host && ready.screen != screen)) {
+            if (net_role() != NetRole::Host)
+                g.gear_ready_for = g.gear_ready_for == screen ? nullptr : screen;
+            return;
+        }
+        if (net_role() == NetRole::Host) {
+            if (ready.attempted_at && GetTickCount64() - ready.attempted_at >= kConfirmRetryMs)
+                ready.attempted_at = 0;   // retry after a native prompt was dismissed
+        }
+        if (net_role() == NetRole::Host || !gear_cats_required || gear_cats_applied)
+            press_ready(2, screen);
+        return;
+    }
+    // Defense keeps following the host; its native screen has its own callback.
+    if (shared_start() && net_role() != NetRole::Host && g.active && g.view.phase == 2) return;
+    o_gear_confirm(screen);
 }
 
 void dim_slots(void* screen);
 void dim_tag(void* tag);
 
 void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
+    // Native init calls update before its equipment widgets are finished.
+    // Network edits and rebuilds must wait for the first ordinary update.
+    if (inv_initializing) return g.o_inv(a, b, c, d);
     g.inv_at = GetTickCount64();
-    if (net_role() != NetRole::Host) startrun_scene_tick(a);
+    g.inv_screen = a;
+    if (advances_run(a)) g.adventure_gear = a;
+    if (net_role() != NetRole::Host) {
+        startrun_scene_tick(a);
+        if (a == g.adventure_gear && a == g.gear_ready_for && g.active &&
+            g.view.phase == 2 && ready.phase == 2 && (!gear_cats_required || gear_cats_applied)) {
+            g.gear_ready_for = nullptr;
+            press_ready(2, a);
+        }
+    }
     if (net_role() != NetRole::Host && g.gear_n && apply_gear() && !safe_rebuild(a))
         log_line("CLASSPICK", "!! rebuilding this game's gear screen faulted");
-    // NOT the host's cats here. Applied under this screen, they took the items
-    // its slots still pointed at, and the friend's game went down on its next
-    // update (2026-11-13, 0x140942DC1 from the slot-lock test). They are held
-    // through the gear screen and land on the map, before the first node.
+    // Full cat snapshots are only safe before InventoryScreen2::init builds
+    // the slots. Ordinary CATDATA remains deferred through this screen.
     // The friend's gear, put on from inside the screen's own update.
     if (net_role() == NetRole::Host && (g.phase == 2 || run_gear()) && g.equipped) {
         apply_equips();
         // The friend's items moved under this screen too: built again, as the
         // client's is (else they showed only at the host's next click).
         if (!safe_rebuild(a)) log_line("CLASSPICK", "!! rebuilding the gear screen faulted");
+    }
+    if (o_gear_confirm && take_ready(2, a)) {
+        authorized_gear_exit = a;
+        o_gear_confirm(a);
+        return nullptr;
     }
     void* r = g.o_inv(a, b, c, d);
     dim_slots(a);
@@ -299,6 +471,8 @@ void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
     return r;
 }
 
+void commit_collars();
+
 void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
     void* ch = nullptr;
     if (mem_read((const uint8_t*)a + kTag_Chooser, &ch, sizeof(ch)) && ch) {
@@ -308,6 +482,8 @@ void* __fastcall tag_tick(void* a, void* b, void* c, void* d) {
     void* r = g.o_tick(a, b, c, d);
     dim_tag(a);
     if (net_role() != NetRole::Host) startrun_scene_tick(nullptr);
+    else if (g.o_embark && ch == g.claimed_for && g.cats && !g.queued && take_ready(1, ch))
+        commit_collars();
     // From inside the chooser's own update: the embark may ask its popup (a cat
     // with no collar), and a popup outside a scene's update faults -- the
     // client did at 0x14077DD5F on 2026-11-05, called from the frame's end.
@@ -436,36 +612,34 @@ void* __fastcall tag_click(void* a, void* b, void* c, void* d) {
     return g.o_click(a, b, c, d);
 }
 
-// Embarking before the friend has dressed their cats takes a second click.
-// The client's own chooser never embarks: the run is the host's, its save follows.
+constexpr uintptr_t kRva_EmbarkLambdaVt = 0xEE2250;
+constexpr uintptr_t kRva_AcceptCollars = 0x13FCE0;
+const uint8_t kAcceptCollarsHead[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B};
+
 void* __fastcall embark(void* a, void* b, void* c, void* d) {
-    if (client_chooser() && !g.embark_due) {
-        g.embark_refused_at = GetTickCount64();
-        log_line("CLASSPICK", "embark pressed here -- the host confirms, this game follows");
-        return nullptr;
+    if (!shared_start()) return g.o_embark(a, b, c, d);
+    void* screen = ((void**)a)[2];
+    if (net_role() == NetRole::Host) {
+        begin_ready(1, screen);
+        if (ready.attempted_at && GetTickCount64() - ready.attempted_at >= kConfirmRetryMs)
+            ready.attempted_at = 0;
     }
-    if (vote_on() && chooser_up()) {
-        void* tags[kClassPickTags];
-        const uint32_t n = read_tags(g.chooser, tags);
-        uint32_t bare = 0;
-        for (uint32_t i = 0; i < g.cats; ++i) {
-            if (!g.owner[i]) continue;
-            bool dressed = false;
-            for (uint32_t t = 0; t < n; ++t) dressed |= tag_cat(tags[t]) == g.key[i];
-            bare += !dressed;
-        }
-        const uint64_t now = GetTickCount64();
-        if (bare && now - g.embark_at > kEmbarkAgain) {
-            g.embark_at = now;
-            log_line("CLASSPICK", "%u of the other player's cats have no collar yet -- "
-                                  "press embark again to go anyway", bare);
-            return nullptr;
-        }
-    }
+    press_ready(1, screen);
+    return nullptr;
+}
+
+void commit_collars() {
+    void* const* slot = (void* const*)addr_of_data(D_MewDirectorPtr);
+    void* dir = nullptr;
+    if (!slot || !mem_read(slot, &dir, sizeof(dir)) || !dir) return;
+    g.embark_closure[0] = (void*)(g.base + kRva_EmbarkLambdaVt);
+    g.embark_closure[1] = dir;
+    g.embark_closure[2] = g.chooser;
     // From here the chooser hands its classes to the cats and frees its collars;
     // a list read now says no cat wears one, and the client took every host
     // cat's collar off by it (2026-11-05). So nothing more goes out of this one.
-    if (vote_on() && chooser_up()) { g.embarking = g.chooser; g.embarking_at = GetTickCount64(); }
+    g.embarking = g.chooser;
+    g.embarking_at = GetTickCount64();
     // THE CLASS ABILITIES. The confirm gives each cat its class's abilities, and
     // draws them from the ability pool on the simulation stream (sub_1400B7320,
     // TLS+0x178) -- the friend's own stream drew others, and the two screens
@@ -482,7 +656,7 @@ void* __fastcall embark(void* a, void* b, void* c, void* d) {
             net_send_choice(m);
         }
     }
-    return g.o_embark(a, b, c, d);
+    g.o_embark(g.embark_closure, nullptr, nullptr, nullptr);
 }
 
 uint64_t g_embark_rng[4] = {};
@@ -846,15 +1020,34 @@ void hook_slot_locked(uintptr_t base) {
 // The cats each player put in the House's box are that player's: pinned before
 // the split, which keeps a cat's row and deals only cats nobody picked.
 void pin_friend_picks(const uint64_t* uid, uint32_t n) {
-    if (net_peer_count() < 2) return;
+    const uint32_t players = net_peer_count();
+    if (players < 2) return;
+    uint32_t counts[kMaxPeers] = {};
+    uint32_t capacity[kMaxPeers] = {};
+    int owners[kClassPickCats];
+    for (uint32_t p = 0; p < players; ++p)
+        capacity[p] = n / players + (p < n % players ? 1 : 0);
+    // Preserve each player's picks up to their share, then distribute the
+    // remaining cats to players whose share is still incomplete.
     for (uint32_t i = 0; i < n; ++i) {
         const int p = startrun_box_picker(g.key[i]);
-        // The host's too: a row left in the owner table from an earlier run of
-        // the same cats gave the friend a third cat the host had put in
-        // (2026-11-14). Every cat in the box is its picker's, nothing is dealt.
-        if (p < 0 || (uint32_t)p >= net_peer_count()) continue;
-        lockstep_owner_put(uid[i], (uint8_t)p);
-        log_line("CLASSPICK", "  cat '%s' went in the box from player %d -- theirs", g.name[i], p);
+        owners[i] = -1;
+        if (p >= 0 && (uint32_t)p < players && counts[p] < capacity[p]) {
+            owners[i] = p;
+            ++counts[p];
+        }
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (owners[i] < 0) {
+            for (uint32_t p = 0; p < players; ++p) {
+                if (counts[p] >= capacity[p]) continue;
+                owners[i] = (int)p;
+                ++counts[p];
+                break;
+            }
+        }
+        lockstep_owner_put(uid[i], (uint8_t)owners[i]);
+        log_line("CLASSPICK", "  cat '%s' assigned to player %d", g.name[i], owners[i]);
     }
 }
 
@@ -1371,13 +1564,28 @@ void publish(uint8_t phase) {
     h = (h ^ phase) * 0x100000001B3ull;
     const uint64_t now = GetTickCount64();
     if (h == g.sent_hash && now - g.sent_at < kResendMs) return;
-    // A collar gives a cat its class's STARTER_PLACEHOLDER_ ability and passive
-    // (sub_1400BDC70), and each game turns those into class abilities of its
-    // own choosing: on 2026-11-11 the gear screens showed other ones. So the
-    // cats as this game has them on its gear screen go over whole, ahead of the
-    // screen's own messages; the client applies them past its chooser's embark.
-    if (phase == 2 && (!g.open_sent || g.phase != phase))
-        catsync_push_keys(g.key, g.cats, "the party with its class abilities, for the gear screen");
+    if (phase == 2 && g.claimed_for && g.phase != phase) {
+        // Send the resolved abilities and passives separately from ordinary
+        // CATDATA, which intentionally waits until the map opens.
+        ChoiceMsg batch{};
+        batch.kind = kChoiceGearCatBatch;
+        batch.count = g.cats;
+        if (!net_send_choice(batch)) return;
+        for (uint32_t i = 0; i < g.cats; ++i) {
+            CatDataMsg cat{};
+            if (!catsync_snapshot(run_cat(i), cat)) return;
+            const bool sent = net_send_gearcat(cat);
+            free(cat.data);
+            if (!sent) return;
+        }
+        log_line("CLASSPICK", "-> sent %u party snapshots with resolved starter abilities", g.cats);
+    } else if (phase == 2 && g.phase != phase) {
+        catsync_push_keys(g.key, g.cats, "the party on the gear screen");
+    }
+    if (phase == 1 || g.claimed_for || (g.inv_screen && g.inv_screen == g.adventure_gear)) {
+        begin_ready(phase, phase == 1 ? g.chooser : g.inv_screen);
+        publish_ready();
+    }
     for (uint32_t i = 0; i < g.cats; ++i)
         send(kChoiceClassCat, i, g.cats, g.owner[i], g.key[i], g.name[i]);
     for (uint32_t t = 0; t < n; ++t)
@@ -1505,6 +1713,7 @@ void close_menu(const char* why) {
     g.open_sent = false;
     g.sent_hash = 0;
     g.phase     = 0;
+    ready = RunReady{};
 }
 
 void forget_cats() {
@@ -1513,6 +1722,7 @@ void forget_cats() {
     g.queued      = 0;
     g.equipped    = 0;
     g.chooser     = nullptr;
+    g.gear_ready_for = nullptr;
     g.gear_seen   = false;
     g.chooser_gone_at = 0;
 }
@@ -1541,13 +1751,15 @@ void host_pump() {
     // from inside its update, see inv_tick).
     if (g.equipped && !inv_up() && g.phase != 2 && run_gear()) apply_equips();
     uint8_t phase = 0;
+    const bool adventure_gear_up = g.adventure_gear && g.inv_screen == g.adventure_gear && inv_up();
     // Not the backpack on the map, nor anything in a fight: those are the run's
     // own inventory, which the cat sync already carries.
     // Not the backpack opened on the run's map either: the map stops ticking
     // under it, and taken for the House defense's gear screen it locked the
     // friend's backpack shut (its confirm is this screen's close; 2026-11-07).
-    if (!chooser_up() && !g.cats && inv_up() && !follow_on_map() && !combatlock_menu_live() &&
-        !leave_scene_up("Map") && now - g.run_tried_at > kScanMs) {
+    if (!chooser_up() && !g.cats && inv_up() && g.inv_screen != g.run_backpack &&
+        now - g.run_tried_at > kScanMs &&
+        (adventure_gear_up || (!follow_on_map() && !combatlock_menu_live() && !leave_scene_up("Map")))) {
         g.run_tried_at = now;
         if (claim_run()) g.chooser_gone_at = now;
     }
@@ -1555,7 +1767,7 @@ void host_pump() {
         phase = 1;
         g.chooser_gone_at = 0;
         g.gear_seen       = false;
-    } else if (g.cats) {
+    } else if (g.cats || adventure_gear_up) {
         if (!g.chooser_gone_at) {
             g.chooser_gone_at = now;
             g.queued          = 0;
@@ -1700,8 +1912,20 @@ void classpick_set_base(uintptr_t base) {
           "the collar click");
     patch(base, kRva_EmbarkSlot, kRva_Embark, (void*)&embark, g.o_embark,
           "the embark button");
-    patch(base, kRva_GearConfirmSlot, kRva_GearConfirm, (void*)&gear_confirm, g.o_confirm,
-          "the gear screen's confirm");
+    void* confirm = (void*)(base + kRva_GearConfirm);
+    if (memcmp(confirm, kGearConfirmHead, sizeof(kGearConfirmHead)) != 0 ||
+        MH_CreateHook(confirm, (void*)&gear_confirm, (void**)&o_gear_confirm) != MH_OK ||
+        MH_EnableHook(confirm) != MH_OK) {
+        o_gear_confirm = nullptr;
+        log_line("CLASSPICK", "!! could not hook native gear confirmation");
+    }
+    void* init = (void*)(base + kRva_InvInit);
+    if (memcmp(init, kInvInitHead, sizeof(kInvInitHead)) != 0 ||
+        MH_CreateHook(init, (void*)&inv_init, (void**)&o_inv_init) != MH_OK ||
+        MH_EnableHook(init) != MH_OK) {
+        o_inv_init = nullptr;
+        log_line("CLASSPICK", "!! could not hook gear initialization for the host's class abilities");
+    }
     if (!patch(base, kRva_InvScreenSlot, kRva_InvScreenTick, (void*)&inv_tick, g.o_inv,
                "the inventory screen"))
         log_line("CLASSPICK", "!! so the other player cannot put gear on their cats");
@@ -1772,23 +1996,21 @@ void mirror_host() {
 }
 
 // CLIENT: the host confirmed its collars, so this game's chooser confirms too and
-// goes on to its own gear screen. The embark button's callback, <lambda_1> of
-// ClassChooser::init (vftable 0xEE2250, _Do_call sub_140141E40), is
-// {vftable, MewDirector*, ClassChooser*}; one is made here to call it with.
-constexpr uintptr_t kRva_EmbarkLambdaVt = 0xEE2250;
+// goes on to its own gear screen. Use the accepted callback of the collarless
+// popup: the host has already answered it if there were any bare cats.
 void follow_embark() {
-    // Once a chooser: while the collarless popup is up the chooser does not tick,
-    // and taking that for its end confirmed it again and again (2026-11-05).
     if (g.embark_for != g.chooser) { g.embark_for = g.chooser; g.embark_due = false; }
-    if (!client_chooser() || !g.active || g.view.phase != 2 || g.embark_due) return;
-    void* const* slot = (void* const*)addr_of_data(D_MewDirectorPtr);
-    void* dir = nullptr;
-    if (!slot || !mem_read(slot, &dir, sizeof(dir)) || !dir) return;
-    // Not on the stack: the popup's answer calls back through it later, and a
-    // dead stack frame there is what the client fell over on "no".
-    g.embark_closure[0] = (void*)(g.base + kRva_EmbarkLambdaVt);
-    g.embark_closure[1] = dir;
-    g.embark_closure[2] = g.chooser;
+    if (!client_chooser() || !g.active || g.view.phase != 2 || g.embark_due ||
+        !gear_cats_required || !o_inv_init || gear_cat_count != g.view.cats ||
+        gear_cat_count != gear_cat_expected || !gear_cat_count) return;
+    for (uint32_t c = 0; c < g.view.cats; ++c) {
+        bool found = false;
+        for (uint32_t i = 0; i < gear_cat_count; ++i)
+            found |= gear_cats[i].id == g.view.cat_key[c];
+        if (!found) return;
+    }
+    const void* accept = (const void*)(g.base + kRva_AcceptCollars);
+    if (memcmp(accept, kAcceptCollarsHead, sizeof(kAcceptCollarsHead)) != 0) return;
     g.embark_due = true;
     if (g_embark_rng_at && GetTickCount64() - g_embark_rng_at < 120000) {
         if (uint64_t* s = rng_global_stream()) {
@@ -1797,7 +2019,7 @@ void follow_embark() {
         }
         g_embark_rng_at = 0;
     }
-    g.o_embark(g.embark_closure, nullptr, nullptr, nullptr);
+    ((fn_click)accept)(g.chooser);
     log_line("CLASSPICK", "<- the host confirmed its collars -- this game's chooser confirms too");
 }
 
@@ -1821,25 +2043,110 @@ void say_backpack() {
 }
 
 void classpick_pump() {
+    if (inv_initializing) return;
     say_backpack();
     if (!g.o_tick || !g.o_click) return;
+    if (!shared_start()) {
+        ready = RunReady{};
+        if (gear_cat_count) clear_gear_cats();
+        gear_cats_required = false;
+    }
     if (net_role() == NetRole::Host) { host_pump(); return; }
     if (g.gear_n && !inv_up() && run_gear()) apply_gear();
     mirror_host();
     if (g.active && GetTickCount64() - g.last_end > kStaleMs) {
         g.active = false;
+        ready = RunReady{};
         log_line("CLASSPICK", "the host stopped sending its class chooser");
     }
+}
+
+void classpick_on_run_restart() {
+    ready = RunReady{};
+    clear_gear_cats();
+    gear_cats_required = false;
+    gear_cats_applied = false;
+    gear_cats_failed = false;
+    authorized_gear_exit = nullptr;
+    forget_cats();
+    g.inv_screen = nullptr;
+    g.inv_at = 0;
+    g.adventure_gear = nullptr;
+    g.run_backpack = nullptr;
+    g.embark_due = false;
+    g.embark_for = nullptr;
+    g.embarking = nullptr;
+    g.active = false;
+    g.phase = 0;
+    g.open_sent = false;
+    g.sent_hash = 0;
+    g.gear_n = 0;
+    g.view = ClassPickView{};
+    g.building = ClassPickView{};
 }
 
 bool classpick_peer_in_backpack() {
     return g_peer_pack_at && GetTickCount64() - g_peer_pack_at < 2500;
 }
 
-bool classpick_on_message(const ChoiceMsg& m) {
+void classpick_on_gearcat(CatDataMsg& m, uint8_t from) {
+    if (from != kHostPeer || net_role() == NetRole::Host || !gear_cats_required ||
+        !m.data || !m.id || gear_cat_count == gear_cat_expected) return;
+    for (uint32_t i = 0; i < gear_cat_count; ++i)
+        if (gear_cats[i].id == m.id) return;
+    // A push from before the collars may already be waiting for the map.
+    catsync_drop_pending_cat(m.id);
+    gear_cats[gear_cat_count++] = m;
+    m.data = nullptr;   // consumed by inv_init or the next batch
+}
+
+bool classpick_on_message(const ChoiceMsg& m, uint8_t from) {
+    const bool host = net_role() == NetRole::Host;
+    if (m.kind == kChoiceRunReadyState) {
+        if (!host && from == kHostPeer && (m.index == 1 || m.index == 2) && m.node_seed &&
+            m.count >= 2 && m.count <= kMaxPeers && m.aux <= m.count) {
+            if (ready.id != m.node_seed) {
+                ready = RunReady{};
+                if (m.index == 1) g.embark_due = false;
+                else g.host_gear_closed = false;
+            }
+            ready.id = m.node_seed;
+            ready.phase = m.index;
+            ready.count = m.aux;
+            ready.total = m.count;
+        }
+        return true;
+    }
+    if (m.kind == kChoiceRunReadyVote) {
+        if (!host || !ready.id || ready.id != m.node_seed || ready.phase != m.index ||
+            from == kHostPeer || from == kNoPeer || m.aux > 1 || ready.attempted_at ||
+            ready.voted[from] == (m.aux != 0)) return true;
+        uint8_t peers[kMaxPeers];
+        if (!net_peer_ids(peers, kMaxPeers)) return true;
+        for (uint32_t i = 0; i < net_peer_count(); ++i) {
+            if (peers[i] != from) continue;
+            ready.voted[from] = m.aux != 0;
+            publish_ready();
+            log_line("CLASSPICK", "peer %u %s %s (%u/%u)", (unsigned)from,
+                     m.aux ? "confirmed" : "withdrew confirmation for",
+                     ready.phase == 1 ? "collars" : "gear", ready.count, ready.total);
+            break;
+        }
+        return true;
+    }
+    if (m.kind == kChoiceGearCatBatch) {
+        if (!host && from == kHostPeer && m.count && m.count <= kClassPickCats) {
+            clear_gear_cats();
+            gear_cat_expected = m.count;
+            gear_cats_required = true;
+            gear_cats_applied = false;
+            gear_cats_failed = false;
+        }
+        return true;
+    }
     if (m.kind == kChoiceEmbarkRng) {
         unsigned long long w2 = 0, w3 = 0;
-        if (net_role() != NetRole::Host && sscanf_s(m.name, "%16llx%16llx", &w2, &w3) == 2) {
+        if (!host && from == kHostPeer && sscanf_s(m.name, "%16llx%16llx", &w2, &w3) == 2) {
             g_embark_rng[0] = m.node_seed;
             g_embark_rng[1] = m.cat;
             g_embark_rng[2] = w2;
@@ -1852,7 +2159,7 @@ bool classpick_on_message(const ChoiceMsg& m) {
         // The run's backpack is the same screen with the same way out: the
         // host's closed backpack shut the friend's too (2026-11-14). Only the
         // gear screen that mirrors the host's collar chooser follows.
-        if (net_role() != NetRole::Host && g.active && g.view.phase == 2) {
+        if (!host && from == kHostPeer && g.active && g.view.phase == 2) {
             g.host_gear_closed    = true;
             g.host_gear_closed_at = GetTickCount64();
             if (GetTickCount64() - g.inv_at > 1000)
@@ -1879,8 +2186,6 @@ bool classpick_on_message(const ChoiceMsg& m) {
         m.kind != kChoiceClassBonus && m.kind != kChoiceClassWear &&
         m.kind != kChoiceGearOn && m.kind != kChoiceGearOff && m.kind != kChoiceRunOwner)
         return false;
-    const bool host = net_role() == NetRole::Host;
-
     if (m.kind == kChoiceRunOwner) {
         if (!host) lockstep_owner_put(m.cat, (uint8_t)m.aux);
         return true;
@@ -1929,7 +2234,7 @@ bool classpick_on_message(const ChoiceMsg& m) {
         }
         return true;
     }
-    if (host) return true;
+    if (host || from != kHostPeer) return true;
 
     ClassPickView& b = g.building;
     if (m.kind == kChoiceClassItem && m.index < kClassPickItems) {
@@ -1999,21 +2304,60 @@ bool classpick_on_message(const ChoiceMsg& m) {
                     ? "the host's class chooser is up -- pick your cats' collars in the panel"
                     : "the host's gear screen is up -- dress your cats in the panel");
             b.phase    = (uint8_t)m.aux;
-            g.host_gear_closed = false;
             g.view     = b;
             g.active   = true;
             g.last_end = GetTickCount64();
+            if (m.aux == 1 && gear_cats_required) {
+                clear_gear_cats();
+                gear_cats_required = false;
+            }
         } else {
             if (g.active) log_line("CLASSPICK", g.view.phase == 2 ? "the host's gear screen closed"
                                                                   : "the host embarked");
             // Closed is not left: Esc closes it too, back to the collars, and the
             // friend went on to ActSelection alone (2026-11-14). The host says
             // when it really leaves (kChoiceGearDone).
+            if (g.view.phase == 2) {
+                clear_gear_cats();
+                gear_cats_required = false;
+            }
             g.active = false;
+            ready = RunReady{};
         }
         b = ClassPickView{};
     }
     return true;
+}
+
+bool classpick_ready_badge(uint32_t& count, uint32_t& total) {
+    if (!shared_start() || !ready.id || ready.transitioning) return false;
+    if (net_role() == NetRole::Host) {
+        if (g.phase != ready.phase) return false;
+    } else if (!g.active || g.view.phase != ready.phase ||
+               (ready.phase == 2 && (g.inv_screen != g.adventure_gear ||
+                                     (gear_cats_required && !gear_cats_applied)))) {
+        return false;
+    }
+    count = ready.count;
+    total = ready.total;
+    return true;
+}
+
+void classpick_hide_ready_note() {
+    ready.transitioning = true;
+}
+
+bool classpick_allow_gear_exit(void* screen) {
+    if (screen == g.run_backpack) return true;
+    if (!shared_start() || net_role() != NetRole::Host ||
+        (!advances_run(screen) && screen != g.adventure_gear)) return true;
+    if (screen == authorized_gear_exit) {
+        authorized_gear_exit = nullptr;
+        return true;
+    }
+    g.adventure_gear = screen;
+    if (ready.phase == 2 && ready.screen == screen) press_ready(2, screen);
+    return false;
 }
 
 bool classpick_client_chooser_up() {

@@ -7,6 +7,7 @@
 #include "mgmp_runhist.h"
 #include "mgmp_savefile.h"
 #include "mgmp_follow.h"
+#include "mgmp_classpick.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_meow.h"
 #include "mgmp_net.h"
@@ -655,6 +656,7 @@ void follow_on_run_restart() {
     g.run_id    = (uint32_t)time(nullptr);
     g.have_here = false;      // the node we were in belongs to the run just left
     lockstep_on_run_restart();
+    classpick_on_run_restart();
     log_line("FOLLOW", "new load of the run: %08x", g.run_id);
 }
 

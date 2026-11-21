@@ -51,7 +51,8 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 104; // 104 carries the native cat release velocity and pose.
+constexpr uint32_t kProtoVersion = 107; // Run confirmation votes can be withdrawn.
+// 104 carries the native cat release velocity and pose.
 // 103 carries exact release positions for yard drops.
 // 102 mirrors the House cat's pre-jump animation.
 // 101 sends the House animator's actual facing.
@@ -135,6 +136,7 @@ enum MsgType : uint8_t {
     MSG_HOSTLEFT =20,   // host -> client: the host is no longer in the run
     MSG_LOGFILE  =21,   // client -> host: the end of the client's log, after
                         // trouble or when asked (see mgmp_peerlog.h)
+    MSG_GEARCAT  =24,   // host -> client: party cat after the collar chooser commits
     MSG_CATPRE   =23,   // host -> client: a cat as it was before the host's shop
                         // level-up raised it; a CatDataMsg on the wire
     MSG_NIGHT    =22,   // host -> client: one event of the House's night, as
@@ -834,6 +836,12 @@ constexpr uint8_t kChoiceHouseItemMove = 50;
 // animation variant and an optional "|" followed by a cosmetic action.
 // Room 0x1FFF is outside. Facing uses bits 30 and 31 for -1, 0, +1 or unknown.
 constexpr uint8_t kChoiceHouseCatState = 51;
+// Event result arrow, authored by the cat owner. node_seed and cat
+// identify the screen, name is the event, index is its remaining rewards.
+constexpr uint8_t kChoiceEventNext = 52;
+constexpr uint8_t kChoiceRunReadyState = 53;
+constexpr uint8_t kChoiceRunReadyVote  = 54;
+constexpr uint8_t kChoiceGearCatBatch  = 55;
 // Host -> client: the NPC office's conversation number `index` is `name` (see
 // mgmp_cutscene.cpp, office_talk). Empty name: the office has no more to say.
 constexpr uint8_t kChoiceOfficeTalk   = 17;
@@ -1628,6 +1636,7 @@ inline const char* msg_name(uint8_t t) {
         case MSG_LOGFILE:  return "LOGFILE";
         case MSG_NIGHT:    return "NIGHT";
         case MSG_CATPRE:   return "CATPRE";
+        case MSG_GEARCAT:  return "GEARCAT";
         default:          return "?";
     }
 }

@@ -112,7 +112,7 @@ uint32_t catsync_serialize(void* cat, uint8_t** out);
 // That cat as a push carries it (key, bytes, hash); m.data is the caller's to free.
 bool     catsync_snapshot(void* cat, CatDataMsg& m);
 // That serialization written back into this peer's cat of the same id, now.
-void     catsync_apply_now(const CatDataMsg& m, const char* why);
+bool     catsync_apply_now(const CatDataMsg& m, const char* why);
 // HOST: the cats with these registry keys, sent whole now (a run's party).
 void     catsync_push_keys(const uint64_t* keys, uint32_t n, const char* why);
 
@@ -125,6 +125,7 @@ uint64_t catsync_equipment_sig();
 void     catsync_send_equipment();
 bool     catsync_has_pending();
 void     catsync_drop_pending();
+void     catsync_drop_pending_cat(uint64_t id);
 // HOST: apply what is held, or with keep false throw it away.
 void     catsync_take_equipment(bool keep);
 // HOST: count every cat as sent. After an edit: the client has those slots

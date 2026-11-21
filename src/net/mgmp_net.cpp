@@ -169,7 +169,8 @@ bool decode_into(const uint8_t* buf, uint32_t len, NetMsg& m) {
         case MSG_STATEDUMP: return dec_statedump(r, m.statedump);
         case MSG_LOGFILE:   return dec_logfile(r, m.logfile);
         case MSG_NIGHT:     return dec_logfile(r, m.night);
-        case MSG_CATPRE:    return dec_catdata(r, m.catpre);
+        case MSG_CATPRE:
+        case MSG_GEARCAT:   return dec_catdata(r, m.catpre);
         case MSG_NODEHASH:  return dec_nodehash(r, m.nodehash);
         case MSG_HOSTLEFT:  return dec_hostleft(r, m.hostleft);
         case MSG_PEERS:   return dec_peers(r, m.peers);
@@ -750,16 +751,19 @@ bool net_send_catdata(const CatDataMsg& m) {
     return ok;
 }
 
-bool net_send_catpre(const CatDataMsg& m) {
+static bool send_cat_snapshot(const CatDataMsg& m, uint8_t type) {
     const uint32_t need = catdata_frame_size(m);
     if (need > kMaxFrame) return false;
     uint8_t* p = (uint8_t*)malloc(need);
     if (!p) return false;
-    const uint32_t n = enc_catdata(p, need, m, MSG_CATPRE);
+    const uint32_t n = enc_catdata(p, need, m, type);
     const bool ok = n && net_send(p, n);
     free(p);
     return ok;
 }
+
+bool net_send_catpre(const CatDataMsg& m) { return send_cat_snapshot(m, MSG_CATPRE); }
+bool net_send_gearcat(const CatDataMsg& m) { return send_cat_snapshot(m, MSG_GEARCAT); }
 
 bool net_send_runhist(const RunHistMsg& m) {
     uint32_t need = runhist_frame_size(m);

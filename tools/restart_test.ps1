@@ -41,7 +41,13 @@ if ($running.Count -gt 0 -and -not $Force) {
     }
 }
 
-& (Join-Path $PSScriptRoot 'net_test.ps1') -BuildDir $BuildDir -Config $Config -HousePositions:$HousePositions -HouseWalk:$HouseWalk -HouseActions:$HouseActions -HouseDrag:$HouseDrag -HouseDragSync:$HouseDragSync -HouseCatSync:$HouseCatSync
+$netTestArgs = @{ BuildDir = $BuildDir; Config = $Config }
+foreach ($option in 'HousePositions', 'HouseWalk', 'HouseActions', 'HouseDrag', 'HouseDragSync', 'HouseCatSync') {
+    if ($PSBoundParameters.ContainsKey($option)) {
+        $netTestArgs[$option] = $PSBoundParameters[$option]
+    }
+}
+& (Join-Path $PSScriptRoot 'net_test.ps1') @netTestArgs
 
 Add-Type -AssemblyName System.Windows.Forms
 if (-not ('MgmpTestWindow' -as [type])) {

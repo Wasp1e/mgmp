@@ -467,6 +467,7 @@ bool flush_live_run() {
     // Leaving the House is the one entry that flushes on purpose (the client
     // needs the run's start) -- it says so with g.entry_flush.
     if (!g.entry_flush && follow_entered_within(8000)) return false;
+    if (follow_on_map() && !follow_map_save_safe()) return false;
     if (!follow_on_map()) {
         if (!g.said_mid_node) {
             g.said_mid_node = true;

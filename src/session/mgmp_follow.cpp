@@ -153,6 +153,9 @@ struct State {
     uint32_t suppressed     = 0;
     bool     warned_no_map  = false;
     bool checkpoint_valid = false;
+    void* checkpoint_map = nullptr;
+    void* checkpoint_node = nullptr;
+    uint64_t checkpoint_seed = 0;
 
     CRITICAL_SECTION cs;
     bool cs_ready = false;
@@ -234,6 +237,10 @@ void follow_init() {
     g.on        = config().net_follow;
     g.is_client = (net_role() == NetRole::Client);
     g.map       = nullptr;
+    g.checkpoint_map = nullptr;
+    g.checkpoint_node = nullptr;
+    g.checkpoint_seed = 0;
+    g.checkpoint_valid = false;
     pending_clear();
     memset(g.peer_backpack, 0, sizeof(g.peer_backpack));
     g.backpack_sent = 0;
@@ -420,6 +427,9 @@ static bool map_backpack_open() {
     return false;
 }
 
+static void prepare_entry_checkpoint(void* map, void* node);
+static void take_entry_checkpoint(void* map, void* node);
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !net_active() || !map_screen || !node) return true;
@@ -467,8 +477,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
         return true;
     }
 
-    net_begin_battle_checkpoint();
-    g.checkpoint_valid = savefile_checkpoint_before_battle();
+    take_entry_checkpoint(map_screen, node);
     g.host_vote   = -1;
     g.client_vote = -1;
     g.host_clicks = 0;
@@ -678,6 +687,48 @@ static void unstick_marker(void* map_screen) {
 bool follow_marker_node(uint32_t& index)   { return read_marker_node(kMarker_AtNode,   index); }
 bool follow_selected_node(uint32_t& index) { return read_marker_node(kMarker_Selected, index); }
 
+bool follow_map_save_safe() {
+    Guard guard;
+    uint32_t at = 0, selected = 0;
+    if (!follow_marker_node(at) || !follow_selected_node(selected) || at != selected)
+        return false;
+    // The walk can finish before EnterNode is dispatched. That frame is
+    // already on the unfinished destination, even though the map still ticks.
+    return g.checkpoint_map != g.map || g.checkpoint_node != node_at(g.map, at);
+}
+
+// A native click selects and walks to the destination BEFORE EnterNode. Saving
+// there persisted the unfinished battle tile. Capture before that click, then
+// keep its SAVEFILE as the first frame of the ordinary reconnect checkpoint.
+static void prepare_entry_checkpoint(void* map, void* node) {
+    net_begin_battle_checkpoint();
+    g.checkpoint_map = map;
+    g.checkpoint_node = node;
+    g.checkpoint_seed = node_seed0(node);
+    g.checkpoint_valid = false;
+    uint32_t at = 0, selected = 0, destination = 0;
+    if (g.map != map || !index_of_node(map, node, destination) ||
+        !follow_marker_node(at) || !follow_selected_node(selected) ||
+        at != selected || at == destination) {
+        log_line("FOLLOW", "not saving an entry checkpoint after map selection/movement");
+        return;
+    }
+    g.checkpoint_valid = savefile_checkpoint_before_battle();
+    log_line("FOLLOW", "checkpoint before map click: source %u destination %u saved=%u",
+             at, destination, g.checkpoint_valid ? 1u : 0u);
+}
+
+static void take_entry_checkpoint(void* map, void* node) {
+    if (g.checkpoint_map != map || g.checkpoint_node != node ||
+        g.checkpoint_seed != node_seed0(node))
+        // Vote agreement and debug jumps enter directly, before marker
+        // placement. The same source-node checks also protect these paths.
+        prepare_entry_checkpoint(map, node);
+    g.checkpoint_map = nullptr;
+    g.checkpoint_node = nullptr;
+    g.checkpoint_seed = 0;
+}
+
 void follow_request_jump(uint32_t index) {
     g.jump_pending = true;
     g.jump_index   = index;
@@ -688,6 +739,10 @@ void follow_request_jump(uint32_t index) {
 void follow_on_run_restart() {
     Guard guard;
     net_clear_battle_checkpoint();
+    g.checkpoint_map = nullptr;
+    g.checkpoint_node = nullptr;
+    g.checkpoint_seed = 0;
+    g.checkpoint_valid = false;
     g.run_id    = (uint32_t)time(nullptr);
     g.have_here = false;      // the node we were in belongs to the run just left
     lockstep_on_run_restart();
@@ -779,25 +834,33 @@ constexpr uintptr_t kRva_NodeClick     = 0x228700;
 using fn_node_click = void (__fastcall*)(void*, void*, void*, void*);
 fn_node_click o_node_click = nullptr;
 
-static void send_vote(uint32_t index, uint32_t meow = 0) {
+static void send_vote(uint32_t index, uint32_t meow = 0, bool sound_only = false) {
     ChoiceMsg v{};
     v.kind      = kChoiceNode;
     v.index     = index;
     v.node_seed = g.have_here ? g.here_seed : 0;
     v.aux       = meow;   // which meow the click makes; see meow_play
+    if (sound_only) strcpy_s(v.name, "map-click-sound");
     net_send_choice(v);
 }
 
 static bool vote_click(void* node) {
     if (!g.on || !net_active() || !g.map || !node) return true;
     Guard guard;
-    if (map_backpack_open()) {
-        log_line("FOLLOW", "map click blocked before selection: a backpack is open");
-        return false;
-    }
     uint32_t index = 0;
     if (!index_of_node(g.map, node, index)) return true;
     const char* type = node_type_name(node_type(node));
+
+    if (map_backpack_open()) {
+        // Let both players hear the click before blocking selection/movement.
+        // This is sound only: do not leave a vote that could start the node
+        // automatically once the backpack closes.
+        const uint32_t meow = meow_new_seed();
+        send_vote(index, meow, true);
+        if (meow) meow_play(meow);
+        log_line("FOLLOW", "map click meowed, then blocked before selection: a backpack is open");
+        return false;
+    }
 
     // EVERY click is sent and meows, a repeat included: the meow is how each
     // player hears the other one clicking, not a sound for a pick that changed.
@@ -852,7 +915,14 @@ static bool vote_click(void* node) {
 static void __fastcall node_click(void* closure, void* b, void* c, void* d) {
     void* node = nullptr;
     mem_read((const uint8_t*)closure + 8, &node, sizeof(node));
-    if (vote_click(node)) o_node_click(closure, b, c, d);
+    if (vote_click(node)) {
+        if (g.on && !g.is_client && net_active() && g.map && node) {
+            Guard guard;
+            savefile_on_leaving_house();
+            prepare_entry_checkpoint(g.map, node);
+        }
+        o_node_click(closure, b, c, d);
+    }
 }
 
 void follow_set_base(uintptr_t base) {
@@ -882,15 +952,19 @@ void follow_on_vote(const ChoiceMsg& m, uint8_t from) {
         }
         return;
     }
-    if (map_backpack_open()) return;
     // A pick made on another node is about another map position.
     if (m.node_seed && g.have_here && m.node_seed != g.here_seed) return;
-    show_pick((int32_t)m.index);
+    if (strcmp(m.name, "map-click-sound") == 0) {
+        if (m.aux) meow_play(m.aux);
+        return;
+    }
     // The clicker's meow, so both hear the same one. None when the picks now
     // match: aux 0 from a clicker that saw it, or this end's own pick the same
     // (a clicker that had not heard of it yet).
     const int32_t mine = g.is_client ? g.client_vote : g.host_vote;
     if (m.aux && mine != (int32_t)m.index) meow_play(m.aux);
+    if (map_backpack_open()) return;
+    show_pick((int32_t)m.index);
 
     if (g.is_client) {
         log_line("FOLLOW", "the host picked node %u%s", m.index,

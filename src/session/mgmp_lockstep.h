@@ -195,8 +195,9 @@ bool lockstep_barrier_holding();
 
 // The aim preview writes Character+0x388, and the backstab test reads it, so a
 // wall-clock-gated presentation write decides damage. Call `begin` on entry to
-// Brain::UpdateDecision and `end` on the way out: whatever the preview turned
-// the cat to is put back, leaving facing written only by committed actions.
+// Brain::UpdateDecision and `end` on the way out. The Face hook blocks its
+// direct preview turn before sprite/animation side effects; end also restores
+// any remaining field writes, leaving facing written by committed actions.
 // Both are inert outside a net session. See the long note on the definitions.
 // Everything mgmp_aim needs about one character, answered once: is it a HUMAN
 // cat in this battle's roster at all, which index, and does the PEER own it.
@@ -206,6 +207,8 @@ bool lockstep_aim_subject(const void* character, uint8_t& cat, bool& peer_owns);
 
 void     lockstep_preview_facing_begin(void* brain);
 void     lockstep_preview_facing_end();
+bool     lockstep_preview_facing_block(const void* character, uintptr_t caller,
+                                     uintptr_t face);
 uint32_t lockstep_preview_facing_count();
 
 // --- the state fence -------------------------------------------------------

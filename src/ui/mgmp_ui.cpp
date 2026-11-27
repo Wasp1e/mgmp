@@ -80,6 +80,8 @@ struct UI {
     ImFont* paper_font = nullptr;   // the night's scrap of paper; see draw_night
     float   paper_w    = 0.0f;      // its width, from the widest line last frame
     bool  forced     = false;   // the class menu is up, panel or not
+    bool host_connection_lost = false;
+    uint64_t host_left_until = 0;
 
     // Seeded from mgmp.json at ui_init, so the fields already hold whatever the
     // launch was configured for and a reconnect is one click.
@@ -1236,6 +1238,16 @@ bool ui_captures_input() {
     return io.WantCaptureMouse || io.WantCaptureKeyboard;
 }
 
+void ui_notify_host_left(bool connection_lost) {
+    if (connection_lost) g.host_connection_lost = true;
+    else g.host_left_until = GetTickCount64() + 10000;
+}
+
+void ui_clear_host_left() {
+    g.host_connection_lost = false;
+    g.host_left_until = 0;
+}
+
 void ui_on_swap(void* window) {
     (void)window;
     // Before the panel's own early returns: the up has to follow its down
@@ -1267,7 +1279,10 @@ void ui_on_swap(void* window) {
     // In a fight: the other player not in it yet (every decision held), or the
     // cat whose turn it is theirs (its bar greyed) -- a note at the top.
     const char* note = nullptr;
-    if (refused)
+    const bool host_left = g.host_connection_lost || GetTickCount64() < g.host_left_until;
+    if (host_left)
+        note = tr(u8"\u0425\u043e\u0441\u0442 \u0432\u044b\u0448\u0435\u043b", "The host left");
+    else if (refused)
         // The same button sets off and ends the day.
         note = tr(u8"\u0414\u043e\u0441\u0442\u0443\u043f\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u0445\u043e\u0441\u0442\u0443",
                   "Only the host can do this");
@@ -1317,7 +1332,8 @@ void ui_on_swap(void* window) {
     }
     if (loading) draw_loading(step);
     if (night) draw_night(night, nights, loading);
-    else if (note && !loading) draw_paper_note(note, true);   // all in the top right corner
+    if (host_left) draw_paper_note(note, true);
+    else if (!night && note && !loading) draw_paper_note(note, true);   // all in the top right corner
     if (house_ready && !loading && !night && !run_ready) {
         const unsigned action = startrun_box_has_cats() ? 1 : 0;
         char label[96];

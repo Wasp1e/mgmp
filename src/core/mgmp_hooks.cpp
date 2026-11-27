@@ -132,6 +132,8 @@ fn_this       o_ButtonUpdate  = nullptr;
 // a whole TurnAction, std::function and all -- over whatever rdx happened to
 // hold. Same ABI as GetChoice, and for the same reason.
 fn_two_ptr    o_UpdateDecision = nullptr;
+using fn_face = void (__fastcall*)(void*, uint64_t, unsigned char, unsigned char);
+fn_face o_CharacterFace = nullptr;
 fn_this_c     o_HighlightRefresh = nullptr;
 fn_two_ptr    o_ShopBuy = nullptr;
 
@@ -701,14 +703,20 @@ void* __fastcall h_ShopBuy(void* self, void* item) {
     return result;
 }
 
-// The aim preview turns the acting cat while a decision is held, writing the
-// same Character+0x388 the backstab test reads -- under a wall-clock gate, so
-// two peers at different frame rates disagree about damage. Snapshot the field,
-// let the preview do whatever it likes, put it back. Inert outside a session.
-//
-// `out` is the caller's TurnAction sret buffer. It is not read or written here
-// -- it exists in the signature so that rdx and the returned rax survive the
-// detour untouched.
+// Block the direct preview turn before Face changes the Animator, its animation
+// suffix and queued turn callbacks. The old field-only rollback left the sprite
+// facing the preview direction while CTRL/backstab read the restored direction.
+// The caller signature confines this to the preview; action/status turns pass.
+void __fastcall h_CharacterFace(void* self, uint64_t dir,
+                               unsigned char a, unsigned char b) {
+    if (lockstep_preview_facing_block(self, (uintptr_t)_ReturnAddress(),
+                                     addr_of(T_CharacterFace))) return;
+    o_CharacterFace(self, dir, a, b);
+}
+
+// Bracket the preview so the Face hook can identify its subject. The field
+// snapshot remains as a fallback. Both guards are inert outside a session.
+// `out` is the caller's TurnAction sret buffer; preserve it and the returned rax.
 void* __fastcall h_UpdateDecision(void* self, void* out) {
     lockstep_preview_facing_begin(self);
     void* ret = o_UpdateDecision(self, out);
@@ -840,6 +848,7 @@ const Binding kBindings[] = {
     { T_ButtonUpdate,     (void*)&h_ButtonUpdate, (void**)&o_ButtonUpdate },
     { T_HighlightRefresh, (void*)&h_HighlightRefresh, (void**)&o_HighlightRefresh },
     { T_UpdateDecision,   (void*)&h_UpdateDecision, (void**)&o_UpdateDecision },
+    { T_CharacterFace,    (void*)&h_CharacterFace, (void**)&o_CharacterFace },
     { T_ShopBuy,          (void*)&h_ShopBuy,        (void**)&o_ShopBuy        },
 
     { T_SaveScumPenalty, (void*)&h_SaveScum, (void**)&o_SaveScum },

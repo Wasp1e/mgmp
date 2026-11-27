@@ -78,6 +78,7 @@ enum Target : int {
                          // drawing another player's aim. See mgmp_aim.h.
     T_ShopBuy,           // the shop's purchase, after a click and before the
                          // coin check -- swallowed on the client mid-adventure.
+    T_CharacterFace,     // suppress only UpdateDecision's direct preview turn
     T_COUNT
 };
 
@@ -482,6 +483,10 @@ static const TargetDesc kTargets[T_COUNT] = {
     // cat in its own shop, and that cat then took a move the host's copy could
     // not, halting the boss on turn 6.
     { 0x0079A600, "SHOPBUY",   "shop purchase (sub_14079A600)" },
+    // Verified against the shipped PE: direction is an 8-byte value in rdx,
+    // r8b/r9b are flags. Also changes Animator state and turn callbacks, so
+    // restoring +0x388/+0x390 after a preview cannot undo this function.
+    { 0x0010CE50, "FACE",      "glaiel::Character::Face" },
 };
 
 // Coarse module guard, checked before the per-target signatures.

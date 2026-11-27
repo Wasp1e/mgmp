@@ -8,9 +8,11 @@ Version **0.31 pre-release** (network protocol 121), for Mewgenics **1.1.21239**
 
 Release 0.31 includes shared run confirmation, House shop stock refresh,
 inventory lifetime fixes, synchronized music, night playback improvements and
-halt reports. Both players must install this version. The collars-to-gear
-transition and backpack map-click blocking have been verified in a live session;
-other recent changes still need broader live testing.
+halt reports. The November 28 update fixes stale enemy sprite facing after
+movement, keeps map-click meows while backpacks block travel, adds a host-left
+note, and saves before selecting the next node. Both players must replace the
+DLL and restart. Enemy facing, the collars-to-gear transition and backpack map
+blocking have been checked in live play; other changes need broader testing.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the

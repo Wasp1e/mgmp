@@ -8,15 +8,17 @@
 #include <cstring>
 
 namespace mgmp {
+extern "C" {
+    void* mgmp_rng_native_randfloat = nullptr;
+    double mgmp_rng_randfloat(double, uint64_t*);
+}
 namespace {
 
 typedef int     (__fastcall* fn_randint)  (int    n, uint64_t* state);
-typedef double  (__fastcall* fn_randfloat)(double m, uint64_t* state);
 typedef __m128  (__fastcall* fn_rand2)    (double m, uint64_t* state);
 typedef bool    (__fastcall* fn_rollchance)(double p, double scale, uint64_t* state);
 
 fn_randint   o_randint   = nullptr;
-fn_randfloat o_randfloat = nullptr;
 fn_rand2     o_rand2     = nullptr;
 fn_rollchance o_rollchance = nullptr;
 
@@ -82,15 +84,10 @@ int __fastcall h_randint(int n, uint64_t* state) {
     return r;
 }
 
-double __fastcall h_randfloat(double m, uint64_t* state) {
-    void*    ret = _ReturnAddress();
-    bool     glb = (state == rng_global_stream());
-    uint64_t s0  = state ? state[0] : 0;
-    double   r   = o_randfloat(m, state);
-    uint64_t bits;
-    memcpy(&bits, &r, sizeof(bits));
-    note(RNG_FLOAT, ret, s0, bits, glb, state);
-    return r;
+extern "C" void mgmp_rng_observe_float(uintptr_t caller, uint64_t s0,
+                                      uint64_t result, const void* state) {
+    note(RNG_FLOAT, (void*)caller, s0, result,
+         state == rng_global_stream(), state);
 }
 
 __m128 __fastcall h_rand2(double m, uint64_t* state) {
@@ -125,12 +122,12 @@ bool __fastcall h_rollchance(double p, double scale, uint64_t* state) {
 }
 
 void* rng_detour_randint()   { return (void*)&h_randint;   }
-void* rng_detour_randfloat() { return (void*)&h_randfloat; }
+void* rng_detour_randfloat() { return (void*)&mgmp_rng_randfloat; }
 void* rng_detour_rand2()     { return (void*)&h_rand2;     }
 void* rng_detour_rollchance(){ return (void*)&h_rollchance;}
 
 void** rng_original_randint()   { return (void**)&o_randint;   }
-void** rng_original_randfloat() { return (void**)&o_randfloat; }
+void** rng_original_randfloat() { return &mgmp_rng_native_randfloat; }
 void** rng_original_rand2()     { return (void**)&o_rand2;     }
 void** rng_original_rollchance(){ return (void**)&o_rollchance;}
 

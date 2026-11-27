@@ -13,6 +13,7 @@
 # single-config). tools\net_test.ps1 handles both layouts.
 cmake_minimum_required(VERSION 3.21)
 project(mgmp LANGUAGES C CXX)
+enable_language(ASM_MASM)
 
 if(NOT WIN32)
     message(FATAL_ERROR "mgmp targets Mewgenics.exe, a Windows x64 PE -- see CLAUDE.md")
@@ -39,6 +40,7 @@ add_library(mgmp SHARED
     src/core/mgmp_hooks.cpp
     src/core/mgmp_log.cpp
     src/core/mgmp_mem.cpp
+    src/core/mgmp_spriteface.cpp
     src/core/mgmp_rtti.cpp
     src/core/mgmp_config.cpp
     src/core/mgmp_crash.cpp
@@ -51,6 +53,7 @@ add_library(mgmp SHARED
     src/determinism/mgmp_ability.cpp
     src/determinism/mgmp_record.cpp
     src/determinism/mgmp_rng.cpp
+    src/determinism/mgmp_rng_float.asm
     src/determinism/mgmp_replay.cpp
     src/net/mgmp_net.cpp
     src/net/mgmp_tunnel.cpp

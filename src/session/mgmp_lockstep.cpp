@@ -3,6 +3,8 @@
 #include "mgmp_lockstep.h"
 #include "mgmp_addresses.h"
 #include "mgmp_resolve.h"
+#include "mgmp_previewface.h"
+#include "mgmp_spriteface.h"
 #include "mgmp_barrier.h"
 #include "mgmp_peerlog.h"
 #include "mgmp_night.h"
@@ -2468,7 +2470,11 @@ bool lockstep_aim_subject(const void* character, uint8_t& cat, bool& peer_owns) 
 // between actions, and the next action re-establishes it") was wrong. The gap
 // between a cat's own actions is exactly when it gets attacked.
 //
-// The fix is to let the preview run and then put the field back. Nothing else
+// Originally we let the preview run and then put the fields back. That left
+// the Animator and queued turn callbacks pointing in the preview direction,
+// so the sprite disagreed with CTRL on both peers, especially after AI turns.
+// h_CharacterFace now blocks the direct preview call before any side effects;
+// the snapshot below remains a fallback for other writes. Nothing else
 // inside UpdateDecision writes facing -- Character::Face is called from it
 // exactly once -- and the committed direction is written by Ability::trigger
 // and Character::DoAction, which are outside this function. So the cat no
@@ -2483,6 +2489,22 @@ struct PreviewFacing {
     bool     said = false;
 };
 PreviewFacing g_pf;
+
+bool lockstep_preview_facing_block(const void* character, uintptr_t caller,
+                                 uintptr_t face) {
+    if (!g_pf.have || g_pf.ch != character || !lockstep_active() || caller < 22)
+        return false;
+    uint8_t bytes[22];
+    if (!mem_read((const void*)(caller - sizeof(bytes)), bytes, sizeof(bytes)) ||
+        !preview_face_call(bytes, caller, face)) return false;
+    ++g_pf.restored;
+    if (!g_pf.said) {
+        g_pf.said = true;
+        log_line("LOCKSTEP", "blocked preview Face for %p before sprite and combat facing change",
+                 character);
+    }
+    return true;
+}
 
 void lockstep_preview_facing_begin(void* brain) {
     g_pf.have = false;
@@ -2694,8 +2716,41 @@ void move_trace_sample(const char* phase, bool force) {
     }
 }
 
+// A boundary can arrive while a sprite is still turning. The repair correctly
+// skips it then, but used to never retry until another whole turn had passed.
+// Recheck idle, non-acting characters on the game thread after animations settle.
+static void refresh_idle_sprites() {
+    const uint64_t now = GetTickCount64();
+    static uint64_t last = 0;
+    if (now - last < 100 || !g.snapped || g.halted || !g_tc ||
+        now - g_tc_at >= 500 || !resolve_is_pinned_build() ||
+        resolve_char_list(g_tc) != g.snapped_list) return;
+    last = now;
+    Guard guard;
+    uint32_t count = 0;
+    const void* data = nullptr;
+    if (!mem_read((const uint8_t*)g.snapped_list + kList_Count, &count, sizeof(count)) ||
+        count > kMaxCats ||
+        !mem_read((const uint8_t*)g.snapped_list + kList_Data, &data, sizeof(data)) || !data)
+        return;
+    const void* actor = current_actor(g_tc);
+    const auto face = (SpriteFaceFn)addr_of(T_CharacterFace);
+    for (uint32_t i = 0; i < count; ++i) {
+        void* ch = nullptr;
+        if (!mem_read((const uint8_t*)data + i * sizeof(void*), &ch, sizeof(ch)) || ch == actor)
+            continue;
+        if (refresh_sprite_facing(ch, face, true)) {
+            int32_t facing[2]{};
+            mem_read((const uint8_t*)ch + kChar_Facing, facing, sizeof(facing));
+            log_line("SPRITEFACE", "idle retry refreshed character %p facing=(%d,%d) turn=%u",
+                     ch, facing[0], facing[1], g.turn);
+        }
+    }
+}
+
 void lockstep_pump() {
     if (!g.active) return;
+    refresh_idle_sprites();
     if (g_move_trace.active) {
         Guard guard;
         move_trace_sample("sample", false);
@@ -3542,6 +3597,27 @@ void lockstep_turn_boundary(void* turn_control) {
 
     snapshot_cats(turn_control);
     if (!g.snapped || g.halted) return;
+
+    // Refresh only at a simulation boundary, from live membership, after
+    // owner-facing pinning. This also catches sprites left stale by native AI
+    // movement/animation paths, independent of the preview call guard.
+    if (resolve_is_pinned_build()) {
+        uint32_t live = 0;
+        const void* data = nullptr;
+        if (mem_read((const uint8_t*)g.snapped_list + kList_Count, &live, sizeof(live)) &&
+            live <= kMaxCats &&
+            mem_read((const uint8_t*)g.snapped_list + kList_Data, &data, sizeof(data)) && data) {
+            const auto face = (SpriteFaceFn)addr_of(T_CharacterFace);
+            // Walk current membership, including summons added after setup.
+            for (uint32_t i = 0; i < live; ++i) {
+                void* ch = nullptr;
+                if (mem_read((const uint8_t*)data + i * sizeof(void*), &ch, sizeof(ch)) &&
+                    refresh_sprite_facing(ch, face))
+                    log_line("SPRITEFACE", "refreshed character %p sprite from committed facing at turn %u",
+                             ch, g.turn);
+            }
+        }
+    }
 
     Guard guard;
     HashMsg mine = build_hash(turn_control);

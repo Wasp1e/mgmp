@@ -197,6 +197,7 @@ void hook_defaults() {
     // reason is that the preview is real feedback: a solo player watching their
     // cat turn toward the aim has nobody to diverge from.
     g_cfg.hook[T_UpdateDecision] = false;
+    g_cfg.hook[T_CharacterFace] = false;
 
     // The shop's purchase. Solo, there is no host for a purchase to diverge from.
     g_cfg.hook[T_ShopBuy] = false;
@@ -258,6 +259,7 @@ void hooks_implied_by(bool net_configured) {
         // peers at different frame rates compute different damage. Implied by a
         // session for the same reason the lockstep hooks are.
         g_cfg.hook[T_UpdateDecision] = true;
+        g_cfg.hook[T_CharacterFace] = true;
 
         // Only the host's run is real, and a purchase is a run write.
         g_cfg.hook[T_ShopBuy] = true;

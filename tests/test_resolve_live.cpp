@@ -20,6 +20,8 @@
 // It skips, loudly and successfully, when the game is not on this machine.
 #include "mgmp_sigscan.h"
 #include "mgmp_sigs.generated.h"
+#include "mgmp_addresses.h"
+#include "mgmp_previewface.h"
 
 #include <windows.h>
 
@@ -127,6 +129,21 @@ int main(int argc, char** argv) {
                 "%d failed, %d needed a scan, in %.2f ms\n",
                 ok, dok, failed, scanned, ms);
 
+    // Check the guard against actual executable bytes, independently of the
+    // synthetic callsite test. A changed compiler sequence must fail visibly.
+    const auto preview = sig_resolve(base, text, kTargetSigs[T_UpdateDecision]);
+    const auto face = sig_resolve(base, text, kTargetSigs[T_CharacterFace]);
+    int preview_calls = 0;
+    if (preview.ok && face.ok) {
+        for (size_t i = 0; i + 22 <= 0x700; ++i) {
+            const auto* at = (const uint8_t*)preview.addr + i;
+            if (preview_face_call(at, (uintptr_t)at + 22, face.addr)) ++preview_calls;
+        }
+    }
+    if (preview_calls != 1) {
+        std::printf("FAIL: expected one guarded preview Face call, found %d\n", preview_calls);
+        ++failed;
+    }
     FreeLibrary(raw);
 
     if (failed) { std::printf("\n%d FAILURE(S)\n", failed); return 1; }

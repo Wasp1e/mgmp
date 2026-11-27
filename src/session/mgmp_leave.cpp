@@ -671,6 +671,8 @@ void leave_on_message(const HostLeftMsg& m) {
 
     const Where here = refresh_where(nullptr);
 
+    ui_notify_host_left(false);
+
     // ONLY "definitely out" declines. Unknown ARMS, and that is the correction:
     // the first version bailed with a warning whenever it could not read its own
     // position, which is a drop site that does nothing -- the rule this project

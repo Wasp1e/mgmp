@@ -50,6 +50,11 @@
 
 namespace mgmp {
 
+// Game-thread notifications. A dropped connection stays visible through
+// automatic redials until a successful handshake or a local disconnect.
+void ui_notify_host_left(bool connection_lost = true);
+void ui_clear_host_left();
+
 // Reads the ui* keys and installs the WndProc subclass. Builds no ImGui state:
 // the GL objects and the font atlas need a current context, and there is none
 // until the first swap arrives.

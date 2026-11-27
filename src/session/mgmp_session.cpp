@@ -3,6 +3,7 @@
 #include "mgmp_cursor.h"
 #include "mgmp_overlay.h"
 #include "mgmp_session.h"
+#include "mgmp_ui.h"
 #include "mgmp_net.h"
 #include "mgmp_steamlink.h"
 #include "mgmp_catsync.h"
@@ -175,6 +176,7 @@ void go_ready(const char* how) {
     // joining must not disturb the players already playing.
     if (g.phase == Phase::Ready) return;
     g.phase = Phase::Ready;
+    ui_clear_host_left();
     set_status("ready (%s)", how);
     log_line("SESSION", "handshake complete -- %s", how);
     lockstep_init();
@@ -453,6 +455,7 @@ void apply_request() {
     const Request req = g.request;
     if (req == Request::None) return;
     g.request = Request::None;
+    if (req == Request::Disconnect) ui_clear_host_left();
 
     // Always tear down first, whichever way round. Host-while-hosting and
     // join-while-joined both mean "start over" -- that is what the button is
@@ -559,7 +562,12 @@ static void redial() {
         return;
     }
     const uint64_t now = GetTickCount64();
-    if (!g.closed_at) g.closed_at = now;
+    if (!g.closed_at) {
+        g.closed_at = now;
+        // Initial dial failures are not host departures. Notify only after a
+        // working session, before automatic redial tears down its state.
+        if (g.phase == Phase::Ready) ui_notify_host_left();
+    }
     if (now - g.closed_at < kRedialAfterMs) return;
     g.closed_at = 0;
     log_line("SESSION", "the link to the host dropped -- dialling again");

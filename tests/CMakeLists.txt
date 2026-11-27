@@ -52,6 +52,25 @@ target_include_directories(test_house_shop_live PRIVATE
 target_compile_definitions(test_house_shop_live PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
 add_test(NAME test_house_shop_live COMMAND test_house_shop_live)
 
+add_executable(test_map_checkpoint test_map_checkpoint.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_mem.cpp)
+target_include_directories(test_map_checkpoint PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/session ${CMAKE_SOURCE_DIR}/src/core
+    ${CMAKE_SOURCE_DIR}/src/net ${CMAKE_SOURCE_DIR}/src/determinism)
+target_compile_definitions(test_map_checkpoint PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_compile_options(test_map_checkpoint PRIVATE /Gy)
+target_link_options(test_map_checkpoint PRIVATE /OPT:REF)
+add_test(NAME test_map_checkpoint COMMAND test_map_checkpoint)
+
+add_executable(test_rng_float test_rng_float.cpp rng_float_probe.asm
+    ${CMAKE_SOURCE_DIR}/src/determinism/mgmp_rng_float.asm
+    ${CMAKE_SOURCE_DIR}/src/determinism/mgmp_record.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_mem.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_rtti.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_log.cpp)
+target_include_directories(test_rng_float PRIVATE ${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/determinism)
+target_compile_definitions(test_rng_float PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_test(NAME test_rng_float COMMAND test_rng_float)
+
 add_executable(test_night_playback test_night_playback.cpp)
 target_include_directories(test_night_playback PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
 add_test(NAME test_night_playback COMMAND test_night_playback)
@@ -67,6 +86,16 @@ add_test(NAME test_sigscan COMMAND test_sigscan)
 add_executable(test_resolve_live test_resolve_live.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_sigscan.cpp)
 target_include_directories(test_resolve_live PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
 add_test(NAME test_resolve_live COMMAND test_resolve_live)
+
+add_executable(test_previewface test_previewface.cpp)
+target_include_directories(test_previewface PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
+add_test(NAME test_previewface COMMAND test_previewface)
+
+add_executable(test_spriteface test_spriteface.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_spriteface.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_mem.cpp)
+target_include_directories(test_spriteface PRIVATE ${CMAKE_SOURCE_DIR}/src/core)
+add_test(NAME test_spriteface COMMAND test_spriteface)
 
 add_executable(test_battleid test_battleid.cpp)
 target_include_directories(test_battleid PRIVATE ${CMAKE_SOURCE_DIR}/src/session)

@@ -147,6 +147,9 @@ uint64_t follow_here_seed();
 bool follow_marker_node(uint32_t& index);
 bool follow_selected_node(uint32_t& index);
 
+// A save is safe only before map selection/movement starts.
+bool follow_map_save_safe();
+
 // PANEL: ask to enter node `index` on the next MapScreen::update tick.
 //
 // DEFERRED, and to that tick specifically -- not merely off the render thread.

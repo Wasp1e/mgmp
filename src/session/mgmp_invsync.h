@@ -106,6 +106,9 @@
 #include <cstdint>
 
 namespace mgmp {
+// Called by classpick's existing InventoryScreen2 update hook. Do not patch
+// the same vtable again: classpick verifies and owns that slot.
+void invsync_on_screen_tick();
 
 struct InventoryMsg;
 

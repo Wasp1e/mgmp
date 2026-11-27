@@ -1764,12 +1764,13 @@ void halt(const char* why) {
     g.stats.halted = true;
     ++g.stats.desyncs;
     log_line("LOCKSTEP", "!! HALT at turn %u: %s", g.turn, why);
+    peerlog_halt_report(why, g.battles.current, g.turn);
 
     HaltMsg m{};
     m.turn = g.turn;
     _snprintf_s(m.reason, sizeof(m.reason), _TRUNCATE, "%s", why);
     net_send_halt(m);
-    peerlog_trouble("halt");
+    peerlog_ask("halt");
 }
 
 // --- the desync dump --------------------------------------------------------
@@ -1974,6 +1975,7 @@ void compare_state_dump(const StateDumpMsg& m, uint8_t from) {
         ++differ;
         log_line_lvl(LogLevel::Error, "LOCKSTEP", "  cat %2u %s", i, line);
     }
+    if (g.halted) peerlog_refresh_report();
 
     if (differ == 0) {
         // Worth its own loud line. Every hashed field agreeing while the hash
@@ -2780,6 +2782,7 @@ void lockstep_pump() {
                 break;
 
             case MSG_NIGHT:
+                if (strcmp(m.night.reason, "house_shop") == 0 && m.from != kHostPeer) break;
                 night_on_message(m.night);
                 break;
 
@@ -2870,7 +2873,8 @@ void lockstep_pump() {
                     ++g.stats.desyncs;
                     log_line("LOCKSTEP", "!! peer halted at turn %u: %s",
                              m.halt.turn, m.halt.reason);
-                    peerlog_trouble("the other player halted");
+                    peerlog_halt_report(m.halt.reason, g.battles.current, m.halt.turn);
+                    peerlog_ask("the other player halted");
                 }
                 break;
 

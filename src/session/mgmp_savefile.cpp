@@ -534,6 +534,37 @@ bool savefile_live_path(wchar_t* out, size_t cap) {
     return true;
 }
 
+bool savefile_checkpoint_before_battle() {
+    ensure_dir();
+    if (!g.have_dir || !g.have_slot || net_role() != NetRole::Host) return false;
+    // Called while still on Map, before EnterNode changes the marker/state.
+    if (!follow_on_map()) return false;
+    const bool was_entry_flush = g.entry_flush;
+    g.entry_flush = true;
+    const bool flushed = flush_live_run();
+    g.entry_flush = was_entry_flush;
+    if (!flushed) return false;
+    wchar_t path[MAX_PATH]{};
+    if (!savefile_live_path(path, MAX_PATH)) return false;
+    uint32_t size = 0;
+    uint64_t mtime = 0;
+    uint8_t* bytes = read_whole_file(path, size, mtime);
+    if (!bytes) return false;
+    SaveFileMsg message{};
+    message.slot = g.slot;
+    message.size = size;
+    message.hash = savefile_hash(bytes, size);
+    message.fresh = kSaveCatchupInRun;
+    strncpy_s(message.name, g.name, _TRUNCATE);
+    message.data = bytes;
+    uint8_t* frame = (uint8_t*)malloc(size + 256);
+    const uint32_t length = frame ? enc_savefile(frame, size + 256, message) : 0;
+    if (length) net_checkpoint_frame(frame, length);
+    free(frame);
+    free(bytes);
+    return length != 0;
+}
+
 namespace {
 
 bool publish(uint8_t to, uint8_t fresh) {

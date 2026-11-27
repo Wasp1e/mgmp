@@ -3,6 +3,7 @@
 #include "mgmp_peerlog.h"
 #include "mgmp_startrun.h"
 #include "mgmp_house.h"
+#include "mgmp_house_shop.h"
 #include "mgmp_choice.h"
 #include "mgmp_catsync.h"
 #include "mgmp_follow.h"
@@ -117,6 +118,7 @@ void*         g_shop       = nullptr;
 
 void* __fastcall shop_start(void* self, void* b, void* c, void* d) {
     g_shop = self;
+    house_shop_update(self);
     return o_shop_start(self, b, c, d);
 }
 
@@ -1481,7 +1483,7 @@ void choice_pump() {
 // --- receiving -------------------------------------------------------------
 
 void choice_on_message(const ChoiceMsg& m, uint8_t from) {
-    if (m.kind == kChoiceNode) { follow_on_vote(m); return; }   // the map's, not ours
+    if (m.kind == kChoiceNode) { follow_on_vote(m, from); return; }   // the map's, not ours
     if (classpick_on_message(m, from)) return;                   // the class chooser's
     if (cutscene_on_message(m)) return;                          // a cutscene's
     if (peerlog_on_choice(m)) return;                            // a request for the log

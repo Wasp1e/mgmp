@@ -83,6 +83,10 @@ void catsync_publish(const char* why);
 // push. For a reconnecting peer -- see the comment on the definition.
 void catsync_forget();
 
+// Hash every serialized party cat, including the native next-fight statuses.
+// Zero means the complete party could not be read.
+uint64_t catsync_party_hash();
+
 // CLIENT: resolve m.id in this peer's run and deserialize over it.
 //
 // A cat that arrives while this peer is in a battle is HELD, not applied and

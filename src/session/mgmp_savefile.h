@@ -64,6 +64,7 @@
 #include <cstdint>
 
 namespace mgmp {
+bool savefile_checkpoint_before_battle();
 
 struct SaveFileMsg;
 

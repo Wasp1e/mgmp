@@ -344,6 +344,8 @@ int main() {
         m.index = 12; m.node_count = 40; m.type = 5;
         m.seed0 = 0xF7E6D5C4B3A29180ULL;
         m.run_id = 0x6A1B2C3D;
+        m.party_hash = 0xFEDCBA9876543210ULL;
+        m.difficulty = 7;
         m.owner_count = 2;
         m.owner_id[0] = 0xF000000000000001ULL; m.owner_pos[0] = 0;
         m.owner_id[1] = 22;                    m.owner_pos[1] = 1;
@@ -357,6 +359,8 @@ int main() {
         check(o.type == 5, "node type (5 = battle)");
         check(o.seed0 == 0xF7E6D5C4B3A29180ULL, "seed survives the high bit");
         check(o.run_id == 0x6A1B2C3D, "run id survives");
+        check(o.party_hash == m.party_hash && o.difficulty == 7,
+              "full party state fingerprint and run difficulty survive");
         check(o.owner_count == 2 && o.owner_id[0] == 0xF000000000000001ULL &&
               o.owner_pos[0] == 0 && o.owner_id[1] == 22 && o.owner_pos[1] == 1,
               "cat owners survive");
@@ -384,10 +388,10 @@ int main() {
         check(dec_enter_node(r, o) && o.owner_count == kMaxNodeOwners,
               "a full owner table decodes");
 
-        // With no owners the count is the frame's last byte.
+        // type, three u32 fields, seed u64 and run id u32 precede the count.
         EnterNodeMsg z{};
         uint32_t k = enc_enter_node(buf, sizeof(buf), z);
-        buf[k - 1] = kMaxNodeOwners + 1;
+        buf[1 + 3 * 4 + 8 + 4] = kMaxNodeOwners + 1;
         Reader q(buf, k); q.u8v();
         EnterNodeMsg p{};
         check(!dec_enter_node(q, p), "an oversized owner count is rejected");

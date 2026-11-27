@@ -64,6 +64,8 @@ void house_drag_remote_placed(void* cat);
 // A remote pipe delivery must finish before the client's NPC office opens:
 // otherwise the office can start a new quest before the previous cat counts.
 bool house_pipe_delivery_pending();
+// Native office transitions must wait for local House modals to close.
+bool house_office_can_open();
 
 // Either side: the note for the top right corner, or null -- which cat the
 // other player sent down the pipe and to which NPC, for a few seconds after.
@@ -75,3 +77,17 @@ const char* house_note();
 bool house_on_message(const LogFileMsg& m);
 
 } // namespace mgmp
+
+namespace mgmp { bool house_ready_visible(); }
+
+namespace mgmp { void house_refresh_cat_icon(uint64_t key); }
+
+namespace mgmp {
+bool house_closing_day_menus();
+bool house_night_input_owned();
+void house_on_night_button_update(void* button);
+// Whole-bucket loads regenerate item IDs. The persistent House drawers must
+// rebuild their item buttons before the next UI update, even while closed.
+bool house_inventory_can_replace();
+void house_inventory_replaced();
+}

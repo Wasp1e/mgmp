@@ -108,6 +108,14 @@ bool net_send(const uint8_t* payload, uint32_t len);
 // and REFUSE, and the per-peer PEERS copies.
 bool net_send_peer(uint8_t peer, const uint8_t* payload, uint32_t len);
 
+// Best-effort music on a writable link. Optional audio never enters net_poll.
+bool net_send_music_to(uint8_t peer, const uint8_t* payload, uint32_t len);
+void net_begin_battle_checkpoint();
+void net_end_battle_checkpoint();
+void net_checkpoint_frame(const uint8_t* payload, uint32_t len);
+bool net_send_battle_checkpoint(uint8_t peer);
+void net_clear_battle_checkpoint();
+
 // This peer's own id, kHostPeer on the host and kNoPeer on a client until the
 // first PEERS arrives. Peer 0 is always the host.
 uint8_t net_self();

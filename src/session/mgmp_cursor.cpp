@@ -11,6 +11,7 @@
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
 #include "mgmp_overlay.h"
+#include "mgmp_peer_colour.h"
 #include "mgmp_meow.h"
 #include "mgmp_proto.h"
 
@@ -85,19 +86,6 @@ bool make_str(GameStr& s, const char* text) {
     s.cap  = 15;
     return true;
 }
-
-// --- who gets which colour --------------------------------------------------
-//
-// Fixed per peer id rather than negotiated, because both sides already agree on
-// ids (PEERS is host-authored and sorted) and a colour nobody has to be told is
-// a colour that cannot be told wrong. Chosen to stay apart on the game's
-// palette, which is mostly browns and greys.
-const float kPeerRGB[kMaxPeers][3] = {
-    { 1.00f, 0.80f, 0.20f },   // 0, the host  -- gold
-    { 0.30f, 0.80f, 1.00f },   // 1            -- cyan
-    { 0.45f, 1.00f, 0.45f },   // 2            -- green
-    { 1.00f, 0.40f, 0.85f },   // 3            -- magenta
-};
 
 // Matching Brain::UpdateDecision's own target cursor, so a peer's mark reads as
 // the same kind of object the local one is rather than as a foreign overlay.

@@ -13,6 +13,7 @@
 #include "mgmp_addresses.h"
 #include "MinHook.h"
 #include "mgmp_config.h"
+#include "mgmp_house_shop.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -233,7 +234,10 @@ void* __fastcall swf_update(void* a, void* b, void* c, void* d) {
     // 'game_intro' skipped 40 minutes before and was skipped with it, silently.
     if (g.swf_at && now - g.swf_at > 1000) g.skip_seen = nullptr;
     g.swf_at = now;
-    if (is_second_player()) maybe_skip(a);
+    if (house_closing_day_menus()) {
+        const double done = 1.0;
+        mem_write((uint8_t*)a + kSwf_SkipProgress, &done, sizeof(done));
+    } else if (is_second_player()) maybe_skip(a);
     return g.o_swf(a, b, c, d);
 }
 
@@ -280,7 +284,11 @@ void* __fastcall drawer_update(void* a, void* b, void* c, void* d) {
     // A pipe delivery is deliberately queued until the cat and map settle.
     // The host can open an office before that delay expires; opening it here
     // first would let a new quest begin before the old cat is counted.
-    if (g.office_go >= 0 && !house_pipe_delivery_pending()) {
+    // FurnitureBuildingUI owns the held piece and the House's cat visibility.
+    // Opening an office beneath it bypasses its normal close/restore path.
+    // Keep the visit queued until the player finishes the local modal.
+    if (g.office_go >= 0 && g.exit_wanted) g.office_go = -1;
+    if (g.office_go >= 0 && !house_pipe_delivery_pending() && house_office_can_open()) {
         const int npc = g.office_go;
         g.office_go  = -1;
         g.going_ours = true;
@@ -298,6 +306,7 @@ void* __fastcall office_update(void* a, void* b, void* c, void* d) {
     g.office    = a;
     g.office_at = GetTickCount64();
     void* r = g.o_office(a, b, c, d);
+    if (net_role() == NetRole::Host) house_shop_sync();
     if (net_role() == NetRole::Host && net_active()) send_quest_items(true);
     if (g.exit_wanted && net_role() != NetRole::Host) {
         g.exit_wanted = false;
@@ -530,6 +539,9 @@ void send_first_talk(int npc) {
 }
 
 uint64_t __fastcall go_office(void* drawer, int npc) {
+    // Send progression/stock BEFORE the office-open message. The client can
+    // install it on the House update before Shop borrows stock pointers.
+    if (net_role() == NetRole::Host) house_shop_sync(true);
     if (net_role() == NetRole::Host) { g.talks_sent = 0; g.talk_none = false; }
     else if (g.going_ours) g.talks_used = 0;
     if (!g.going_ours && net_active()) {
@@ -572,6 +584,7 @@ void __fastcall exit_button(void* closure) {
         log_line("CUTSCENE", "-> the NPC office's Exit was pressed here, sent");
     }
     g.o_exit_btn(closure);
+    if (net_role() == NetRole::Host) house_shop_sync(true);
 }
 
 bool focus_wanted();
@@ -809,7 +822,8 @@ void start_pump(bool up) {
             continue;
         }
         const bool ready = office
-            ? (g.o_goto && g.drawer && now - g.drawer_at < kGoneMs && now - s.at >= 300)
+            ? (g.o_goto && g.drawer && now - g.drawer_at < kGoneMs && now - s.at >= 300 &&
+               house_office_can_open())
             : now - s.at >= kOwnWindowMs;
         // Not on top of another, not on the way to the menu, and not before this
         // game has had its own chance to start it.
@@ -1175,6 +1189,24 @@ void cutscene_set_base(uintptr_t base) {
     }
 }
 
+bool cutscene_active() { return up_why() != nullptr || cutscene_office_active(); }
+
+void cutscene_end_house_day() {
+    g.queued = 0;
+    g.nstarts = 0;
+    hline_n = 0;
+    pevent_n = 0;
+    talk_at = 0;
+    g.office_go = -1;
+    g.host_input_at = 0;
+    if (office_up()) {
+        g.exit_wanted = true;
+        g.exit_at = GetTickCount64();
+    }
+    ui_end_house_day();
+    log_line("CUTSCENE", "day ended: discarded daytime input/starts and requested NPC office exit");
+}
+
 void cutscene_pump() {
     const char* why = up_why();
     const bool  up  = why != nullptr;
@@ -1218,6 +1250,8 @@ void cutscene_pump() {
     const uint64_t now = GetTickCount64();
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g.queued; ++i) {
+        if (house_night_input_owned()) continue;
+        if (house_shop_client_active() && !talk_up()) continue;
         if (now - g.queue[i].at > kStaleInputMs) continue;
         if (talk_up()) continue;   // a talk moves by the host's lines, not its clicks
         if (up && kept == 0 && i == 0 && same_as_host() && ui_post_input(g.queue[i].what, g.queue[i].pos)) {
@@ -1310,6 +1344,10 @@ bool cutscene_on_message(const ChoiceMsg& m) {
     }
     g.host_up_at    = GetTickCount64();
     g.host_input_at = g.host_up_at;
+    if (house_night_input_owned()) return true;
+    // Shop purchases use host-validated requests and authoritative state.
+    // Replaying the host's raw mouse click as well can buy a second copy.
+    if (house_shop_client_active() && !talk_up()) return true;
     // count: where the host clicked (ui_pack_pos) -- an NPC office moves on
     // only for a click on its speech box, not for one under the client's cursor.
     if (g.queued < 16)
@@ -1320,6 +1358,10 @@ bool cutscene_on_message(const ChoiceMsg& m) {
 
 bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam) {
     if (!linked()) return false;
+    if (house_night_input_owned() &&
+        (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+         ((msg == WM_KEYDOWN || msg == WM_KEYUP) &&
+          (wparam == VK_SPACE || wparam == VK_RETURN || wparam == VK_ESCAPE)))) return true;
     uint8_t what = 0;
     bool    down = false;
     switch (msg) {
@@ -1333,6 +1375,9 @@ bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam) {
         default: return false;
     }
     if (!up_why()) return false;
+    // Each player can click the shared shop; h_ShopBuy forwards a client's
+    // purchase instead of granting locally. NPC conversations stay host-led.
+    if (house_shop_client_active() && !talk_up()) return false;
 
     if (net_role() == NetRole::Host) {
         if (down && !talk_up()) {

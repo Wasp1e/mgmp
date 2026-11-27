@@ -4,7 +4,13 @@ An unofficial mod that lets two people play one Mewgenics campaign together:
 the same House, the same runs, the same cats and the same fights, each player
 in charge of their own half of the cats.
 
-Version **0.3 pre-release** (network protocol 104), for Mewgenics **1.1.21239**.
+Version **0.31 pre-release** (network protocol 121), for Mewgenics **1.1.21239**.
+
+Release 0.31 includes shared run confirmation, House shop stock refresh,
+inventory lifetime fixes, synchronized music, night playback improvements and
+halt reports. Both players must install this version. The collars-to-gear
+transition and backpack map-click blocking have been verified in a live session;
+other recent changes still need broader live testing.
 
 This is a fork of [SanTertrust/mgmp](https://github.com/SanTertrust/mgmp),
 which laid the foundation: the battle lockstep, the network layer and the

@@ -8,6 +8,20 @@ add_executable(test_proto test_proto.cpp)
 target_include_directories(test_proto PRIVATE ${CMAKE_SOURCE_DIR}/src/net)
 add_test(NAME test_proto COMMAND test_proto)
 
+add_executable(test_peerlog test_peerlog.cpp
+    ${CMAKE_SOURCE_DIR}/src/session/mgmp_peerlog.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/mgmp_log.cpp)
+target_include_directories(test_peerlog PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/session ${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/net)
+target_compile_definitions(test_peerlog PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_test(NAME test_peerlog COMMAND test_peerlog)
+
+add_executable(test_invsync_house test_invsync_house.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_mem.cpp)
+target_include_directories(test_invsync_house PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/session ${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/net)
+target_compile_definitions(test_invsync_house PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_test(NAME test_invsync_house COMMAND test_invsync_house)
+
 add_executable(test_hashring test_hashring.cpp)
 target_include_directories(test_hashring PRIVATE ${CMAKE_SOURCE_DIR}/src/net)
 add_test(NAME test_hashring COMMAND test_hashring)
@@ -27,6 +41,24 @@ add_test(NAME test_split COMMAND test_split)
 add_executable(test_house_drag test_house_drag.cpp)
 target_include_directories(test_house_drag PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
 add_test(NAME test_house_drag COMMAND test_house_drag)
+
+add_executable(test_house_shop test_house_shop.cpp)
+target_include_directories(test_house_shop PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
+add_test(NAME test_house_shop COMMAND test_house_shop)
+
+add_executable(test_house_shop_live test_house_shop_live.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_mem.cpp)
+target_include_directories(test_house_shop_live PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/session ${CMAKE_SOURCE_DIR}/src/core ${CMAKE_SOURCE_DIR}/src/net)
+target_compile_definitions(test_house_shop_live PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_test(NAME test_house_shop_live COMMAND test_house_shop_live)
+
+add_executable(test_night_playback test_night_playback.cpp)
+target_include_directories(test_night_playback PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
+add_test(NAME test_night_playback COMMAND test_night_playback)
+
+add_executable(test_music_codec test_music_codec.cpp)
+target_include_directories(test_music_codec PRIVATE ${CMAKE_SOURCE_DIR}/src/session)
+add_test(NAME test_music_codec COMMAND test_music_codec)
 
 add_executable(test_sigscan test_sigscan.cpp ${CMAKE_SOURCE_DIR}/src/core/mgmp_sigscan.cpp)
 target_include_directories(test_sigscan PRIVATE ${CMAKE_SOURCE_DIR}/src/core)

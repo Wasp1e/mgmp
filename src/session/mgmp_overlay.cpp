@@ -11,6 +11,7 @@
 #include "mgmp_log.h"
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
+#include "mgmp_peer_colour.h"
 #include "mgmp_proto.h"
 #include "mgmp_ui.h"
 
@@ -293,18 +294,6 @@ const char* kFragmentSrc =
     "  vec4 t = mix(vec4(1.0), texture(uTex, vUV), uUseTex);\n"
     "  oColour = vec4(t.rgb * uColour.rgb, t.a * uColour.a);\n"
     "}\n";
-
-// --- peer colours, matching mgmp_cursor's reticle ---------------------------
-//
-// Deliberately the same table: the pointer and the reticle are two views of one
-// peer, and a partner whose arrow is gold but whose square is cyan would read
-// as two different people.
-const float kPeerRGB[kMaxPeers][3] = {
-    { 1.00f, 0.80f, 0.20f },
-    { 0.30f, 0.80f, 1.00f },
-    { 0.45f, 1.00f, 0.45f },
-    { 1.00f, 0.40f, 0.85f },
-};
 
 constexpr uint64_t kStaleMs = 3000;   // as in mgmp_cursor: a quiet peer is gone
 

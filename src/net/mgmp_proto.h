@@ -51,7 +51,8 @@ namespace mgmp {
 // So: if the value a peer puts in a message changes meaning, that is a protocol
 // change even when every byte stays where it was. Refusing at connect is free;
 // diagnosing it from a turn-0 halt is not.
-constexpr uint32_t kProtoVersion = 107; // Run confirmation votes can be withdrawn.
+constexpr uint32_t kProtoVersion = 121; // Run difficulty follows the host at act and node entry.
+// 109 resolves all disorder abilities, including long names.
 // 104 carries the native cat release velocity and pose.
 // 103 carries exact release positions for yard drops.
 // 102 mirrors the House cat's pre-jump animation.
@@ -136,6 +137,7 @@ enum MsgType : uint8_t {
     MSG_HOSTLEFT =20,   // host -> client: the host is no longer in the run
     MSG_LOGFILE  =21,   // client -> host: the end of the client's log, after
                         // trouble or when asked (see mgmp_peerlog.h)
+    MSG_MUSIC    =25,   // host audio blocks, client clock probes and host replies
     MSG_GEARCAT  =24,   // host -> client: party cat after the collar chooser commits
     MSG_CATPRE   =23,   // host -> client: a cat as it was before the host's shop
                         // level-up raised it; a CatDataMsg on the wire
@@ -596,8 +598,8 @@ struct CursorMsg {
 // first roll -- so comparing one word of it here names the cause at the moment
 // it is still fixable, instead of surfacing as a turn-3 hash mismatch.
 //
-// It also means the protocol never has to SEND a seed: entering the same node
-// is what makes the streams equal.
+// The run difficulty is carried as well because act selection can change it
+// after the shared save has already been loaded.
 constexpr uint32_t kMaxNodeOwners = 16;
 constexpr uint32_t kMaxNodeWeather = 8;
 constexpr uint32_t kNodeWeatherLen = 16;   // a name that fits the game's SSO
@@ -615,6 +617,8 @@ struct EnterNodeMsg {
     // message the run otherwise sends, and the battle draws from it.
     uint8_t  weather_count = 0;
     char     weather[kMaxNodeWeather][kNodeWeatherLen] = {};
+    int32_t difficulty = -1; // selected run difficulty, before native node entry
+    uint64_t party_hash = 0; // complete serialized party immediately before entry
 };
 
 // Host -> client: the option the host picked on a decision screen.
@@ -842,6 +846,13 @@ constexpr uint8_t kChoiceEventNext = 52;
 constexpr uint8_t kChoiceRunReadyState = 53;
 constexpr uint8_t kChoiceRunReadyVote  = 54;
 constexpr uint8_t kChoiceGearCatBatch  = 55;
+// Either way: cat = selected House cat (0 clears), node_seed = House day.
+constexpr uint8_t kChoiceHouseSelection = 56;
+// House shop: client purchase request / host stock count. index = stock slot,
+// count = remaining quantity, cat = native item fingerprint, node_seed = day,
+// name = catalog fingerprint. Requests are checked and executed on the host.
+constexpr uint8_t kChoiceHouseShopBuy = 58;
+constexpr uint8_t kChoiceHouseShopStock = 59;
 // Host -> client: the NPC office's conversation number `index` is `name` (see
 // mgmp_cutscene.cpp, office_talk). Empty name: the office has no more to say.
 constexpr uint8_t kChoiceOfficeTalk   = 17;
@@ -1333,6 +1344,8 @@ inline uint32_t enc_enter_node(uint8_t* p, uint32_t cap, const EnterNodeMsg& m) 
     w.u8v(m.weather_count);
     for (uint32_t i = 0; i < m.weather_count && i < kMaxNodeWeather; ++i)
         for (uint32_t c = 0; c < kNodeWeatherLen; ++c) w.u8v((uint8_t)m.weather[i][c]);
+    w.i32v(m.difficulty);
+    w.u64v(m.party_hash);
     return w.ok ? w.len : 0;
 }
 
@@ -1565,7 +1578,10 @@ inline bool dec_enter_node(Reader& r, EnterNodeMsg& m) {
         for (uint32_t c = 0; c < kNodeWeatherLen; ++c) m.weather[i][c] = (char)r.u8v();
         m.weather[i][kNodeWeatherLen - 1] = 0;
     }
-    return r.ok;
+    m.difficulty = r.i32v();
+    m.party_hash = r.u64v();
+    if (m.difficulty < -1 || m.difficulty > 100) return false;
+    return r.ok && r.pos == r.len;
 }
 
 inline bool dec_choice(Reader& r, ChoiceMsg& m) {
@@ -1634,6 +1650,7 @@ inline const char* msg_name(uint8_t t) {
         case MSG_STATEDUMP: return "STATEDUMP";
         case MSG_HOSTLEFT: return "HOSTLEFT";
         case MSG_LOGFILE:  return "LOGFILE";
+        case MSG_MUSIC:    return "MUSIC";
         case MSG_NIGHT:    return "NIGHT";
         case MSG_CATPRE:   return "CATPRE";
         case MSG_GEARCAT:  return "GEARCAT";

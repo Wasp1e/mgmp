@@ -49,3 +49,5 @@ bool startrun_box_drag_guard_ready();
 bool startrun_on_message(const ChoiceMsg& m);
 
 } // namespace mgmp
+
+namespace mgmp { bool startrun_box_has_cats(); }

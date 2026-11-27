@@ -74,6 +74,8 @@ void* ui_window();
 
 // Press Escape for the game. It goes past the panel, open or not.
 void ui_post_escape();
+// Release pending replicated input and hide the mod panel at the day boundary.
+void ui_end_house_day();
 
 // A left click (0), Space (1) or Enter (2) for the game, past the panel and the
 // cutscene filter: the down now, the up three frames later. False while the

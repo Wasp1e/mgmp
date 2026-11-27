@@ -1,3 +1,4 @@
+#include "mgmp_house_ready.h"
 #include "mgmp_startrun.h"
 #include "mgmp_classpick.h"
 #include "mgmp_house.h"
@@ -8,6 +9,7 @@
 #include "mgmp_leave.h"
 #include "mgmp_catsync.h"
 #include "mgmp_rng.h"
+#include "mgmp_addresses.h"
 #include "MinHook.h"
 
 #include <windows.h>
@@ -126,6 +128,7 @@ struct State {
     fn_gdone   gear_done  = nullptr;
     bool       act_ours   = false;
     int        act_pending = 0;         // client: the host's act, for the next ActSelection update
+    int32_t    act_difficulty[3] = {-1, -1, -1};
     uint64_t   act_at      = 0;
     bool       map_pending = false;     // client: set off for real, its map not built yet
     uint64_t   map_pending_at = 0;
@@ -274,10 +277,31 @@ void* __fastcall gen_map(void* map, void* name, void* flag, void* d) {
 }
 
 // HOST: an act picked. CLIENT: only the host's.
+bool act_difficulties(int32_t values[3], bool apply) {
+    void* director = nullptr;
+    void* save = nullptr;
+    if (!mem_read((const void*)addr_of_data(D_MewDirectorPtr), &director, sizeof(director)) ||
+        !director || !mem_read((uint8_t*)director + 0x5A8, &save, sizeof(save)) || !save)
+        return false;
+    for (int i = 0; i < 3; ++i) {
+        void* field = (uint8_t*)save + 0x410 + i * 0x18;
+        if (apply) {
+            if (values[i] < 0 || values[i] > 100 || !mem_write(field, &values[i], sizeof(values[i])))
+                return false;
+        } else if (!mem_read(field, &values[i], sizeof(values[i]))) return false;
+    }
+    return true;
+}
+
 void __fastcall act_pick(void* screen, int act) {
     if (net_active() && net_peer_count() >= 2) {
         if (net_role() == NetRole::Host) {
-            ChoiceMsg m{}; m.kind = kChoiceRunAct; m.index = (uint32_t)act; net_send_choice(m);
+            ChoiceMsg m{}; m.kind = kChoiceRunAct; m.index = (uint32_t)act;
+            int32_t difficulty[3]{};
+            if (act_difficulties(difficulty, false))
+                snprintf(m.name, sizeof(m.name), "%d %d %d",
+                         difficulty[0], difficulty[1], difficulty[2]);
+            net_send_choice(m);
             log_line("STARTRUN", "-> the host sets off into act %d", act);
         } else if (!g.act_ours) {
             static uint64_t said = 0;
@@ -306,6 +330,7 @@ void* __fastcall act_tick(void* screen, void* b, void* c, void* d) {
             g.map_pending_at = GetTickCount64();
             g.map_matched_at = 0;
             g.act_ours = true;
+            act_difficulties(g.act_difficulty, true);
             const bool ok = safe_act(screen, act);
             g.act_ours = false;
             log_line("STARTRUN", ok ? "<- act %d, as the host picked -- this game sets off into it"
@@ -612,7 +637,21 @@ void* __fastcall box_add_hook(void* box, void* cat, void* c, void* d) {
     return o_box_add(box, cat, c, d);
 }
 
+using fn_box_confirm = void (__fastcall*)(void*);
+fn_box_confirm original_box_confirm = nullptr;
+void __fastcall ready_box_confirm(void* box) {
+    if (house_vote_active && !house_vote_running) { house_vote_press(1); return; }
+    original_box_confirm(box);
+}
+
 void* __fastcall box_tick(void* box, void* b, void* c, void* d) {
+    if (original_box_confirm && house_vote_complete(1)) {
+        house_vote_clear();
+        house_vote_running = true;
+        original_box_confirm(box);
+        house_vote_running = false;
+        return nullptr;
+    }
     void* r = o_box_tick(box, b, c, d);
     if (!box || !net_active() || net_peer_count() < 2) return r;
     if (box != box_seen) {
@@ -740,6 +779,11 @@ void* __fastcall box_tick(void* box, void* b, void* c, void* d) {
 }
 
 void watch_box(uintptr_t base) {
+    const unsigned char confirm_head[] = {0x48, 0x89, 0x4C, 0x24, 0x08, 0x55};
+    void* confirm = (void*)(base + 0xADBF0);
+    if (!original_box_confirm && memcmp(confirm, confirm_head, sizeof(confirm_head)) == 0 &&
+        MH_CreateHook(confirm, (void*)&ready_box_confirm, (void**)&original_box_confirm) == MH_OK)
+        MH_EnableHook(confirm);
     void** slots = (void**)(base + kRva_BoxVtbl);
     void* tick = nullptr; void* add = nullptr; void* rem = nullptr;
     DWORD prot = 0;
@@ -1081,6 +1125,10 @@ int startrun_box_picker(uint64_t key) {
     return net_role() == NetRole::Host ? picker_of(key) : -1;
 }
 
+bool startrun_box_has_cats() {
+    return GetTickCount64() - box_tick_at <= 500 && box_note_any != 0;
+}
+
 bool startrun_box_note(uint32_t& mine, uint32_t& most) {
     const uint32_t players = net_peer_count();
     if (!net_active() || players < 2) return false;
@@ -1160,6 +1208,9 @@ bool startrun_on_message(const ChoiceMsg& m) {
         return false;
     if (net_role() == NetRole::Host) return true;
     if (m.kind == kChoiceRunAct) {
+        int32_t values[3] = {-1, -1, -1};
+        if (sscanf_s(m.name, "%d %d %d", &values[0], &values[1], &values[2]) == 3)
+            memcpy(g.act_difficulty, values, sizeof(values));
         g.act_pending = (int)m.index;
         g.act_at      = GetTickCount64();
         log_line("STARTRUN", "<- the host set off into act %u -- picked on this game's ActSelection", m.index);

@@ -87,6 +87,8 @@ struct State {
         uint32_t count = 0;
         uint64_t seed  = 0;
         uint32_t run_id = 0;
+        int32_t difficulty = -1;
+        uint64_t party_hash = 0;
         uint8_t  weather_count = 0;
         char     weather[kMaxNodeWeather][kNodeWeatherLen] = {};
         uint64_t at    = 0;         // tick the host's choice arrived
@@ -117,6 +119,9 @@ struct State {
     uint64_t edit_seen      = 0;
     bool     edit_rebase    = true;
     bool     inv_open       = false;
+    bool     peer_backpack[kMaxPeers] = {};
+    uint64_t backpack_sent = 0;
+    bool backpack_sent_open = false;
 
     // THE VOTE. Both players pick the next node, as in Slay the Spire 2, and the
     // host walks only when the picks agree. -1 is "not picked".
@@ -147,6 +152,7 @@ struct State {
     uint32_t published      = 0;
     uint32_t suppressed     = 0;
     bool     warned_no_map  = false;
+    bool checkpoint_valid = false;
 
     CRITICAL_SECTION cs;
     bool cs_ready = false;
@@ -229,6 +235,8 @@ void follow_init() {
     g.is_client = (net_role() == NetRole::Client);
     g.map       = nullptr;
     pending_clear();
+    memset(g.peer_backpack, 0, sizeof(g.peer_backpack));
+    g.backpack_sent = 0;
     if (!g.on) { log_line("FOLLOW", "map following disabled by net_follow = 0"); return; }
     log_line_lvl(LogLevel::Trace, "FOLLOW", "armed -- %s",
              g.is_client ? "following the host's map choices; local map input is suppressed"
@@ -399,12 +407,26 @@ static bool others_own_cats() {
     return false;
 }
 
+// Called with Guard held. Check before the native click, which selects the
+// node and starts walking the marker long before EnterNode is reached.
+static bool map_backpack_open() {
+    if (invsync_screen_open()) return true;
+    uint8_t members[kMaxPeers]{};
+    if (!net_peer_ids(members, kMaxPeers)) return false;
+    const uint8_t count = net_peer_count();
+    for (uint8_t i = 0; i < count && i < kMaxPeers; ++i)
+        if (members[i] < kMaxPeers && members[i] != net_self() &&
+            g.peer_backpack[members[i]]) return true;
+    return false;
+}
+
 bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     if (sent) *sent = false;
     if (!g.on || !net_active() || !map_screen || !node) return true;
 
     Guard guard;
     g.map = map_screen;                    // the click proves the pointer is live
+    if (map_backpack_open()) return false;
 
     uint32_t index = 0;
     bool     known = index_of_node(map_screen, node, index);
@@ -445,6 +467,8 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
         return true;
     }
 
+    net_begin_battle_checkpoint();
+    g.checkpoint_valid = savefile_checkpoint_before_battle();
     g.host_vote   = -1;
     g.client_vote = -1;
     g.host_clicks = 0;
@@ -484,6 +508,7 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     // is cheap, and the client ends every node holding exactly the host's run.
     catsync_forget();
     invsync_forget();
+    runhist_forget();
     catsync_publish("entering a node");
     // ...and the other half of the same equip. Order between these two does not
     // matter the way it does against ENTERNODE -- an equip has already moved
@@ -502,6 +527,8 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
     m.type       = type;
     m.seed0      = seed;
     m.run_id     = g.run_id;
+    m.difficulty = follow_difficulty();
+    m.party_hash = catsync_party_hash();
     lockstep_owners_write(m);
     weather_write(m);
     if (net_send_enter_node(m)) {
@@ -509,6 +536,13 @@ bool follow_on_enter_node(void* map_screen, void* node, bool* sent) {
         if (sent) *sent = true;
         log_line("FOLLOW", "-> node %u/%u (%s) seed0=%016llx",
                  index, count, node_type_name(type), (unsigned long long)m.seed0);
+    }
+    net_end_battle_checkpoint();
+    if (!g.checkpoint_valid) {
+        net_clear_battle_checkpoint();
+        log_line("FOLLOW", "pre-battle checkpoint unavailable for node %u", index);
+    } else {
+        log_line("FOLLOW", "pre-battle checkpoint cached for node %u", index);
     }
     return true;
 }
@@ -653,11 +687,43 @@ void follow_request_jump(uint32_t index) {
 // from one again and reuse an id a connected client has already played.
 void follow_on_run_restart() {
     Guard guard;
+    net_clear_battle_checkpoint();
     g.run_id    = (uint32_t)time(nullptr);
     g.have_here = false;      // the node we were in belongs to the run just left
     lockstep_on_run_restart();
     classpick_on_run_restart();
     log_line("FOLLOW", "new load of the run: %08x", g.run_id);
+}
+
+int32_t follow_difficulty() {
+    const void* director = nullptr;
+    const void* save = nullptr;
+    int32_t mode = 0, difficulty = -1;
+    const void* slot = (const void*)addr_of_data(D_MewDirectorPtr);
+    if (!slot || !mem_read(slot, &director, sizeof(director)) || !director ||
+        !mem_read((const uint8_t*)director + 0x6DC, &mode, sizeof(mode)) ||
+        mode < 1 || mode > 3 ||
+        !mem_read((const uint8_t*)director + 0x5A8, &save, sizeof(save)) || !save)
+        return -1;
+    mem_read((const uint8_t*)save + 0x410 + (mode - 1) * 0x18, &difficulty, sizeof(difficulty));
+    return difficulty >= 0 && difficulty <= 100 ? difficulty : -1;
+}
+
+bool follow_apply_difficulty(int32_t difficulty) {
+    if (difficulty < 0 || difficulty > 100) return false;
+    const void* director = nullptr;
+    void* save = nullptr;
+    int32_t mode = 0;
+    const void* slot = (const void*)addr_of_data(D_MewDirectorPtr);
+    if (!slot || !mem_read(slot, &director, sizeof(director)) || !director ||
+        !mem_read((const uint8_t*)director + 0x6DC, &mode, sizeof(mode)) ||
+        mode < 1 || mode > 3 ||
+        !mem_read((const uint8_t*)director + 0x5A8, &save, sizeof(save)) || !save)
+        return false;
+    const bool ok = mem_write((uint8_t*)save + 0x410 + (mode - 1) * 0x18,
+                              &difficulty, sizeof(difficulty));
+    if (ok) log_line("FOLLOW", "host run difficulty %d applied for mode %d", difficulty, mode);
+    return ok;
 }
 
 // THE OTHER PLAYER'S PICK, SHOWN ON THE NODE ITSELF. A frame drawn where its
@@ -725,6 +791,10 @@ static void send_vote(uint32_t index, uint32_t meow = 0) {
 static bool vote_click(void* node) {
     if (!g.on || !net_active() || !g.map || !node) return true;
     Guard guard;
+    if (map_backpack_open()) {
+        log_line("FOLLOW", "map click blocked before selection: a backpack is open");
+        return false;
+    }
     uint32_t index = 0;
     if (!index_of_node(g.map, node, index)) return true;
     const char* type = node_type_name(node_type(node));
@@ -801,9 +871,18 @@ void follow_set_base(uintptr_t base) {
     VirtualProtect(slot, sizeof(void*), prot, &prot);
 }
 
-void follow_on_vote(const ChoiceMsg& m) {
+void follow_on_vote(const ChoiceMsg& m, uint8_t from) {
     if (!g.on) return;
     Guard guard;
+    if (strcmp(m.name, "backpack-state") == 0) {
+        if (from != net_self() && from < kMaxPeers) {
+            if (g.peer_backpack[from] != (m.aux != 0))
+                log_line("FOLLOW", "peer %u backpack %s", from, m.aux ? "open" : "closed");
+            g.peer_backpack[from] = m.aux != 0;
+        }
+        return;
+    }
+    if (map_backpack_open()) return;
     // A pick made on another node is about another map position.
     if (m.node_seed && g.have_here && m.node_seed != g.here_seed) return;
     show_pick((int32_t)m.index);
@@ -846,6 +925,7 @@ void follow_catchup(uint8_t peer) {
     m.type       = g.here_type;
     m.seed0      = g.here_seed;
     m.run_id     = g.run_id;
+    m.difficulty = follow_difficulty();
     lockstep_owners_write(m);
     weather_write(m);
     if (!net_send_enter_node_to(peer, m)) return;
@@ -867,6 +947,16 @@ void follow_on_message(const EnterNodeMsg& m) {
         return;
     }
     lockstep_owners_read(m);
+    if (g.have_here && g.run_id == m.run_id && g.here_seed == m.seed0 &&
+        g.here_index == m.index && !follow_on_map()) {
+        log_line("FOLLOW", "duplicate current node %u ignored while inside it", m.index);
+        return;
+    }
+    for (uint32_t i = 0; i < g.pending_count; ++i) {
+        const auto& queued = g.pending_q[(g.pending_head + i) % State::kMaxPendingNodes];
+        if (queued.run_id == m.run_id && queued.seed == m.seed0 && queued.index == m.index)
+            return;
+    }
     // A full queue means this peer is eight nodes behind, which no amount of
     // waiting is going to fix. Refuse the newest and SAY SO: the run is already
     // wrong, and the one thing that must not happen is what used to -- losing a
@@ -891,6 +981,8 @@ void follow_on_message(const EnterNodeMsg& m) {
     p.count = m.node_count;
     p.seed  = m.seed0;
     p.run_id = m.run_id;
+    p.difficulty = m.difficulty;
+    p.party_hash = m.party_hash;
     p.weather_count = m.weather_count;
     memcpy(p.weather, m.weather, sizeof(p.weather));
     // Timed from ARRIVAL, not from the first map update that sees it: the point
@@ -985,6 +1077,22 @@ void follow_edit_pump() {
     if (!g.on) return;
     Guard guard;
     const uint64_t now = GetTickCount64();
+    const bool backpack = invsync_screen_open();
+    // Publish before map/battle gating: the map stops updating underneath an
+    // open backpack, and the previous battle roster remains cached on the map.
+    if (backpack != g.backpack_sent_open || !g.backpack_sent ||
+        now - g.backpack_sent >= 1000) {
+        ChoiceMsg state{};
+        state.kind = kChoiceNode;
+        state.aux = backpack ? 1 : 0;
+        strcpy_s(state.name, "backpack-state");
+        if (net_send_choice(state)) {
+            if (!g.backpack_sent || backpack != g.backpack_sent_open)
+                log_line("FOLLOW", "published backpack %s", backpack ? "open" : "closed");
+            g.backpack_sent = now;
+            g.backpack_sent_open = backpack;
+        }
+    }
     if (now - g.edit_tick < kEveryMs) return;
     g.edit_tick = now;
 
@@ -1042,6 +1150,7 @@ void* follow_map_update(void* map_screen) {
     // panel jump below.
     if (g.vote_go && !g.is_client) {
         g.vote_go = false;
+        if (map_backpack_open()) return nullptr;
         void* node = g.host_vote >= 0 ? node_at(map_screen, (uint32_t)g.host_vote) : nullptr;
         if (!node) return nullptr;
         bool sent = false;
@@ -1162,6 +1271,26 @@ void* follow_map_update(void* map_screen) {
 
     const uint32_t entering = p.index;
     const uint32_t run_id   = p.run_id;
+    // Apply the full host snapshot before the game consumes next-fight
+    // effects. A roster-id hash alone cannot detect a missing event status.
+    invsync_apply_pending("pre-battle snapshot");
+    catsync_apply_pending("pre-battle snapshot");
+    runhist_apply_pending("pre-battle snapshot");
+    if (p.party_hash) {
+        const uint64_t actual = catsync_party_hash();
+        if (actual != p.party_hash) {
+            if (!p.held) {
+                log_line("FOLLOW", "party snapshot mismatch before node %u: host %016llx client %016llx; entry held",
+                         entering, (unsigned long long)p.party_hash, (unsigned long long)actual);
+                p.held = true;
+            }
+            return nullptr;
+        }
+        log_line("FOLLOW", "full party snapshot verified before node %u, including event effects",
+                 entering);
+    }
+    g.run_id = run_id;
+    follow_apply_difficulty(p.difficulty);
     weather_apply(p.weather_count, p.weather);
     pending_pop();
     ++g.entered;

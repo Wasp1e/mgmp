@@ -2,22 +2,51 @@
 
 #include "mgmp_net.h"
 #include "mgmp_log.h"
+#include "mgmp_music.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <cstdio>
+#include <vector>
 
 #pragma comment(lib, "ws2_32.lib")
 
 namespace mgmp {
+namespace {
+bool checkpoint_capture = false;
+std::vector<std::vector<uint8_t>> battle_checkpoint;
+}
+
+void net_clear_battle_checkpoint() { checkpoint_capture = false; battle_checkpoint.clear(); }
+void net_begin_battle_checkpoint() { net_clear_battle_checkpoint(); checkpoint_capture = true; }
+void net_end_battle_checkpoint() { checkpoint_capture = false; }
+void net_checkpoint_frame(const uint8_t* payload, uint32_t len) {
+    if (len) battle_checkpoint.emplace_back(payload, payload + len);
+}
+bool net_send_battle_checkpoint(uint8_t peer) {
+    if (checkpoint_capture || battle_checkpoint.empty() ||
+        battle_checkpoint.front()[0] != MSG_SAVEFILE ||
+        battle_checkpoint.back()[0] != MSG_ENTERNODE) return false;
+    const auto& node_frame = battle_checkpoint.back();
+    Reader reader(node_frame.data(), static_cast<uint32_t>(node_frame.size()));
+    reader.u8v();
+    EnterNodeMsg node{};
+    if (!dec_enter_node(reader, node) || node.type < 5 || node.type > 8) return false;
+    for (const auto& frame : battle_checkpoint)
+        if (!net_send_peer(peer, frame.data(), static_cast<uint32_t>(frame.size()))) return false;
+    return true;
+}
 namespace {
 
 // The receive queue. Fixed capacity, no allocation on the receive path.
 // 256 messages is far more than a turn can produce -- run E's whole 15-turn
 // battle was 49 actions -- so overflow means the game thread has stopped
 // draining, which is a bug worth counting rather than growing a buffer for.
-constexpr uint32_t kQueueCap = 256;
+// A reconnect can deliver all 512 recorded actions plus its checkpoint before
+// the game finishes loading. Keep that burst intact while the main thread is
+// constructing the run.
+constexpr uint32_t kQueueCap = 1024;
 
 // The largest frame this build will accept. Everything except MSG_SAVEFILE is
 // under 128 bytes; a save is ~45 KB, and the slack is for saves that grow.
@@ -316,6 +345,12 @@ void recv_loop(Link& link) {
         // let one peer inject another's decisions, so the host overwrites it
         // with the id it handed that socket rather than trusting what arrived.
         if (g.role == NetRole::Host) from = link.id;
+
+        if (payload[0] == MSG_MUSIC) {
+            g.stats.bytes_received += len + 4;
+            music_receive(payload, plen, from, g.role == NetRole::Host);
+            continue;
+        }
 
         // Relay BEFORE decoding and queuing. Decoding can allocate and the game
         // thread may be mid-frame; the other clients should not wait on either.
@@ -622,6 +657,9 @@ bool net_active() {
 // returns false, which every caller already treats as "nothing sent".
 bool net_send(const uint8_t* payload, uint32_t len) {
     if (len == 0) return false;
+    if (checkpoint_capture && (payload[0] == MSG_CATDATA || payload[0] == MSG_INVENTORY ||
+        payload[0] == MSG_RUNHIST || payload[0] == MSG_ENTERNODE))
+        net_checkpoint_frame(payload, len);
     bool any = false, failed = false;
     for (int i = 0; i < kMaxPeers; ++i) {
         Link& l = g.links[i];
@@ -637,6 +675,43 @@ bool net_send_peer(uint8_t peer, const uint8_t* payload, uint32_t len) {
     int slot = link_slot_of(peer);
     if (slot < 0) return false;
     return send_framed(g.links[slot].sock, g.self, payload, len);
+}
+
+bool net_send_music_to(uint8_t peer, const uint8_t* payload, uint32_t len) {
+    constexpr uint32_t kMaxMusicBytes = 2048;
+    if (!len || len > kMaxMusicBytes) return false;
+    const int slot = link_slot_of(peer);
+    if (slot < 0 || !TryEnterCriticalSection(&g.send_cs)) return false;
+
+    const SOCKET socket = g.links[slot].sock;
+    fd_set writable{};
+    FD_SET(socket, &writable);
+    timeval timeout{};
+    bool ok = false;
+    if (socket != INVALID_SOCKET && select(0, nullptr, &writable, nullptr, &timeout) == 1) {
+        const uint32_t body = len + kEnvelopeBytes;
+        uint8_t frame[sizeof(body) + kEnvelopeBytes + kMaxMusicBytes];
+        memcpy(frame, &body, sizeof(body));
+        frame[sizeof(body)] = g.self;
+        memcpy(frame + sizeof(body) + kEnvelopeBytes, payload, len);
+        const int total = static_cast<int>(sizeof(body) + body);
+        int written = 0;
+        while (written < total) {
+            const int count = send(socket, reinterpret_cast<const char*>(frame) + written,
+                                   total - written, 0);
+            if (count <= 0) break;
+            written += count;
+        }
+        ok = written == total;
+        if (ok) {
+            g.stats.bytes_sent += total;
+        } else if (written > 0) {
+            // A partial TCP frame cannot be dropped and followed by gameplay.
+            shutdown(socket, SD_BOTH);
+        }
+    }
+    LeaveCriticalSection(&g.send_cs);
+    return ok;
 }
 
 // Every encoder writes into a stack buffer and hands the result to net_send.

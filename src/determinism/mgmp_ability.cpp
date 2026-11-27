@@ -134,7 +134,7 @@ void* all_abilities(void* character) {
 // and puts it in the temporary vector at Character+0xEA0.
 using fn_find_or_create_ability = void* (__fastcall*)(void*, const void*);
 
-void* resolve_cannibalize(void* character) {
+void* resolve_temporary_ability(void* character, const char* gon) {
     if (!resolve_is_pinned_build()) return nullptr;
 
     // The factory's creations are outside both the spell slots and the tile
@@ -146,7 +146,7 @@ void* resolve_cannibalize(void* character) {
     for (uint32_t i = 0; i < count; ++i) {
         const void* ability = read_ptr(data, i * sizeof(void*));
         char name[64];
-        if (ability_gon_name(ability, name, sizeof(name)) && strcmp(name, "Cannibalize") == 0)
+        if (ability_gon_name(ability, name, sizeof(name)) && strcmp(name, gon) == 0)
             return const_cast<void*>(ability);
     }
 
@@ -160,10 +160,16 @@ void* resolve_cannibalize(void* character) {
 
     // Borrowed short MSVC string, read by the game and copied before any move.
     struct {
-        char inline_chars[16];
+        union { char inline_chars[16]; const char* chars; };
         uint64_t size;
         uint64_t capacity;
-    } name{"Cannibalize", sizeof("Cannibalize") - 1, 15};
+    } name{{}, strlen(gon), 15};
+    if (name.size > 15) {
+        name.chars = gon;   // borrowed by the const-reference factory
+        name.capacity = name.size;
+    } else {
+        memcpy(name.inline_chars, gon, name.size);
+    }
     auto factory = reinterpret_cast<fn_find_or_create_ability>(entry);
     __try { return factory(character, &name); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
@@ -200,7 +206,19 @@ void* ability_find_by_name(void* character, const char* gon, char* seen, size_t 
         if (seen && at + 1 < seen_size)
             at += _snprintf_s(seen + at, seen_size - at, _TRUNCATE, "%s%s", at ? ", " : "", nm);
     }
-    return strcmp(gon, "Cannibalize") == 0 ? resolve_cannibalize(character) : nullptr;
+    // data/abilities/disorder_abilities.gon and ability references in
+    // data/passives/disorders.gon. These can be created lazily on the owner.
+    static const char* const disorder_abilities[] = {
+        "ViolentOutburst", "BasicDashAttackMove", "BasicDashAttackMove_NoKnockback",
+        "PoxScratch", "MegaFart", "ParanoiaBasicMelee", "MiniFart", "KidneyStone",
+        "EatShit", "Cannibalize", "CrohnsPoop", "Hallucinate_Disorder",
+        "SpontaneouslyCombust", "DysenteryPoop", "DarkOneStrike", "SkunkTail",
+        "Bloodzerk", "Groom", "neck_ChefsApron", "Rest", "PissYourself",
+        "MockingbirdForm", "TigerForm"
+    };
+    for (const char* name : disorder_abilities)
+        if (strcmp(gon, name) == 0) return resolve_temporary_ability(character, gon);
+    return nullptr;
 }
 
 void* current_actor(const void* turn_control) {

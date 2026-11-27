@@ -1,3 +1,4 @@
+#include "mgmp_house.h"
 #include "mgmp_classpick.h"
 #include "mgmp_lockstep.h"
 #include "mgmp_catsync.h"
@@ -430,6 +431,7 @@ void dim_slots(void* screen);
 void dim_tag(void* tag);
 
 void* __fastcall inv_tick(void* a, void* b, void* c, void* d) {
+    invsync_on_screen_tick();
     // Native init calls update before its equipment widgets are finished.
     // Network edits and rebuilds must wait for the first ordinary update.
     if (inv_initializing) return g.o_inv(a, b, c, d);
@@ -754,11 +756,43 @@ bool run_gear() {
 }
 
 // 1 this player's cat in the run, 0 the other player's, -1 neither.
+void assign_new_run_cats() {
+    if (!net_active() || net_role() != NetRole::Host || net_peer_count() < 2 ||
+        !in_a_run()) return;
+    uint64_t ids[16]{};
+    const uint32_t count = catsync_run_uids(ids, 16);
+    bool known = false, unseen = false;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (lockstep_cat_known(ids[i])) known = true;
+        else unseen = true;
+    }
+    // The class chooser establishes the original party. Subsequent additions
+    // use that same persistent ownership table as soon as they join the run.
+    if (!unseen) return;
+    if (!known) {
+        uint64_t previous_ids[16]{};
+        uint8_t previous_owners[16]{};
+        if (!lockstep_owners_copy(previous_ids, previous_owners, 16)) return;
+    }
+    uint8_t owners[16]{};
+    lockstep_claim_cats(ids, count, owners);
+    for (uint32_t i = 0; i < count; ++i) {
+        ChoiceMsg message{};
+        message.kind = kChoiceRunOwner;
+        message.cat = ids[i];
+        message.aux = owners[i];
+        net_send_choice(message);
+    }
+    log_line("CLASSPICK", "new party member assigned immediately; published %u cat owners", count);
+}
+
 int run_owner(void* cat) {
+    assign_new_run_cats();
     uint64_t uid = 0;
     if (!cat || !mem_read(cat, &uid, sizeof(uid)) || !uid) return -1;
     if (lockstep_cat_theirs(uid)) return 0;
-    return lockstep_cat_known(uid) ? 1 : -1;
+    // Until the host's ownership arrives, neither screen may dress a new cat.
+    return lockstep_cat_known(uid) ? 1 : 0;
 }
 
 // CLIENT: a move onto or off its own cat, asked of the host.
@@ -1831,8 +1865,7 @@ fn_this   o_icon_click = nullptr;
 fn_assign str_assign   = nullptr;
 
 void* __fastcall icon_click(void* closure, void* b, void* c, void* d) {
-    void* r = o_icon_click(closure, b, c, d);
-    if (!net_active() || net_peer_count() < 2) return r;
+    if (!net_active() || net_peer_count() < 2) return o_icon_click(closure, b, c, d);
     uint8_t* card = nullptr;
     int32_t  idx  = -1;
     uint8_t* hc   = nullptr;
@@ -1847,7 +1880,8 @@ void* __fastcall icon_click(void* closure, void* b, void* c, void* d) {
         !mem_read(hc + kHouseCat_Key, &key, sizeof(key)) || !key ||
         !mem_read(card + kCard_Icons, &icons, sizeof(icons)) || !icons ||
         !mem_read_std_string(icons + (uintptr_t)idx * 0x20, name, sizeof(name)))
-        return r;
+        return o_icon_click(closure, b, c, d);
+    void* r = o_icon_click(closure, b, c, d);
     ChoiceMsg m{};
     m.kind = kChoiceCatIcon;
     m.cat  = key;
@@ -2044,6 +2078,7 @@ void say_backpack() {
 
 void classpick_pump() {
     if (inv_initializing) return;
+    assign_new_run_cats();
     say_backpack();
     if (!g.o_tick || !g.o_click) return;
     if (!shared_start()) {
@@ -2170,8 +2205,10 @@ bool classpick_on_message(const ChoiceMsg& m, uint8_t from) {
         return true;
     }
     if (m.kind == kChoiceCatIcon) {
+        if (from == net_self() || from == kNoPeer || !m.cat) return true;
         void* cat = cat_by_key(m.cat);
         const bool ok = cat && str_assign && safe_assign((uint8_t*)cat + kCatData_Icon, m.name);
+        if (ok) house_refresh_cat_icon(m.cat);
         log_line("CLASSPICK", ok ? "<- cat %016llx wears the icon '%s', as the other player put it"
                                  : "!! cat %016llx's icon '%s' could not be put on here",
                  (unsigned long long)m.cat, m.name);

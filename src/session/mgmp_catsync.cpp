@@ -298,6 +298,34 @@ void catsync_forget() {
     memset(g.sent_hash, 0, sizeof(g.sent_hash));
 }
 
+uint64_t catsync_party_hash() {
+    RunCats party{};
+    if (!run_cats(party)) return 0;
+    uint64_t hash = 0xCBF29CE484222325ull;
+    auto mix = [&](const void* data, uint32_t size) {
+        const auto* bytes = static_cast<const uint8_t*>(data);
+        for (uint32_t i = 0; i < size; ++i) {
+            hash ^= bytes[i];
+            hash *= 0x100000001B3ull;
+        }
+    };
+    mix(&party.count, sizeof(party.count));
+    for (uint32_t i = 0; i < party.count; ++i) {
+        uint64_t id = 0;
+        void* cat = nullptr;
+        if (!mem_read(party.ids + i, &id, sizeof(id)) ||
+            !safe_by_id((void*)party.registry, id, &cat) || !cat) return 0;
+        uint8_t* data = nullptr;
+        const uint32_t size = serialize_cat(cat, &data);
+        if (!size) return 0;
+        mix(&id, sizeof(id));
+        mix(&size, sizeof(size));
+        mix(data, size);
+        free(data);
+    }
+    return hash ? hash : 1;
+}
+
 uint32_t catsync_run_uids(uint64_t* out, uint32_t max) {
     RunCats rc{};
     if (!run_cats(rc)) return 0;
@@ -635,6 +663,15 @@ static bool apply_now(const CatDataMsg& m, const char* when) {
                  (unsigned long long)m.id);
         return false;
     }
+
+    // Repeated snapshots are common at node boundaries. Avoid rebuilding an
+    // already identical cat and its queued event effects.
+    uint8_t* current = nullptr;
+    const uint32_t current_size = serialize_cat(cat, &current);
+    const bool identical = current_size == m.size && current &&
+                           fnv1a(current, current_size) == m.hash;
+    free(current);
+    if (identical) return true;
 
     uint8_t bs[kByteStreamSize];
     if (!bs_construct(bs)) return false;

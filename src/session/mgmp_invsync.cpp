@@ -9,6 +9,8 @@
 #include "mgmp_mem.h"
 #include "mgmp_net.h"
 #include "mgmp_proto.h"
+#include "mgmp_house.h"
+#include "mgmp_leave.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -122,6 +124,7 @@ constexpr uint64_t  kBoxGoneMs         = 300;
 using fn_box_update = void* (__fastcall*)(void*, void*, void*, void*);
 fn_box_update o_box_update = nullptr;
 uint64_t      g_box_at     = 0;
+uint64_t g_screen_at = 0;
 
 void* __fastcall box_update(void* a, void* b, void* c, void* d) {
     g_box_at = GetTickCount64();
@@ -343,7 +346,13 @@ void invsync_set_base(uintptr_t base) {
     watch_item_boxes(base);
 }
 
+void invsync_on_screen_tick() {
+    g_screen_at = GetTickCount64();
+}
+
 bool invsync_screen_open() {
+    if (leave_on_house() && !house_inventory_can_replace()) return true;
+    if (g_screen_at && GetTickCount64() - g_screen_at < kBoxGoneMs) return true;
     return !o_box_update || GetTickCount64() - g_box_at < kBoxGoneMs;
 }
 
@@ -643,6 +652,8 @@ static void apply_now(const InventoryMsg& m, const char* when) {
         }
     }
 
+    if (leave_on_house()) house_inventory_replaced();
+
     // Coins and food are the host's own: an edit moves items and nothing else.
     bool scalars = !g.is_client ||
         (mem_write((uint8_t*)ri.inventory + kInv_Coins, &m.coins, sizeof(m.coins)) &&
@@ -664,7 +675,7 @@ static void apply_now(const InventoryMsg& m, const char* when) {
 // invsync_apply_pending. That something is the client's map-follow tick, so a
 // peer with net_follow off applies where the message arrives, as before -- it is
 // driving its own map anyway, and nothing else would ever drain the queue.
-static bool defer_applies() { return g.is_client && config().net_follow; }
+static bool defer_applies() { return g.is_client && (config().net_follow || leave_on_house()); }
 
 void invsync_on_message(const InventoryMsg& m) {
     ensure_state();
@@ -681,13 +692,8 @@ void invsync_on_message(const InventoryMsg& m) {
     if (!defer_applies()) { apply_now(m, "on arrival"); return; }
 
     if (!stash_pending(m)) {
-        // Out of memory holding at most 3 x kMaxInvBytes. Applying it here is
-        // the lesser risk: the crash it dodges needs the peer to have its
-        // inventory screen open, and dropping the push silently is a divergence
-        // every time.
-        log_line("INVSYNC", "!! could not hold the inventory for the map tick -- "
-                            "applying it here instead");
-        apply_now(m, "on arrival, deferral failed");
+        // A load frees every item. Never fall back to loading under live UI.
+        log_line("INVSYNC", "!! could not hold the inventory -- snapshot dropped; waiting for a new push");
         return;
     }
     ++g.deferred;
@@ -699,6 +705,7 @@ void invsync_drop_pending() { free_pending(); }
 int invsync_take_edit() {
     ensure_state();
     if (!g.on || g.is_client || !g.pend_have) return 0;
+    if (invsync_screen_open()) return 0;
 
     // The game moves the bag on both peers after a fight, a level-up or an event,
     // and the client reads that as an edit. Measured 2026-11-03: four of five such
@@ -734,6 +741,7 @@ int invsync_take_edit() {
 bool invsync_apply_pending(const char* why) {
     ensure_state();
     if (!g.on || !g.is_client || !g.pend_have) return false;
+    if (invsync_screen_open()) return false;
 
     // An echo of what this peer already holds. Clearing a bucket frees items a
     // screen may be showing, so nothing is touched that does not have to be.

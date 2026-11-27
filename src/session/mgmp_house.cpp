@@ -1,6 +1,11 @@
 #include "mgmp_house.h"
+#include "mgmp_house_ready.h"
+#include "mgmp_house_shop.h"
+#include "mgmp_house_shop_rules.h"
+#include "mgmp_night_playback.h"
 #include "mgmp_house_drag.h"
 #include "mgmp_net.h"
+#include "mgmp_peer_colour.h"
 #include "mgmp_log.h"
 #include "mgmp_savefile.h"
 #include "mgmp_night.h"
@@ -14,6 +19,7 @@
 #include "mgmp_lang.h"
 #include "mgmp_cutscene.h"
 #include "mgmp_config.h"
+#include "mgmp_ui.h"
 #include "mgmp_startrun.h"
 
 #include <windows.h>
@@ -300,6 +306,9 @@ bool ignored(const std::string& id) {
 //                host's.
 //   pedigree     see below.
 const char* noted(const std::string& id) {
+    // UI tutorial acknowledgements can differ with local browsing. The
+    // 2026-11-22 log skipped an otherwise matching night for this alone.
+    if (house_local_ui_row(id)) return "local tutorial acknowledgements, not night simulation state";
     if (id == "files house_state") return "the cats' spots inside their rooms";
     if (id == "properties random_seed") return "each game's own stream until the night is the host's";
     // A cache of the cats' kinship, filled for the pairs a player looked at
@@ -340,6 +349,7 @@ void send(const char* reason, const std::string& text) {
 
 bool     g_match    = false;   // client: the last day-end check found the host's House here
 uint64_t g_match_at = 0;
+std::string g_pending_house_check;
 
 // Where each House cat is now, read from the game rather than its save: the
 // House writes the save only now and then (268 s old at one day's end in the
@@ -362,6 +372,7 @@ void* weather_str() {
 constexpr uintptr_t kRva_FurnitureStore = 0x13DA9A0;
 
 void compare(const std::string& host_text) {
+    house_shop_apply();
     wchar_t path[MAX_PATH];
     std::vector<Row> mine;
     uint64_t age = 0;
@@ -378,6 +389,8 @@ void compare(const std::string& host_text) {
     // The inventory is compared live (live_inventory) once the host's is in.
     const bool live_inventory = here.count("live_inventory hash") &&
                                 host_text.find("live_inventory hash	") != std::string::npos;
+    const bool live_storage = here.count("live_storage upgrades") &&
+                              host_text.find("live_storage upgrades\t") != std::string::npos;
     // Both games read their furniture live: the save's rows are not compared.
     const bool live_furniture = here.count("live_furniture count") &&
                                 host_text.find("live_furniture count\t") != std::string::npos;
@@ -402,6 +415,7 @@ void compare(const std::string& host_text) {
         if (ignored(id)) continue;
         if (live_furniture && id.compare(0, 10, "furniture ") == 0) continue;   // compared live
         if (live_inventory && id.compare(0, 16, "files inventory_") == 0) continue;
+        if (live_storage && id == "properties house_storage_upgrades") continue;
         auto it = here.find(id);
         if (const char* why = noted(id)) {
             if (it != here.end() && it->second->hash != hash)
@@ -420,9 +434,10 @@ void compare(const std::string& host_text) {
         }
     }
     for (const Row& r : mine) {
-        if (seen.count(r.id) || ignored(r.id)) continue;
+        if (seen.count(r.id) || ignored(r.id) || noted(r.id)) continue;
         if (live_furniture && r.id.compare(0, 10, "furniture ") == 0) continue;
         if (live_inventory && r.id.compare(0, 16, "files inventory_") == 0) continue;
+        if (live_storage && r.id == "properties house_storage_upgrades") continue;
         ++extra;
         ++by_table[r.id.substr(0, r.id.find(' '))];
         if (shown++ < 60) log_line("HOUSE", "  only this game has %s = %s", label(r.id).c_str(), r.shown.c_str());
@@ -1065,6 +1080,7 @@ bool safe_unplace(void* place, void* cat) {
 // Suspend only its HouseCat/HouseCatPhysics updates, leaving the renderer alive.
 using fn_drag_update = void (__fastcall*)(void*);
 fn_drag_update o_drag_input = nullptr, o_drag_cat = nullptr, o_drag_physics = nullptr;
+fn_drag_update o_cat_social = nullptr;
 bool g_drag_hooks = false;
 void* g_drag_scene = nullptr;
 struct DragVisual {
@@ -1304,7 +1320,18 @@ uint64_t drag_publish_final(void* cat, double (&pos)[2]) {
     return m.node_seed;
 }
 
+std::map<uint64_t, uint64_t> g_icon_refresh_pending;
 void __fastcall drag_cat_update(void* cat) {
+    const auto refresh = g_icon_refresh_pending.find(cat_key(cat));
+    if (refresh != g_icon_refresh_pending.end() && !remote_drag_cat(cat)) {
+        const bool fresh = GetTickCount64() - refresh->second < 1000;
+        g_icon_refresh_pending.erase(refresh);
+        if (fresh) {
+            o_drag_cat(cat);
+            apply_house_cat_snapshot(cat);
+            return;
+        }
+    }
     if (remote_drag_cat(cat)) {
         const auto& v = g_drag_visuals.find(cat_key(cat))->second;
         drag_position(cat, v.x, v.y);
@@ -1312,6 +1339,15 @@ void __fastcall drag_cat_update(void* cat) {
     }
     if (apply_house_cat_snapshot(cat)) return;
     o_drag_cat(cat);
+}
+
+// HouseCat's second update (vtable +0x58) independently scans nearby cats
+// and queues social actions. Its +0xD9 gate is normally reset by the main
+// update, which followers skip. Running this phase alone repeats reactions
+// whenever mirrored cats cross, even though the host chose no such action.
+void __fastcall house_cat_social_update(void* cat) {
+    if (remote_drag_cat(cat) || apply_house_cat_snapshot(cat)) return;
+    o_cat_social(cat);
 }
 
 void send_native_cat_release(void* cat, void* physics, uint64_t key) {
@@ -1521,6 +1557,7 @@ void drag_install() {
     struct Hook { uintptr_t rva; const char* head; void* det; fn_drag_update* orig; };
     const Hook hooks[] = {
         {0x1FACC0, "\x48\x8b\xc4\x55\x53\x56\x57\x41\x54\x41", (void*)&drag_cat_update, &o_drag_cat},
+        {0x1FD8B0, "\x48\x8b\xc4\x55\x53\x56\x57\x41\x54\x41", (void*)&house_cat_social_update, &o_cat_social},
         {0x1FF3F0, "\x48\x89\x5c\x24\x08\x57\x48\x81\xec\x80", (void*)&drag_physics_update, &o_drag_physics},
         {0x1FE940, "\x48\x8b\xc4\x48\x89\x58\x18\x55\x56\x57", (void*)&drag_input_update, &o_drag_input}
     };
@@ -1718,16 +1755,22 @@ bool     g_pressing   = false;
 void*    g_cur_scene  = nullptr;   // this game's night screen now, and its number
 uint32_t g_cur_scene_n = 0;
 struct NightClick { uint32_t n, action, arg; };
-NightClick g_clicks[16];
+constexpr uint32_t kMaxNightClicks = 128;
+NightClick g_clicks[kMaxNightClicks];
 uint32_t   g_click_n = 0;
+NightPlaybackGate g_night_playback;
+uint64_t g_close_day_until = 0;
+uint64_t g_day_menu_button_at = 0;
 bool night_shared();
 
 // The two calls from TrashScreenItemBox2::click into Inventory's move routine.
 // Other callers use it for game effects and should keep their native behavior.
 constexpr uintptr_t kRva_DrawerMove = 0x2E19B0;
+constexpr uintptr_t kRva_DrawerClick = 0x213DC0;
 constexpr uintptr_t kRva_MoveToTrash = 0x213E90;
 constexpr uintptr_t kRva_MoveToStorage = 0x21409D;
 constexpr uintptr_t kRva_DrawerRefresh = 0x211700;
+constexpr uintptr_t kRva_DrawerRebuild = 0x210590;
 constexpr uintptr_t kRva_DrawersVtbl = 0xEE6688;
 constexpr uintptr_t kComps_InventoryDrawers = 0x48D0;
 constexpr uintptr_t kRva_InventorySlot = 0x13C7560;
@@ -1737,14 +1780,26 @@ constexpr uintptr_t kRva_EraseBucketItem = 0x2E24D0;
 constexpr uintptr_t kRva_SaveHouse = 0x3BDCF0;
 constexpr uintptr_t kDir_CurrentDay = 0x580;
 constexpr uintptr_t kProgression_StorageUpgrade = 0x114;
-constexpr uintptr_t kHouseStore_StorageUpgrade = 0xBC;
 constexpr uint32_t kStorage = 1, kTrash = 2;
 constexpr uint32_t kMaxDrawerItems = 4096;
 
 using fn_drawer_move = void* (__fastcall*)(void*, uint64_t, uint32_t);
+using fn_drawer_click = void (__fastcall*)(void*);
 using fn_item_test = bool (__fastcall*)(const void*);
 using fn_bucket_erase = void (__fastcall*)(void*, const uint64_t*);
 fn_drawer_move o_drawer_move = nullptr;
+fn_drawer_click o_drawer_click = nullptr;
+
+struct DrawerReplay {
+    void* inventory;
+    uint64_t id;
+    uint32_t destination;
+    bool erase;
+    bool handled = false;
+    bool moved = false;
+    void* result = nullptr;
+};
+thread_local DrawerReplay* g_drawer_replay = nullptr;
 
 using Equipment = const uint8_t*;
 uint8_t* drawer_bucket(void* inventory, uint32_t loc) {
@@ -1801,11 +1856,205 @@ DrawerMatch drawer_match(void* inventory, uint32_t loc, uint64_t fingerprint) {
     return match;
 }
 
+Equipment drawer_item_by_id(void* inventory, uint32_t location, uint64_t id) {
+    Equipment found = nullptr;
+    return visit_drawer_items(inventory, location, [&](Equipment item) {
+        uint64_t local_id = 0;
+        if (mem_read(item, &local_id, sizeof(local_id)) && local_id == id) found = item;
+    }) ? found : nullptr;
+}
+
 bool read_shared_house(void*& director, uint64_t& day) {
     return net_active() && net_peer_count() >= 2 && !leave_busy() &&
            !g_night_at && !g_night_go && leave_scene_up(kScene_House) &&
            mem_read((const void*)(g_base + kRva_MewDirectorPtr), &director, sizeof(director)) && director &&
            mem_read((const uint8_t*)director + kDir_CurrentDay, &day, sizeof(day));
+}
+
+// CatInfo is component 0x1D5. The House selection manager at 0x44C identifies
+// the open card by its entity (see 0xEC7B0 and 0x204800). CatInfo also keeps a
+// generation-checked preview pointer, so the pointer alone is not a selection.
+uint64_t local_house_selection(void* comps) {
+    void* held = nullptr;
+    drag_hand(comps, held);
+    if (held) return cat_key(held);
+
+    List cards, managers;
+    if (!list_of(comps, 0x1D50, cards) || !list_of(comps, 0x44C0, managers)) return 0;
+    const auto* card = (const uint8_t*)item(cards, 0);
+    const auto* manager = (const uint8_t*)item(managers, 0);
+    void* open = nullptr;
+    void* card_entity = nullptr;
+    uint8_t* cat = nullptr;
+    uint64_t generation = 0, live_generation = 0;
+    if (!card || !manager ||
+        !mem_read(manager + 0x58, &open, sizeof(open)) || !open ||
+        !mem_read(card + 0x38, &card_entity, sizeof(card_entity)) || open != card_entity ||
+        !mem_read(card + 0x78, &cat, sizeof(cat)) || !cat ||
+        !mem_read(card + 0x80, &generation, sizeof(generation)) ||
+        !mem_read(cat - 8, &live_generation, sizeof(live_generation)) ||
+        live_generation != generation) return 0;
+    return cat_key(cat);
+}
+
+constexpr uint64_t kSelectionRefreshMs = 350;
+constexpr uint64_t kSelectionTimeoutMs = 1500;
+struct PeerHouseSelection { uint64_t cat, day, received_at; };
+PeerHouseSelection g_peer_selection[kMaxPeers]{};
+void* g_selected_owner[kMaxPeers]{};
+void* g_selection_comps = nullptr;
+uint64_t g_selection_day = 0;
+uint64_t g_selection_sent = 0, g_selection_sent_at = 0;
+uint64_t g_selection_draw_until = 0;
+using fn_render_sprite = void (__fastcall*)(void*);
+fn_render_sprite o_render_sprite = nullptr;
+
+void house_selection_tick(void* comps) {
+    memset(g_selected_owner, 0, sizeof(g_selected_owner));
+    g_selection_draw_until = 0;
+    if (!o_render_sprite) return;
+    uint64_t day = 0;
+    void* director = nullptr;
+    const bool in_house = !g_night_at_pub() && sharing() && read_shared_house(director, day);
+    const uint64_t now = GetTickCount64();
+    if (!in_house || comps != g_selection_comps || day != g_selection_day) {
+        memset(g_peer_selection, 0, sizeof(g_peer_selection));
+        g_selection_comps = in_house ? comps : nullptr;
+        g_selection_day = day;
+        g_selection_sent_at = 0;
+    }
+    const uint64_t key = in_house ? local_house_selection(comps) : 0;
+    if (key != g_selection_sent || (key && now - g_selection_sent_at >= kSelectionRefreshMs)) {
+        ChoiceMsg msg{};
+        msg.kind = kChoiceHouseSelection;
+        msg.cat = key;
+        msg.node_seed = in_house ? day : 0;
+        if (net_send_choice(msg) || !in_house) {
+            g_selection_sent = key;
+            g_selection_sent_at = now;
+        }
+    }
+    if (!in_house) return;
+
+    uint8_t peers[kMaxPeers];
+    memset(peers, kNoPeer, sizeof(peers));
+    if (!net_peer_ids(peers, kMaxPeers)) return;
+    bool connected[kMaxPeers]{};
+    for (uint8_t peer : peers) {
+        if (peer < kMaxPeers) connected[peer] = true;
+    }
+    List cats;
+    bool have_cats = false;
+    for (uint8_t peer = 0; peer < kMaxPeers; ++peer) {
+        if (peer == net_self()) continue;
+        if (!connected[peer]) {
+            g_peer_selection[peer] = {};
+            continue;
+        }
+        const PeerHouseSelection& selection = g_peer_selection[peer];
+        if (!selection.cat || selection.day != day ||
+            now - selection.received_at > kSelectionTimeoutMs) continue;
+        if (!have_cats) {
+            if (!list_of(comps, kComps_Cats, cats)) return;
+            have_cats = true;
+        }
+        for (uint32_t i = 0; i < cats.n; ++i) {
+            void* cat = item(cats, i);
+            if (cat_key(cat) != selection.cat) continue;
+            if (mem_read((const uint8_t*)cat + kComp_Owner, &g_selected_owner[peer], sizeof(void*)) &&
+                g_selected_owner[peer]) g_selection_draw_until = now + 250;
+            break;
+        }
+    }
+}
+
+// The base sprite draw is also used by MaskedRenderer for its visible pass.
+// The engine has already pushed the renderer's colour transform by this point.
+// Change its RGB for this draw and restore it using the current stack storage,
+// which SWF rendering can grow. Alpha and the cat's game state are untouched.
+constexpr uintptr_t kRva_SpriteDraw = 0x97AD80;
+constexpr uintptr_t kRva_RenderColours = 0x13C5BE8;
+constexpr uintptr_t kRva_RenderDepth = 0x13C5C00;
+
+void __fastcall draw_house_selection(void* renderer) {
+    void* owner = nullptr;
+    const float* colour = nullptr;
+    if (g_selection_comps && GetTickCount64() < g_selection_draw_until &&
+        mem_read((const uint8_t*)renderer + kComp_Owner, &owner, sizeof(owner)) && owner) {
+        for (uint8_t peer = 0; peer < kMaxPeers; ++peer) {
+            if (g_selected_owner[peer] != owner) continue;
+            void* comps = nullptr;
+            if (sharing() && !g_night_at_pub() && comps_of(renderer, comps) &&
+                comps == g_selection_comps) {
+                List cats;
+                if (list_of(comps, kComps_Cats, cats)) {
+                    for (uint32_t i = 0; i < cats.n; ++i) {
+                        const auto* cat = (const uint8_t*)item(cats, i);
+                        void* cat_owner = nullptr;
+                        void* body = nullptr;
+                        if (cat && mem_read(cat + kComp_Owner, &cat_owner, sizeof(cat_owner)) &&
+                            cat_owner == owner && mem_read(cat + 0x48, &body, sizeof(body)) &&
+                            body == renderer) { colour = kPeerRGB[peer]; break; }
+                    }
+                }
+            }
+            break;
+        }
+    }
+    if (!colour) { o_render_sprite(renderer); return; }
+
+    using ColourTransform = float[8]; // multiply RGBA, add RGBA
+    auto colours = (ColourTransform**) (g_base + kRva_RenderColours);
+    const int depth = *(const int*)(g_base + kRva_RenderDepth);
+    if (!*colours || depth < 0) { o_render_sprite(renderer); return; }
+    ColourTransform original, silhouette;
+    memcpy(original, (*colours)[depth], sizeof(original));
+    memcpy(silhouette, original, sizeof(silhouette));
+    for (int channel = 0; channel < 3; ++channel) {
+        silhouette[channel] = 0.0f;
+        silhouette[channel + 4] = colour[channel] * original[3];
+    }
+
+    // The renderer's matrix is already on the engine's transform stack.
+    // Draw a solid silhouette around its edge, then the normal sprite over it.
+    // Matrix columns 0 and 1 convert local offsets to the current camera space.
+    using Matrix = float[16];
+    auto matrices = (Matrix**)(g_base + 0x13C5BD8);
+    if (!*matrices) { o_render_sprite(renderer); return; }
+    Matrix transform;
+    memcpy(transform, (*matrices)[depth], sizeof(transform));
+    constexpr float radius = 0.20f;
+    constexpr int samples = 16;
+    for (int i = 0; i < samples; ++i) {
+        const float angle = i * 6.283185307f / samples;
+        const float x = cosf(angle) * radius, y = sinf(angle) * radius;
+        Matrix shifted;
+        memcpy(shifted, transform, sizeof(shifted));
+        for (int row = 0; row < 4; ++row)
+            shifted[12 + row] += transform[row] * x + transform[4 + row] * y;
+        memcpy((*matrices)[depth], shifted, sizeof(shifted));
+        memcpy((*colours)[depth], silhouette, sizeof(silhouette));
+        o_render_sprite(renderer);
+    }
+    memcpy((*matrices)[depth], transform, sizeof(transform));
+    memcpy((*colours)[depth], original, sizeof(original));
+    o_render_sprite(renderer);
+}
+
+void install_house_selection() {
+    if (o_render_sprite) return;
+    const uint8_t draw_head[] = {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0xD9};
+    const uint8_t colour_stack_load[] = {
+        0x48, 0x8B, 0x05, 0xC5, 0x8F, 0xA3, 0x00, 0x48, 0x63, 0x0D, 0xD6, 0x8F, 0xA3, 0x00
+    };
+    void* draw = (void*)(g_base + kRva_SpriteDraw);
+    if (memcmp(draw, draw_head, sizeof(draw_head)) != 0 ||
+        memcmp((const void*)(g_base + 0x98CC1C), colour_stack_load, sizeof(colour_stack_load)) != 0 ||
+        MH_CreateHook(draw, (void*)&draw_house_selection, (void**)&o_render_sprite) != MH_OK ||
+        MH_EnableHook(draw) != MH_OK) {
+        o_render_sprite = nullptr;
+        log_line("HOUSE", "!! the sprite colour transform moved -- remote cat selection highlight disabled");
+    }
 }
 
 void* live_inventory_drawers(const void* director) {
@@ -1850,6 +2099,47 @@ bool safe_drawer_erase(void* bucket, uint64_t id) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+void* drawer_button_for_item(void* drawer, uint64_t id) {
+    void* view = nullptr;
+    void* comps = nullptr;
+    if (!drawer || !comps_of(drawer, comps) ||
+        !mem_read((uint8_t*)drawer + 0x38, &view, sizeof(view)) || !view) return nullptr;
+    // Match the game's modal check. A closed drawer can still have buttons,
+    // but replaying a click there could open the menu.
+    List managers;
+    if (!list_of(comps, 0x44C0, managers)) return nullptr;
+    void* manager = item(managers, 0);
+    void* open = nullptr;
+    if (!manager || !mem_read((uint8_t*)manager + 0x58, &open, sizeof(open)) || !open) return nullptr;
+    for (unsigned depth = 0; ; ++depth) {
+        void* parent = nullptr;
+        if (depth == 16 || !mem_read((uint8_t*)view + 0x68, &parent, sizeof(parent))) return nullptr;
+        if (!parent) break;
+        view = parent;
+    }
+    if (view != open) return nullptr;
+
+    // Refresh sorts this shared list of item buttons and lays out each drawer
+    // from it. Each button holds the ID of the item in this game's inventory.
+    List buttons;
+    if (!mem_read((uint8_t*)drawer + 0x64, &buttons.n, sizeof(buttons.n)) || buttons.n > kMaxDrawerItems ||
+        !mem_read((uint8_t*)drawer + 0x68, &buttons.data, sizeof(buttons.data)) || !buttons.data) return nullptr;
+    for (uint32_t i = 0; i < buttons.n; ++i) {
+        void* button = item(buttons, i);
+        void* owner = nullptr;
+        uint64_t button_id = 0;
+        if (button && mem_read((uint8_t*)button + 0x38, &owner, sizeof(owner)) && owner == drawer &&
+            mem_read((uint8_t*)button + 0x68, &button_id, sizeof(button_id)) && button_id == id)
+            return button;
+    }
+    return nullptr;
+}
+
+bool safe_drawer_click(void* button) {
+    __try { o_drawer_click(button); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 bool safe_item_test(uintptr_t rva, Equipment item, bool& result) {
     __try { result = ((fn_item_test)(g_base + rva))(item); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -1876,7 +2166,7 @@ bool can_move_drawer_item(void* director, void* inventory, Equipment item, uint3
     const uint8_t* progression = nullptr;
     int32_t house_upgrade = 0, progression_upgrade = 0;
     if (!mem_read((const void*)(g_base + kRva_FurnitureStore), &house, sizeof(house)) || !house ||
-        !mem_read(house + kHouseStore_StorageUpgrade, &house_upgrade, sizeof(house_upgrade)) ||
+        !mem_read(house + kHouseStoreStorageUpgrade, &house_upgrade, sizeof(house_upgrade)) ||
         !mem_read((uint8_t*)director + kDir_Progression, &progression, sizeof(progression)) || !progression ||
         !mem_read(progression + kProgression_StorageUpgrade, &progression_upgrade, sizeof(progression_upgrade)))
         return false;
@@ -1891,12 +2181,7 @@ bool can_move_drawer_item(void* director, void* inventory, Equipment item, uint3
            }) && read_ok && stored < capacity && stored < 400;
 }
 
-void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
-    const uintptr_t ret = (uintptr_t)_ReturnAddress() - g_base;
-    if ((dest != kStorage || ret != kRva_MoveToStorage + 5) &&
-        (dest != kTrash || ret != kRva_MoveToTrash + 5))
-        return o_drawer_move(inventory, id, dest);
-
+void* shared_drawer_move(void* inventory, uint64_t id, uint32_t dest) {
     void* director = nullptr;
     uint64_t day = 0;
     const bool host = net_role() == NetRole::Host;
@@ -1905,13 +2190,9 @@ void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
         return o_drawer_move(inventory, id, dest);
     }
     const uint32_t source = dest == kStorage ? kTrash : kStorage;
-    uint64_t fingerprint = 0;
-    const bool read = visit_drawer_items(inventory, source, [&](Equipment item) {
-        uint64_t local_id = 0;
-        if (mem_read(item, &local_id, sizeof(local_id)) && local_id == id)
-            fingerprint = drawer_fingerprint(item);
-    });
-    const DrawerMatch match = read && fingerprint ? drawer_match(inventory, source, fingerprint) : DrawerMatch{};
+    const Equipment selected = drawer_item_by_id(inventory, source, id);
+    const uint64_t fingerprint = selected ? drawer_fingerprint(selected) : 0;
+    const DrawerMatch match = fingerprint ? drawer_match(inventory, source, fingerprint) : DrawerMatch{};
     if (!match.count) {
         log_line("HOUSE", "!! could not identify the item for a shared drawer move");
         return host ? o_drawer_move(inventory, id, dest) : nullptr;
@@ -1931,6 +2212,39 @@ void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
     if (!net_send_choice(m))
         log_line("HOUSE", "!! could not send the drawer move");
     return result;
+}
+
+void* __fastcall drawer_move(void* inventory, uint64_t id, uint32_t dest) {
+    const uintptr_t ret = (uintptr_t)_ReturnAddress() - g_base;
+    if ((dest != kStorage || ret != kRva_MoveToStorage + 5) &&
+        (dest != kTrash || ret != kRva_MoveToTrash + 5))
+        return o_drawer_move(inventory, id, dest);
+
+    if (auto* replay = g_drawer_replay) {
+        if (replay->handled || replay->inventory != inventory || replay->id != id ||
+            replay->destination != dest) return nullptr;
+        replay->handled = true;
+        replay->moved = replay->erase ? safe_drawer_erase(drawer_bucket(inventory, kTrash), id) :
+            safe_drawer_move(inventory, id, dest, replay->result) && (replay->result || dest == kStorage);
+        return replay->result;
+    }
+    return shared_drawer_move(inventory, id, dest);
+}
+
+void __fastcall drawer_click(void* button) {
+    if (!o_drawer_move || net_role() != NetRole::Client || !net_active() || net_peer_count() < 2) {
+        o_drawer_click(button);
+        return;
+    }
+    // A local client click sends only a request. The confirmation runs the
+    // full click once, including the game's order and tab changes.
+    void* inventory = nullptr;
+    uint64_t id = 0;
+    if (!mem_read((uint8_t*)button + 0x68, &id, sizeof(id)) ||
+        !mem_read((const void*)(g_base + kRva_InventorySlot), &inventory, sizeof(inventory)) || !inventory)
+        return;
+    if (drawer_item_by_id(inventory, kStorage, id)) shared_drawer_move(inventory, id, kTrash);
+    else if (drawer_item_by_id(inventory, kTrash, id)) shared_drawer_move(inventory, id, kStorage);
 }
 
 void on_drawer_move(const ChoiceMsg& m, uint8_t from) {
@@ -1953,10 +2267,21 @@ void on_drawer_move(const ChoiceMsg& m, uint8_t from) {
         return;
     }
 
-    void* result = nullptr;
-    const bool moved = m.aux ? safe_drawer_erase(drawer_bucket(inventory, source), id) :
-                       safe_drawer_move(inventory, id, m.index, result) &&
-                       (result || (host && m.index == kStorage));
+    void* drawer = live_inventory_drawers(director);
+    DrawerReplay replay{inventory, id, m.index, m.aux != 0};
+    if (void* button = o_drawer_click ? drawer_button_for_item(drawer, id) : nullptr) {
+        g_drawer_replay = &replay;
+        const bool ok = safe_drawer_click(button);
+        g_drawer_replay = nullptr;
+        if (!ok) log_line("HOUSE", "!! replaying the shared drawer click faulted");
+    }
+
+    void* result = replay.result;
+    bool moved = replay.moved;
+    if (!replay.handled) {
+        moved = m.aux ? safe_drawer_erase(drawer_bucket(inventory, source), id) :
+            safe_drawer_move(inventory, id, m.index, result) && (result || (host && m.index == kStorage));
+    }
     if (!moved) {
         log_line("HOUSE", "!! the game could not apply the drawer move");
         return;
@@ -1968,14 +2293,15 @@ void on_drawer_move(const ChoiceMsg& m, uint8_t from) {
             log_line("HOUSE", "!! could not confirm the drawer move to the other players");
     }
 
-    if (void* drawer = live_inventory_drawers(director)) {
+    if (drawer && !replay.handled) {
         if (!safe_drawer_call(kRva_DrawerRefresh, drawer))
             log_line("HOUSE", "!! refreshing the shared drawers faulted");
-    } else if (host && !safe_drawer_call(kRva_SaveHouse, director)) {
+    } else if (!drawer && host && !safe_drawer_call(kRva_SaveHouse, director)) {
         // The ordinary close button saves when the host has the drawers open.
         log_line("HOUSE", "!! saving the guest's drawer move faulted");
     }
-    log_line("HOUSE", "<- applied shared drawer move to %s", m.index == kStorage ? "storage" : "trash");
+    log_line("HOUSE", "<- applied shared drawer move to %s (%s)", m.index == kStorage ? "storage" : "trash",
+             replay.handled ? "native click order" : "inventory move");
 }
 
 void install_drawer_move(uintptr_t base) {
@@ -1999,6 +2325,13 @@ void install_drawer_move(uintptr_t base) {
         return;
     }
     log_line("HOUSE", "shared storage and trash moves hooked");
+    void* click = (void*)(base + kRva_DrawerClick);
+    if (!matches(kRva_DrawerClick, "\x48\x89\x4C\x24\x08\x55\x53\x56", 8) ||
+        MH_CreateHook(click, (void*)&drawer_click, (void**)&o_drawer_click) != MH_OK ||
+        MH_EnableHook(click) != MH_OK) {
+        o_drawer_click = nullptr;
+        log_line("HOUSE", "!! shared drawer click hook unavailable; using inventory moves");
+    }
 }
 
 void __fastcall inter_ok(void* closure) {
@@ -2014,6 +2347,7 @@ void __fastcall inter_ok(void* closure) {
         if (net_role() != NetRole::Host) return;   // the host turns them
         ChoiceMsg m{};
         m.kind  = kChoiceNightClick;
+        m.node_seed = g_night_playback.epoch;
         m.index = g_cur_scene_n;
         m.aux   = out ? 2 : 1;
         m.count = arg;
@@ -2030,32 +2364,44 @@ bool safe_ok(void* closure) {
 
 void press_host_clicks(void* scene) {
     if (!g_click_n || scene != g_cur_scene || !g_cs_ready) return;
-    NightClick todo[16];
-    uint32_t n = 0, keep = 0;
+    const uint64_t now = GetTickCount64();
+    uint8_t out = 0;
+    if (!mem_read((const uint8_t*)scene + kInter_OutcomeOut, &out, 1)) return;
+    if (out) g_night_playback.observe_outcome(now);
+    NightClick click{};
+    bool selected = false, reveal_before_close = false;
     EnterCriticalSection(&g_cs);
+    uint32_t keep = 0;
     for (uint32_t i = 0; i < g_click_n; ++i) {
-        if (g_clicks[i].n == g_cur_scene_n) todo[n++] = g_clicks[i];
-        else if (g_clicks[i].n > g_cur_scene_n) g_clicks[keep++] = g_clicks[i];   // a screen not up here yet
+        const NightClick candidate = g_clicks[i];
+        if (candidate.n < g_cur_scene_n) continue;
+        if (candidate.n == g_cur_scene_n) {
+            if (g_night_playback.closed || (candidate.action == 1 && out)) continue;
+            if (!selected && g_night_playback.can_show(now) &&
+                (candidate.action == 1 || !out || g_night_playback.can_close(now))) {
+                click = candidate;
+                selected = true;
+                reveal_before_close = candidate.action == 2 && !out;
+                if (!reveal_before_close) continue;
+            }
+        }
+        g_clicks[keep++] = candidate;
     }
     g_click_n = keep;
     LeaveCriticalSection(&g_cs);
-    for (uint32_t i = 0; i < n; ++i) {
-        uint8_t out = 0;
-        mem_read((const uint8_t*)scene + kInter_OutcomeOut, &out, 1);
-        if (todo[i].action == 1 && out) continue;   // shown here already
-        if (todo[i].action == 2 && !out) {           // close: past the outcome first
-            const uint8_t one = 1;
-            mem_write((uint8_t*)scene + kInter_OutcomeOut, &one, 1);
-        }
-        void* closure[3] = { nullptr, scene, (void*)(uintptr_t)todo[i].arg };
-        g_pressing = true;
-        const bool ok = safe_ok(closure);
-        g_pressing = false;
-        log_line("HOUSE", ok ? "<- night screen %u: %s, as the host pressed"
-                             : "!! pressing night screen %u (%s) faulted",
-                 todo[i].n, todo[i].action == 2 ? "closed" : "outcome shown");
-        if (todo[i].action == 2) break;
-    }
+    if (!selected) return;
+    void* closure[3] = { nullptr, scene, (void*)(uintptr_t)click.arg };
+    g_pressing = true;
+    const bool ok = safe_ok(closure);
+    g_pressing = false;
+    if (ok && click.action == 2 && !reveal_before_close) g_night_playback.closed = true;
+    if (ok && !g_night_playback.closed &&
+        mem_read((const uint8_t*)scene + kInter_OutcomeOut, &out, 1) && out)
+        g_night_playback.observe_outcome(now);
+    log_line("HOUSE", ok ? "<- night screen %u: %s, epoch=%llu"
+                         : "!! pressing night screen %u (%s) faulted, epoch=%llu",
+             click.n, click.action == 2 && !reveal_before_close ? "closed" : "outcome shown",
+             (unsigned long long)g_night_playback.epoch);
 }
 
 void* __fastcall inter_update(void* a, void* b, void* c, void* d) {
@@ -2812,6 +3158,13 @@ void live_rows(std::vector<Row>& rows) {
 }
 
 void live_rows_now(std::vector<Row>& rows) {
+    if (const uint64_t progress = house_shop_hash()) {
+        Row r;
+        r.id = "live_shop progression";
+        r.hash = progress;
+        r.shown = "NPC stock, purchases and progression";
+        rows.push_back(std::move(r));
+    }
     if (!g_comps || GetTickCount64() - g_comps_at > 2000) {
         log_line("HOUSE", "!! no House update lately -- where the cats are now is not compared");
         return;
@@ -2861,6 +3214,9 @@ void live_rows_now(std::vector<Row>& rows) {
             rows.push_back(std::move(c));
             rows.push_back(std::move(f));
         }
+        int32_t upgrades = 0;
+        if (st && mem_read((const uint8_t*)st + kHouseStoreStorageUpgrade, &upgrades, sizeof(upgrades)))
+            rows.push_back({"live_storage upgrades", (uint32_t)upgrades, std::to_string(upgrades)});
         const uint64_t inv = invsync_local_hash();
         if (inv) {
             char hx[24];
@@ -2992,6 +3348,158 @@ void deliver_here(void* drawer, void* comps, const Move& mv) {
 
 } // namespace
 
+void house_refresh_cat_icon(uint64_t key) {
+    if (g_icon_refresh_pending.size() >= 4096) g_icon_refresh_pending.clear();
+    g_icon_refresh_pending[key] = GetTickCount64();
+    if (!g_comps || GetTickCount64() - g_comps_at > 500) return;
+    List cards;
+    if (!list_of(g_comps, 0x1D50, cards)) return;
+    for (uint32_t i = 0; i < cards.n; ++i) {
+        auto* card = (uint8_t*)item(cards, i);
+        void* cat = nullptr;
+        uint64_t generation = 0, live_generation = 0;
+        if (!card || !mem_read(card + 0x78, &cat, sizeof(cat)) || !cat ||
+            !mem_read(card + 0x80, &generation, sizeof(generation)) ||
+            !mem_read((const uint8_t*)cat - 8, &live_generation, sizeof(live_generation)) ||
+            generation != live_generation || cat_key(cat) != key) continue;
+        // CatInfo::setCat rebuilds its contents when this dirty flag is set,
+        // as in the native icon click at 0xEDAD4.
+        const uint8_t dirty = 1;
+        mem_write(card + 0x70, &dirty, sizeof(dirty));
+        using Refresh = void (__fastcall*)(void*, void*, uint8_t);
+        ((Refresh)(g_base + 0xEBBA0))(card, cat, 0);
+    }
+}
+
+bool house_closing_day_menus() {
+    return net_role() == NetRole::Client && net_active() && g_close_day_until &&
+           GetTickCount64() < g_close_day_until;
+}
+
+bool house_night_input_owned() {
+    return net_role() == NetRole::Client && net_active() &&
+           (house_closing_day_menus() || g_night_go || g_night_at || house_local_night());
+}
+
+bool safe_close_house_modal(void* manager) {
+    // Native House UI close-all/current path: calls the selected panel's
+    // on-close callback (+0x148), clears manager+0x58 and refreshes the HUD.
+    const uint8_t head[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9,0x48};
+    uint8_t actual[sizeof(head)]{};
+    if (!mem_read((void*)(g_base + 0x203C40), actual, sizeof(actual)) ||
+        memcmp(actual, head, sizeof(head))) return false;
+    __try {
+        ((void (__fastcall*)(void*))(g_base + 0x203C40))(manager);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool close_house_day_modals(void* comps) {
+    if (!house_closing_day_menus()) return true;
+    List managers;
+    if (!list_of(comps, 0x44C0, managers)) return false;
+    bool closed = !g_day_menu_button_at || GetTickCount64() - g_day_menu_button_at >= 300;
+    for (uint32_t i = 0; i < managers.n; ++i) {
+        void* manager = item(managers, i);
+        void* open = nullptr;
+        if (!manager || !mem_read((uint8_t*)manager + 0x58, &open, sizeof(open)) || !open) continue;
+        const bool ok = safe_close_house_modal(manager);
+        log_line("HOUSE", ok ? "day ended: closed the client's House menu through its native callback"
+                             : "!! day ended: could not close the client's House menu");
+        if (!ok || !mem_read((uint8_t*)manager + 0x58, &open, sizeof(open)) || open) closed = false;
+    }
+    return closed && leave_house_unobstructed();
+}
+
+void house_on_night_button_update(void* button) {
+    if (!house_closing_day_menus() || !button) return;
+    char name[64]{};
+    if (!mem_read_std_string((uint8_t*)button + kBtn_Name, name, sizeof(name)) ||
+        (strcmp(name, "Button_PauseMenu_Resume") && strcmp(name, "Button_Settings_Back"))) return;
+    g_day_menu_button_at = GetTickCount64();
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - last < 250) return;
+    const uintptr_t click = addr_of_call(C_ButtonClick);
+    if (!click) return;
+    last = now;
+    __try {
+        ((void (__fastcall*)(void*, bool))click)(button, false);
+        log_line("HOUSE", "day ended: pressed client's '%s'", name);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log_line("HOUSE", "!! day ended: closing client's '%s' faulted", name);
+    }
+}
+
+bool house_office_can_open() {
+    if (!leave_house_unobstructed() || !g_comps || GetTickCount64() - g_comps_at > 500)
+        return false;
+    List managers;
+    if (!list_of(g_comps, 0x44C0, managers) || !managers.n) return false;
+    for (uint32_t i = 0; i < managers.n; ++i) {
+        void* manager = item(managers, i);
+        void* open = nullptr;
+        if (!manager || !mem_read((uint8_t*)manager + 0x58, &open, sizeof(open)) || open)
+            return false;
+    }
+    return true;
+}
+
+bool house_inventory_can_replace() {
+    if (!leave_house_unobstructed() || cutscene_active() || house_shop_client_active() ||
+        !g_comps || GetTickCount64() - g_comps_at > 500) return false;
+    List managers;
+    if (!list_of(g_comps, 0x44C0, managers) || !managers.n) return false;
+    for (uint32_t i = 0; i < managers.n; ++i) {
+        void* manager = item(managers, i);
+        void* open = nullptr;
+        if (!manager || !mem_read((uint8_t*)manager + 0x58, &open, sizeof(open)) || open)
+            return false;
+    }
+    const uint8_t head[] = {0x48,0x89,0x4C,0x24,0x08,0x55,0x53,0x56};
+    uint8_t actual[sizeof(head)]{};
+    void* director = nullptr;
+    const uintptr_t slot = addr_of_data(D_MewDirectorPtr);
+    return slot && mem_read((void*)slot, &director, sizeof(director)) && director &&
+        live_inventory_drawers(director) &&
+        mem_read((void*)(g_base + kRva_DrawerRebuild), actual, sizeof(actual)) &&
+        !memcmp(actual, head, sizeof(head));
+}
+
+void house_inventory_replaced() {
+    void* director = nullptr;
+    const uintptr_t slot = addr_of_data(D_MewDirectorPtr);
+    void* drawer = slot && mem_read((void*)slot, &director, sizeof(director)) && director
+        ? live_inventory_drawers(director) : nullptr;
+    // Refresh (0x211700) only sorts existing buttons. Rebuild (0x210590)
+    // reconciles their IDs against the new buckets and destroys obsolete ones,
+    // then refreshes. A bucket reader assigns fresh IDs to every Equipment.
+    if (!drawer || !safe_drawer_call(kRva_DrawerRebuild, drawer))
+        log_line("HOUSE", "!! rebuilding storage/trash buttons after inventory replacement failed");
+    else
+        log_line("HOUSE", "rebuilt storage/trash buttons after inventory replacement");
+}
+
+bool house_ready_visible() {
+    if (!house_vote_active || !leave_house_unobstructed() || cutscene_active()) return false;
+    // InventoryDrawers lives in the House even while its UI is closed.
+    // The UI manager's open entity identifies the modal that actually owns
+    // input. CatInfo is allowed to stay open alongside the readiness note.
+    if (!g_comps || GetTickCount64() - g_comps_at > 500) return false;
+    List managers;
+    if (!list_of(g_comps, 0x44C0, managers)) return true;
+    const auto* manager = (const uint8_t*)item(managers, 0);
+    void* open = nullptr;
+    if (!manager || !mem_read(manager + 0x58, &open, sizeof(open))) return false;
+    if (!open) return true;
+    List cards;
+    if (!list_of(g_comps, 0x1D50, cards)) return false;
+    const auto* card = (const uint8_t*)item(cards, 0);
+    void* card_entity = nullptr;
+    return card && mem_read(card + 0x38, &card_entity, sizeof(card_entity)) &&
+           open == card_entity;
+}
+
 const char* house_note() {
     if (g_note.empty() || GetTickCount64() - g_note_at > kNoteMs) return nullptr;
     return g_note.c_str();
@@ -3000,6 +3508,8 @@ const char* house_note() {
 void house_set_base(uintptr_t base) {
     if (o_drop) return;
     g_base = base;
+    house_shop_set_base(base);
+    install_house_selection();
     if (!o_drawer_move) install_drawer_move(base);
     {
         void** slot = (void**)(base + kRva_GridVtbl + 34 * 8);
@@ -3125,6 +3635,22 @@ void house_set_base(uintptr_t base) {
 }
 
 bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
+    if (house_shop_on_choice(m, from)) return true;
+    if (m.kind == 57) {
+        if (house_vote_active && m.node_seed == house_vote_day && m.index < 2 &&
+            m.aux <= 1 && from < kMaxPeers && from != net_self()) {
+            house_votes[m.index][from] = m.aux != 0;
+            log_line("HOUSE", "remote readiness: action=%s peer=%u ready=%u day=%llu",
+                     m.index ? "set off" : "end day", from, m.aux,
+                     (unsigned long long)m.node_seed);
+        }
+        return true;
+    }
+    if (m.kind == kChoiceHouseSelection) {
+        if (from < kMaxPeers && from != net_self() && sharing())
+            g_peer_selection[from] = {m.cat, m.node_seed, GetTickCount64()};
+        return true;
+    }
     if (m.kind == kChoiceHouseCatState) {
         receive_house_cat(m, from);
         return true;
@@ -3177,19 +3703,18 @@ bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
         return true;
     }
     if (m.kind == kChoiceHousePurse) {
-        // NPC offices follow the host's actions; the client's local shop
-        // result can differ and must not overwrite the host's balance.
-        if (net_role() == NetRole::Host && cutscene_office_active()) {
-            log_line("HOUSE", "ignored the friend's purse during the host's NPC office");
-            return true;
-        }
+        // Purchases are host transactions. Never let a late client observation
+        // restore the pre-purchase balance after the shop has closed.
+        if (net_role() == NetRole::Host || from != kHostPeer) return true;
         apply_purse((int32_t)m.index, (int32_t)m.count);
         return true;
     }
     if (m.kind == kChoiceNightClick) {
-        if (net_role() == NetRole::Host || !g_cs_ready) return true;
+        if (net_role() == NetRole::Host || from != kHostPeer || !g_cs_ready ||
+            !g_night_playback.accepts(m.node_seed) || !m.index ||
+            (m.aux != 1 && m.aux != 2)) return true;
         EnterCriticalSection(&g_cs);
-        if (g_click_n < 16) g_clicks[g_click_n++] = NightClick{ m.index, m.aux, m.count };
+        if (g_click_n < kMaxNightClicks) g_clicks[g_click_n++] = NightClick{ m.index, m.aux, m.count };
         LeaveCriticalSection(&g_cs);
         return true;
     }
@@ -3219,17 +3744,25 @@ bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
         return true;
     }
     if (m.kind == kChoiceNightStart) {
-        if (net_role() == NetRole::Host) return true;
+        if (net_role() == NetRole::Host || from != kHostPeer) return true;
         unsigned long long w2 = 0, w3 = 0;
         if (sscanf_s(m.name, "%16llx%16llx", &w2, &w3) != 2) return true;
         const uint64_t now = GetTickCount64();
+        const uint64_t epoch = (uint64_t)m.index | ((uint64_t)m.count << 32);
+        if (!epoch || g_night_playback.accepts(epoch)) return true;
+        g_night_playback.reset(epoch);
+        g_cur_scene = nullptr;
+        g_cur_scene_n = 0;
+        if (g_cs_ready) {
+            EnterCriticalSection(&g_cs);
+            g_click_n = 0;
+            LeaveCriticalSection(&g_cs);
+        }
+        g_close_day_until = now + kNightGoMs;
+        g_day_menu_button_at = 0;
+        cutscene_end_house_day();
         if (!end_the_day || !o_resolve) {
             log_line("HOUSE", "<- the host's night begins -- this game cannot resolve one, it reloads into the morning");
-            return true;
-        }
-        if (!g_match || now - g_match_at > kMatchFreshMs) {
-            log_line("HOUSE", "<- the host's night begins -- the Houses were not the same, so this game"
-                              " reloads into the host's morning as before");
             return true;
         }
         g_seed[0] = m.node_seed;
@@ -3238,8 +3771,7 @@ bool house_on_choice(const ChoiceMsg& m, uint8_t from) {
         g_seed[3] = w3;
         g_seed_at  = now;
         g_night_go = now;
-        log_line("HOUSE", "<- the host's night begins -- this House is the host's, so this game"
-                          " ends its own day and resolves the same night");
+        log_line("HOUSE", "<- the host's night begins -- waiting for the House check and pending shop state");
         return true;
     }
     if (m.kind != kChoiceHouseMove) return false;
@@ -3300,7 +3832,30 @@ void house_tick(void* component) {
     if (!comps_of(component, comps)) return;
     g_comps    = comps;
     g_comps_at = GetTickCount64();
+    const bool day_modals_closed = close_house_day_modals(comps);
+    if (!g_night_at_pub()) {
+        house_shop_apply();
+        house_shop_sync();
+    }
+    void* vote_director = nullptr;
+    uint64_t vote_day = 0;
+    const bool vote_active = !g_night_at_pub() && read_shared_house(vote_director, vote_day);
+    if (!vote_active || !house_vote_active || vote_day != house_vote_day) house_vote_clear();
+    house_vote_active = vote_active;
+    house_vote_day = vote_day;
+    if (house_vote_complete(0)) {
+        List houses;
+        void* house = list_of(comps, kComps_House, houses) ? item(houses, 0) : nullptr;
+        uint64_t stream[4]{};
+        const uint64_t* rng = rng_global_stream();
+        if (house && rng && end_the_day) {
+            memcpy(stream, rng, sizeof(stream));
+            house_vote_clear();
+            if (safe_end_the_day(house)) house_night_starts(stream);
+        }
+    }
     drag_tick(comps);
+    house_selection_tick(comps);
     trace_house_drag(comps);
     trace_cat_positions(comps);
     if (config().house_cat_sync) house_cat_sync_tick(comps);
@@ -3322,14 +3877,28 @@ void house_tick(void* component) {
             for (const FurnOp& op : ops) apply_furniture(comps, scene, op);
     }
     furniture_watch(comps);
+    if (!g_pending_house_check.empty() && day_modals_closed &&
+        !cutscene_active() && !invsync_screen_open()) {
+        std::string check;
+        check.swap(g_pending_house_check);
+        compare(check);
+    }
     if (g_night_go) {
         const char* step0 = nullptr;
         if (GetTickCount64() - g_night_go > kNightGoMs) {
+            g_close_day_until = 0;
             g_night_go = 0;
             g_seed_at  = 0;
             log_line("HOUSE", "!! this game's House did not come up in time -- it reloads into the host's morning");
-        } else if (leave_on_house() && !leave_loading(&step0)) {
+        } else if (leave_on_house() && !leave_loading(&step0) &&
+                   day_modals_closed && !cutscene_active() && !invsync_screen_open()) {
             g_night_go = 0;
+            if (!g_match || GetTickCount64() - g_match_at > kMatchFreshMs) {
+                g_close_day_until = 0;
+                g_seed_at = 0;
+                log_line("HOUSE", "!! the final House check did not match -- loading the host's morning");
+                return;
+            }
             List hl;
             void* house = nullptr;
             uintptr_t vt = 0;
@@ -3346,6 +3915,7 @@ void house_tick(void* component) {
                 g_seed_at = 0;
                 log_line("HOUSE", "!! ending this game's day faulted -- it reloads into the host's morning");
             } else {
+                g_close_day_until = 0;
                 g_local_at = GetTickCount64();
                 g_night_at = g_local_at;
                 log_line("HOUSE", "this game's day ends with the host's");
@@ -3546,9 +4116,9 @@ void furniture_watch(void* comps) {
         return;
     }
     if (purse && (coins != g_purse_coins || food != g_purse_food)) {
-        if (net_role() != NetRole::Host && cutscene_office_active()) {
-            // The office runs on both games, but only the host's result is
-            // authoritative. Remember this observation without echoing it.
+        if (net_role() != NetRole::Host) {
+            // The host owns the purse; client purchases go through requests.
+            // Applying its snapshot must not echo a stale balance back.
             g_purse_coins = coins;
             g_purse_food = food;
         } else {
@@ -3836,6 +4406,7 @@ void house_on_scene(void* scene) {
     if (!g_scenes_on || !g_night_at) return;
     g_cur_scene   = scene;
     g_cur_scene_n = g_scene_n + 1;
+    g_night_playback.begin_scene(GetTickCount64());
     uint64_t* s = rng_global_stream();
     if (!s) return;
     uint64_t* v = s + 4;   // TLS+0x198
@@ -3846,6 +4417,10 @@ void house_on_scene(void* scene) {
 
 void house_night_starts(const uint64_t stream[4]) {
     if (!net_active() || net_role() != NetRole::Host || net_peer_count() < 2) return;
+    g_night_playback.reset(GetTickCount64() ? GetTickCount64() : 1);
+    g_cur_scene = nullptr;
+    g_cur_scene_n = 0;
+    g_click_n = 0;
     house_on_end_day();
     if (!o_resolve) return;
     g_night_at = GetTickCount64();
@@ -3853,6 +4428,8 @@ void house_night_starts(const uint64_t stream[4]) {
     g_seed_at = GetTickCount64();
     ChoiceMsg m{};
     m.kind      = kChoiceNightStart;
+    m.index = (uint32_t)g_night_playback.epoch;
+    m.count = (uint32_t)(g_night_playback.epoch >> 32);
     m.node_seed = stream[0];
     m.cat       = stream[1];
     snprintf(m.name, sizeof(m.name), "%016llx%016llx", (unsigned long long)stream[2], (unsigned long long)stream[3]);
@@ -3862,6 +4439,7 @@ void house_night_starts(const uint64_t stream[4]) {
 
 void house_on_end_day() {
     if (!net_active() || net_role() != NetRole::Host || net_peer_count() < 2) return;
+    house_shop_sync(true);
     // The House's storage, backpack and trash go first: an NPC office's
     // reward was in the host's storage only (2026-11-15).
     invsync_forget();
@@ -3888,9 +4466,10 @@ void house_on_end_day() {
 }
 
 bool house_on_message(const LogFileMsg& m) {
+    if (house_shop_on_message(m)) return true;
     if (strcmp(m.reason, "house") == 0) {
         if (net_role() != NetRole::Host && m.data && m.size)
-            compare(std::string((const char*)m.data, m.size));
+            g_pending_house_check.assign((const char*)m.data, m.size);
         return true;
     }
     if (strcmp(m.reason, "house_verdict") == 0) {

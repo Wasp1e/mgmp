@@ -27,6 +27,8 @@
 // Character::DoAction -- which fired exactly 12 times for 12 decisions -- is the
 // real command boundary for lockstep.
 #include "mgmp_night.h"
+#include "mgmp_house_shop.h"
+#include "mgmp_house.h"
 #include "mgmp_startrun.h"
 #include "mgmp_ability.h"
 #include "mgmp_addresses.h"
@@ -53,6 +55,8 @@
 #include "mgmp_follow.h"
 #include "mgmp_classpick.h"
 #include "mgmp_cutscene.h"
+#include "mgmp_music.h"
+#include "mgmp_net.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
 #include "mgmp_rng.h"
@@ -659,6 +663,7 @@ void __fastcall h_ButtonUpdate(void* self) {
     // load and a branch: combatlock_on_button's first test is the scope flag.
     combatlock_on_button(self);
     o_ButtonUpdate(self);
+    house_on_night_button_update(self);
 
     // AFTER the original, and this one has to be. Button::update recomputes the
     // button's state and pushes it into the SWF before it returns, and
@@ -678,11 +683,12 @@ void __fastcall h_ButtonUpdate(void* self) {
 
 // A client's shop draws the same stock but buys into a copy of the run the host
 // never hears about, so its purchases are refused before a coin moves. Shop+0x7B
-// is the house shop, which is outside the run and stays this peer's own.
+// is the house shop: its client clicks request a purchase on the host.
 void* __fastcall h_ShopBuy(void* self, void* item) {
     uint8_t house = 0;
     mem_read((const uint8_t*)self + 0x7B, &house, sizeof(house));
-    if (!house && lockstep_active() && _stricmp(config().net_role, "client") == 0) {
+    if (house && house_shop_buy(self, item, o_ShopBuy)) return nullptr;
+    if (!house && net_active() && net_role() == NetRole::Client) {
         log_line("SHOP", "refused a purchase -- only the host buys during a run");
         return nullptr;
     }
@@ -690,7 +696,9 @@ void* __fastcall h_ShopBuy(void* self, void* item) {
     uint32_t type = 0;
     mem_read(item, &type, sizeof(type));
     if (!house && type == kItem_LevelUp) choice_on_shop_level();
-    return o_ShopBuy(self, item);
+    void* result = o_ShopBuy(self, item);
+    house_shop_update(self);
+    return result;
 }
 
 // The aim preview turns the acting cat while a decision is held, writing the
@@ -970,6 +978,7 @@ int hooks_install() {
     follow_set_base(g_base);
     classpick_set_base(g_base);
     cutscene_set_base(g_base);
+    music_set_base(g_base);
     night_set_base(g_base);
     startrun_set_base(g_base);
     savefile_set_base(g_base);

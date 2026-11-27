@@ -408,6 +408,27 @@ bool leave_scene_up(const char* name) {
     return false;
 }
 
+bool leave_house_unobstructed() {
+    SceneList scenes;
+    if (!read_scenes(scenes)) return false;
+    bool house = false;
+    for (uint32_t i = 0; i < scenes.count; ++i) {
+        if (scenes.dying[i]) continue;
+        const char* name = scenes.name[i];
+        if (strcmp(name, kScene_House) == 0) { house = true; continue; }
+        const char* persistent[] = {
+            "Shared", "Base", "Tutorial", "PauseMenu", "ToolTip",
+            "Transition", "PostProcess", "DebugOverlay", "Cutscene"
+        };
+        bool service = false;
+        for (const char* scene : persistent)
+            if (strcmp(name, scene) == 0) { service = true; break; }
+        if (service) continue;
+        return false;
+    }
+    return house && !leave_busy();
+}
+
 bool leave_busy() { return g.pending || g.reload; }
 
 namespace {

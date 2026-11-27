@@ -46,6 +46,8 @@
 namespace mgmp {
 
 struct EnterNodeMsg;
+int32_t follow_difficulty();
+bool follow_apply_difficulty(int32_t difficulty);
 
 void follow_init();
 void follow_shutdown();
@@ -77,7 +79,7 @@ void follow_on_message(const EnterNodeMsg& m);
 // A player's pick of the next map node, kChoiceNode. The host enters a node only
 // once both players have picked it; see follow_on_enter_node.
 struct ChoiceMsg;
-void follow_on_vote(const ChoiceMsg& m);
+void follow_on_vote(const ChoiceMsg& m, uint8_t from);
 
 // Takes over the map node buttons' click, where the vote is taken.
 void follow_set_base(uintptr_t base);

@@ -25,5 +25,9 @@ bool peerlog_on_choice(const ChoiceMsg& m);
 
 // Where the last log from the friend was written, empty when none yet.
 const char* peerlog_last_saved();
+void peerlog_halt_report(const char* reason, uint64_t battle, uint32_t turn);
+void peerlog_refresh_report();
+const char* peerlog_halt_reason();
+const char* peerlog_report_path();
 
 } // namespace mgmp

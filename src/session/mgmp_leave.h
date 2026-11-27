@@ -134,3 +134,5 @@ bool leave_loading(const char** step);
 void leave_request_reload();
 
 } // namespace mgmp
+
+namespace mgmp { bool leave_house_unobstructed(); }

@@ -14,6 +14,7 @@
 #include "mgmp_follow.h"
 #include "mgmp_classpick.h"
 #include "mgmp_cutscene.h"
+#include "mgmp_music.h"
 #include "mgmp_choice.h"
 #include "mgmp_savefile.h"
 #include "mgmp_leave.h"
@@ -276,6 +277,15 @@ void handle_hello(uint8_t from, const Hello& h) {
     // Without this it would be accepted and welcomed and then sit forever on a
     // save-selection screen whose input is suppressed, waiting for a broadcast
     // that already happened.
+    // Rebuild a crashed client's battle from its initial cats, queued event
+    // effects and inventory. Current mid-fight CatData has already consumed
+    // those effects and cannot be used as the starting point of a replay.
+    if (lockstep_in_battle() && !follow_on_map() && net_send_battle_checkpoint(from)) {
+        log_line("SESSION", "peer %u receives the pre-battle checkpoint and action replay",
+                 (unsigned)from);
+        lockstep_catchup(from);
+        return;
+    }
     savefile_catchup(from);
 
     // ...and the run state on top of it. THE SAVE IS NOT ENOUGH, in either
@@ -506,6 +516,7 @@ const char* session_last_action()     { return g.last_action; }
 
 void session_shutdown() {
     if (!g.started) return;
+    music_reset();
     cursor_shutdown();
     overlay_shutdown();
     savefile_shutdown();
@@ -573,6 +584,7 @@ void session_update() {
     if (g.phase == Phase::Ready) {
         keepalive();
         lockstep_pump();
+        music_pump();
         choice_pump();
         follow_edit_pump();
         classpick_pump();

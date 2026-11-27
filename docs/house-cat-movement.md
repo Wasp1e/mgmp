@@ -14,6 +14,14 @@ House cat synchronization was verified in a two-player session on protocol 104.
 Social actions and animations with native callbacks still need separate
 validation. The older `-HouseWalk` experiment is still available for comparison.
 
+The follower also skips HouseCat's second update (vtable `+0x58`, RVA
+`0x1FD8B0`) while a fresh host snapshot controls the cat. That phase scans
+nearby cats and can queue social reactions; its `HouseCat+0xD9` gate is reset
+by the main update, which followers skip. Letting the second phase run alone
+can repeat reactions as cats cross. The guard is build-checked; the reported
+client-only swatting still needs a live retest with the new DLL. Host social
+actions remain outside the supported replay set.
+
 ## Earlier experiment
 
 Visible drag work is tracked separately in [house-cat-drag.md](house-cat-drag.md).

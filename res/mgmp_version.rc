@@ -1,8 +1,8 @@
 #include <winver.h>
 
 #ifndef MGMP_RC_FILEVER
-#define MGMP_RC_FILEVER     0,3,0,0
-#define MGMP_RC_FILEVER_STR "0.3.0.0"
+#define MGMP_RC_FILEVER     0,31,0,0
+#define MGMP_RC_FILEVER_STR "0.31.0.0"
 #endif
 
 #ifdef MGMP_RC_DLL

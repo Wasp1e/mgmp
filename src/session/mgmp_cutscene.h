@@ -26,3 +26,6 @@ bool cutscene_on_message(const ChoiceMsg& m);
 bool cutscene_filter_input(unsigned msg, uintptr_t wparam, intptr_t lparam);
 
 } // namespace mgmp
+
+namespace mgmp { bool cutscene_active(); }
+namespace mgmp { void cutscene_end_house_day(); }

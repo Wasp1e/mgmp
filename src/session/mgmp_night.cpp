@@ -1,3 +1,4 @@
+#include "mgmp_house_ready.h"
 #include "mgmp_night.h"
 #include "mgmp_net.h"
 #include "mgmp_mem.h"
@@ -6,6 +7,7 @@
 #include "mgmp_leave.h"
 #include "mgmp_lang.h"
 #include "mgmp_house.h"
+#include "mgmp_startrun.h"
 #include "mgmp_rng.h"
 #include "MinHook.h"
 
@@ -232,9 +234,8 @@ void* __fastcall inter_init(void* scene, void* inter, void* fn, void* str) {
 }
 
 void __fastcall end_day(void* closure) {
-    if (net_active() && net_role() != NetRole::Host && net_peer_count() >= 2) {
-        g.denied_at = GetTickCount64();
-        log_line("NIGHT", "the end-day sign was pressed here -- the day ends on the host's side, so nothing");
+    if (house_vote_active && !house_vote_running) {
+        house_vote_press(startrun_box_has_cats() ? 1 : 0);
         return;
     }
     // Did the sign end the day (not set off a run)? The House at closure+8

@@ -1,3 +1,4 @@
+#include "mgmp_house_ready.h"
 #include "mgmp_ui.h"
 #include "mgmp_lang.h"
 
@@ -358,33 +359,40 @@ float tear(uint32_t i, uint32_t salt) {
     return (float)(h & 0xFFFF) / 65535.0f;
 }
 
-void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false, bool long_tears = true) {
+float paper_scale() {
+    const ImVec2 size = ImGui::GetIO().DisplaySize;
+    return (std::min)(size.x / 1920.0f, size.y / 1080.0f);
+}
+
+void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false, bool long_tears = true,
+           bool house_note = false) {
     std::vector<ImVec2> pts;
-    const float step = 26.0f;
+    const float scale = paper_scale();
+    const float step = 26.0f * scale;
     // top, left to right
     for (float x = a.x; x < b.x; x += step)
-        pts.push_back(ImVec2(x, a.y + (tear((uint32_t)(x - a.x), 1) - 0.5f) * 7.0f));
+        pts.push_back(ImVec2(x, a.y + (tear((uint32_t)(x - a.x), 1) - 0.5f) * (7.0f * scale)));
     // right side, a couple of nicks
     for (float y = a.y; y < b.y; y += step * 1.6f)
-        pts.push_back(ImVec2(b.x + (tear((uint32_t)(y - a.y), 2) - 0.5f) * 6.0f, y));
+        pts.push_back(ImVec2(b.x + (tear((uint32_t)(y - a.y), 2) - 0.5f) * (6.0f * scale), y));
     // bottom, right to left, with a few long tears hanging off it, here and there
     uint32_t k = 0;
     for (float x = b.x; x > a.x; x -= step, ++k) {
-        float y = b.y + (tear(k, 3) - 0.5f) * 8.0f;
-        if (long_tears && tear(k, 6) > 0.84f) y += 14.0f + tear(k, 4) * 24.0f;
+        float y = b.y + (tear(k, 3) - 0.5f) * (8.0f * scale);
+        if (long_tears && tear(k, 6) > 0.84f) y += (14.0f + tear(k, 4) * 24.0f) * scale;
         pts.push_back(ImVec2(x, y));
     }
     // left side
     for (float y = b.y; y > a.y; y -= step * 1.6f)
-        pts.push_back(ImVec2(a.x + (tear((uint32_t)(y - a.y), 5) - 0.5f) * 6.0f, y));
+        pts.push_back(ImVec2(a.x + (tear((uint32_t)(y - a.y), 5) - 0.5f) * (6.0f * scale), y));
     const ImU32 shade   = IM_COL32(0, 0, 0, 90);
-    const ImU32 fill    = IM_COL32(222, 222, 218, 250);
+    const ImU32 fill    = house_note ? IM_COL32(203, 201, 199, 255) : IM_COL32(222, 222, 218, 250);
     const ImU32 outline = IM_COL32(40, 38, 36, 255);
     std::vector<ImVec2> sh(pts);
     if (inked) {
         // The game's own outline: the shape in black a few pixels all round,
         // and once more a little down and right.
-        constexpr float kInk = 4.0f;
+        const float kInk = 4.0f * scale;
         const ImU32 ink = IM_COL32(18, 16, 16, 255);
         for (int pass = 0; pass < 2; ++pass)
             for (int i = 0; i < 12; ++i) {
@@ -395,11 +403,11 @@ void paper(ImDrawList* dl, ImVec2 a, ImVec2 b, bool inked = false, bool long_tea
                 dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), ink);
             }
     } else {
-        for (ImVec2& p : sh) { p.x += 5; p.y += 6; }
+        for (ImVec2& p : sh) { p.x += 5 * scale; p.y += 6 * scale; }
         dl->AddConcavePolyFilled(sh.data(), (int)sh.size(), shade);
     }
     dl->AddConcavePolyFilled(pts.data(), (int)pts.size(), fill);
-    dl->AddPolyline(pts.data(), (int)pts.size(), outline, ImDrawFlags_Closed, 3.0f);
+    dl->AddPolyline(pts.data(), (int)pts.size(), outline, ImDrawFlags_Closed, 3.0f * paper_scale());
 }
 
 void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
@@ -408,13 +416,13 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
     if (over_loading) ImGui::SetNextWindowFocus();
     // As wide as its widest line and no wider (2026-11-05: a big sheet with a
     // little text on it), up to most of the screen; long lines wrap there.
-    constexpr float kPadX = 56.0f;
+    const float kPadX = 56.0f * paper_scale();
     const float most  = io.DisplaySize.x * 0.82f;
     const float width = g.paper_w > 0.0f ? (g.paper_w < most ? g.paper_w : most) : most;
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f * paper_scale()),
                             ImGuiCond_Always, ImVec2(0.5f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(width, 0));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(kPadX, 34));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(kPadX, 34 * paper_scale()));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 2));
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
@@ -426,7 +434,7 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->ChannelsSplit(2);
         dl->ChannelsSetCurrent(1);
-        if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f);
+        if (g.paper_font) ImGui::PushFont(g.paper_font, 32.0f * paper_scale());
         const float left  = ImGui::GetCursorPosX();
         const float right = ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x;
         const float wrap  = most - 2.0f * kPadX;   // break at the widest the sheet may be
@@ -447,7 +455,7 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
         const ImVec2 okw = ImGui::CalcTextSize(ok);
         ImGui::SetCursorPosX(left + (right - left - okw.x - 24) * 0.5f);
         g.paper_w = g_widest + 2.0f * kPadX + 4.0f;
-        if (g.paper_w < 360.0f) g.paper_w = 360.0f;
+        if (g.paper_w < (360.0f * paper_scale())) g.paper_w = (360.0f * paper_scale());
         if (ImGui::InvisibleButton("ok", ImVec2(okw.x + 24, okw.y + 6))) open = false;
         const ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax();
         const bool hot = ImGui::IsItemHovered();
@@ -460,7 +468,7 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
         // clips to itself, and on 2026-11-05 that cut the paper off square.
         dl->PushClipRectFullScreen();
         const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 14), true);
+        paper(dl, ImVec2(p.x + 10 * paper_scale(), p.y + 8 * paper_scale()), ImVec2(p.x + s.x - 10 * paper_scale(), p.y + s.y - 14 * paper_scale()), true);
         dl->PopClipRect();
         dl->ChannelsMerge();
     }
@@ -473,42 +481,50 @@ void draw_night(const char* const* lines, uint32_t n, bool over_loading) {
 // A one-line scrap at the top, no buttons, not taking the mouse.
 // `beside_round`: in a fight, top right under the game's turn order (the
 // user's pick, 2026-11-05), not over the round counter; otherwise centred.
-void draw_paper_note(const char* text, bool beside_round = false, bool ready_counter = false) {
+void draw_paper_note(const char* text, bool beside_round = false, bool ready_counter = false, int house_action = -1) {
     const ImGuiIO& io = ImGui::GetIO();
     if (ready_counter)
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f, io.DisplaySize.y - 24.0f),
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f * paper_scale(), io.DisplaySize.y - 24.0f * paper_scale()),
                                 ImGuiCond_Always, ImVec2(1.0f, 1.0f));
     else if (beside_round)
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f, io.DisplaySize.y * 0.15f),
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 24.0f * paper_scale(), io.DisplaySize.y * 0.15f),
                                 ImGuiCond_Always, ImVec2(1.0f, 0.0f));
     else
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f),
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.04f + 12.0f * paper_scale()),
                                 ImGuiCond_Always, ImVec2(0.5f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40, 26));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(40 * paper_scale(), 26 * paper_scale()));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_Text, house_action >= 0
+        ? ImVec4(54.0f / 255.0f, 54.0f / 255.0f, 54.0f / 255.0f, 1.0f)
+        : ImVec4(0.10f, 0.09f, 0.08f, 1.0f));
     const ImGuiWindowFlags f = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
-                               ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+                               (house_action < 0 ? ImGuiWindowFlags_NoInputs : 0) | ImGuiWindowFlags_NoFocusOnAppearing;
     if (ImGui::Begin(ready_counter ? "##mgmp_ready_counter" : "##mgmp_endday", nullptr, f)) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->ChannelsSplit(2);
         dl->ChannelsSetCurrent(1);
         if (g.paper_font || ready_counter)
-            ImGui::PushFont(g.paper_font ? g.paper_font : ImGui::GetFont(), ready_counter ? 48.0f : 32.0f);
+            ImGui::PushFont(g.paper_font ? g.paper_font : ImGui::GetFont(), (ready_counter ? 48.0f : 32.0f) * paper_scale());
         const std::string t = upper_utf8(text);
         const ImVec2 sz = ImGui::CalcTextSize(t.c_str());
         const ImVec2 at0 = ImGui::GetCursorScreenPos();
         const ImU32 ink = ImGui::GetColorU32(ImGuiCol_Text);
         for (int o = 0; o < 4; ++o)
             dl->AddText(ImVec2(at0.x + (o & 1) * 1.1f, at0.y + (o >> 1) * 1.0f), ink, t.c_str());
-        ImGui::Dummy(ImVec2(sz.x + 1.1f, sz.y + 1.0f));
+        if (house_action >= 0) {
+            if (ImGui::InvisibleButton("##house_vote", ImVec2(sz.x + 1.1f, sz.y + 1.0f)))
+                house_vote_press((unsigned)house_action);
+            if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        } else {
+            ImGui::Dummy(ImVec2(sz.x + 1.1f, sz.y + 1.0f));
+        }
         if (g.paper_font || ready_counter) ImGui::PopFont();
         dl->ChannelsSetCurrent(0);
         dl->PushClipRectFullScreen();
         const ImVec2 p = ImGui::GetWindowPos(), s = ImGui::GetWindowSize();
-        paper(dl, ImVec2(p.x + 10, p.y + 8), ImVec2(p.x + s.x - 10, p.y + s.y - 12),
-              true, !ready_counter);
+        paper(dl, ImVec2(p.x + 10 * paper_scale(), p.y + 8 * paper_scale()), ImVec2(p.x + s.x - 10 * paper_scale(), p.y + s.y - 12 * paper_scale()),
+              true, !ready_counter, house_action >= 0);
         dl->PopClipRect();
         dl->ChannelsMerge();
     }
@@ -825,9 +841,16 @@ void draw_session() {
     if (st == NetState::Failed && net_error()[0])
         ImGui::TextColored(level_colour(LogLevel::Error), "%s", net_error());
 
-    if (lockstep_halted())
+    if (lockstep_halted()) {
         ImGui::TextColored(level_colour(LogLevel::Error),
                            "HALTED -- the peers disagreed and this one stopped");
+        if (peerlog_halt_reason()[0]) ImGui::TextWrapped("%s", peerlog_halt_reason());
+        if (peerlog_report_path()[0]) {
+            ImGui::TextWrapped("HALT report: %s", peerlog_report_path());
+            if (ImGui::Button("Copy report folder"))
+                ImGui::SetClipboardText(peerlog_report_path());
+        }
+    }
 
     ImGui::Separator();
 
@@ -961,6 +984,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     // takes him out to load the host's run.
     if (g.synthetic_keys && (msg == WM_KEYDOWN || msg == WM_KEYUP) && wp == VK_ESCAPE) {
         --g.synthetic_keys;
+        if (house_night_input_owned() && msg == WM_KEYDOWN) return 0;
         return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
     }
     // The host's cutscene inputs, posted by ui_post_input and counted like the
@@ -970,6 +994,8 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
          ((msg == WM_KEYDOWN || msg == WM_KEYUP) && (wp == VK_SPACE || wp == VK_RETURN)))) {
         --g.synthetic_input;
+        if (house_night_input_owned() &&
+            (msg == WM_LBUTTONDOWN || msg == WM_KEYDOWN)) return 0;
         return CallWindowProcW(g.prev_wndproc, hwnd, msg, wp, lp);
     }
 
@@ -1179,6 +1205,20 @@ bool ui_post_input(uint8_t what, uint32_t pos) {
     return true;
 }
 
+void ui_end_house_day() {
+    g.visible = false;
+    if (g.up_frames) {
+        ++g.synthetic_input;
+        post_input(g.up_what, false, g.up_pos);
+        g.up_frames = 0;
+    }
+    // Clear physical input held while a day menu was open as well.
+    for (uint8_t what = 0; what < 3; ++what) {
+        ++g.synthetic_input;
+        post_input(what, false, 0);
+    }
+}
+
 uint32_t ui_pack_pos(intptr_t lparam) {
     RECT rc{};
     if (!g.hwnd || !GetClientRect(g.hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) return 0;
@@ -1254,7 +1294,8 @@ void ui_on_swap(void* window) {
     }
     uint32_t ready_count = 0, ready_total = 0;
     const bool run_ready = !loading && classpick_ready_badge(ready_count, ready_total);
-    g.forced = loading || night || note || run_ready;
+    const bool house_ready = house_ready_visible();
+    g.forced = loading || night || note || run_ready || house_ready;
     if (!g.visible && !g.forced) return;
 
     if (!g.ready) {
@@ -1277,6 +1318,15 @@ void ui_on_swap(void* window) {
     if (loading) draw_loading(step);
     if (night) draw_night(night, nights, loading);
     else if (note && !loading) draw_paper_note(note, true);   // all in the top right corner
+    if (house_ready && !loading && !night && !run_ready) {
+        const unsigned action = startrun_box_has_cats() ? 1 : 0;
+        char label[96];
+        snprintf(label, sizeof(label), "%s %u/%u",
+                 action ? tr(u8"\u0412 \u043f\u0443\u0442\u044c", "Set off")
+                        : tr(u8"\u041a\u043e\u043d\u0435\u0446 \u0434\u043d\u044f", "End day"),
+                 house_vote_count(action), net_peer_count());
+        draw_paper_note(label, false, true, (int)action);
+    }
     if (run_ready) {
         char label[16];
         snprintf(label, sizeof(label), "%u/%u", ready_count, ready_total);
